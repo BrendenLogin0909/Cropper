@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cropper — fast perspective crops</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark"><span></span></span><span>Cropper</span><small>LOCAL IMAGE STUDIO</small></div>
+      <div class="top-actions">
+        <div class="tool-tabs" role="tablist" aria-label="Workspace">
+          <button class="tool-tab active" id="crop-tab" role="tab" aria-selected="true">Crop</button>
+          <button class="tool-tab" id="merge-tab" role="tab" aria-selected="false">Front + Back</button>
+          <button class="tool-tab" id="enhance-tab" role="tab" aria-selected="false">Auto improve</button>
+        </div>
+        <span class="local-pill"><i></i> Runs on this computer</span>
+        <button class="button button-quiet" id="open-folder-top"><span class="icon">▣</span> Open folder</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="explorer panel">
+        <div class="panel-head">
+          <div><div class="eyebrow">YOUR IMAGES</div><h2>Explorer</h2></div>
+          <button class="icon-button" id="refresh" title="Refresh folder" aria-label="Refresh folder">↻</button>
+        </div>
+        <div class="path-box">
+          <div class="path-heading"><span>Current folder</span><button id="folder-browse" class="text-button">Browse…</button></div>
+          <div class="path-row"><button id="go-parent" title="Parent folder" aria-label="Parent folder">↑</button><input id="folder-path" aria-label="Folder path" placeholder="Choose or paste a folder path"><button id="go-path" title="Open path" aria-label="Open path">→</button></div>
+        </div>
+        <div class="explorer-section">
+          <div class="section-label">FOLDERS <span id="folder-count">0</span></div>
+          <div id="folders" class="folder-list"></div>
+        </div>
+        <div class="explorer-section images-section">
+          <div class="section-label">IMAGES <span id="image-count">0</span></div>
+          <div id="images" class="image-grid" tabindex="0" aria-label="Images in folder"></div>
+        </div>
+        <div class="explorer-foot" id="explorer-foot"><span class="keycap">↕</span> Browse files <span class="dot-sep">·</span> double-click to open</div>
+      </aside>
+
+      <main class="main">
+        <div id="crop-workspace">
+        <div class="editor-top">
+          <div class="editor-title"><div class="eyebrow">PERSPECTIVE CROP</div><h1 id="image-title">Ready when you are</h1><p id="image-subtitle">Open a folder, then double-click an image to begin.</p></div>
+          <div class="navigation"><button class="icon-button" id="prev" title="Previous image (left arrow)" aria-label="Previous image">←</button><span id="position">— / —</span><button class="icon-button" id="next" title="Next image (right arrow)" aria-label="Next image">→</button></div>
+        </div>
+        <div class="canvas-shell" id="canvas-shell">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-symbol"><span class="corner a"></span><span class="corner b"></span><span class="corner c"></span><span class="corner d"></span><span>✦</span></div>
+            <h2>Turn four clicks into a clean crop</h2>
+            <p>Pick an image folder to start your batch.</p>
+            <button class="button button-primary" id="empty-open">Open image folder <span>→</span></button>
+          </div>
+          <div id="image-layer" class="image-layer hidden" aria-label="Image crop area">
+            <img id="photo" alt="Image to crop" draggable="false">
+            <svg id="overlay" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+          </div>
+          <div id="zoom-label" class="zoom-label hidden"><span>⌕</span> Precision zoom ×3 <kbd>CTRL</kbd></div>
+          <div class="canvas-help" id="canvas-help">Click the four corners in any order</div>
+        </div>
+        <div class="editor-bottom">
+          <div class="progress-group"><div class="progress-dots" id="progress-dots"><span></span><span></span><span></span><span></span></div><div><strong id="step-title">Select four corners</strong><small id="step-detail">Click once for each corner, or drag a point to refine it.</small></div></div>
+          <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point (Ctrl+Z)">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="select-whole" title="Select all four corners of this image">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
+        </div>
+        <div class="shortcut-strip"><span><kbd>CTRL</kbd> hold to zoom for precise clicks</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
+        </div>
+        <section id="merge-workspace" class="merge-workspace hidden" aria-labelledby="merge-title">
+          <div class="editor-top merge-top">
+            <div class="editor-title"><div class="eyebrow">PHOTO PAIRING</div><h1 id="merge-title">Front + Back</h1><p>Click the front photo first, then the back photo in the Explorer.</p></div>
+          </div>
+          <div class="merge-canvas">
+            <div class="merge-instructions" id="merge-instructions"><span class="merge-step-number">1</span><strong>Select the front</strong><small>Its shape decides whether the back goes beside or below it.</small></div>
+            <div id="merge-preview" class="merge-preview hidden" aria-live="polite"></div>
+          </div>
+          <div class="merge-bottom"><p id="merge-summary">Choose the front photo, then the back photo.</p><button class="button button-quiet" id="merge-clear">Clear pair</button></div>
+        </section>
+        <section id="enhance-workspace" class="enhance-workspace hidden" aria-labelledby="enhance-title">
+          <div class="editor-top">
+            <div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="enhance-title">Auto improve</h1><p id="enhance-subtitle">Open any folder, then select photos to preview and improve.</p></div>
+          </div>
+          <div class="enhance-toolbar"><span id="enhance-selection-count">0 selected</span><div><button id="enhance-select-all" class="button button-quiet">Select all</button><button id="enhance-clear" class="button button-quiet">Clear</button><button id="enhance-stop" class="button button-quiet hidden">Stop after current</button></div></div>
+          <div class="enhance-preview-shell">
+            <div id="enhance-empty" class="empty-state"><div class="empty-symbol">✦</div><h2>Preview automatic improvements</h2><p>Click a photo in the Explorer. Click more photos to include them in a batch.</p></div>
+            <div id="enhance-comparison" class="enhance-comparison hidden"><div class="enhance-pane"><strong>BEFORE</strong><img id="enhance-before" alt="Original photo"></div><div class="enhance-pane"><strong>AUTO IMPROVED</strong><img id="enhance-after" alt="Automatically improved photo"></div></div>
+          </div>
+          <div class="enhance-bottom"><p id="enhance-changes">Each image is analysed separately. Review the preview before saving.</p><p id="enhance-progress" role="status" aria-live="polite"></p></div>
+        </section>
+      </main>
+
+      <aside class="settings panel" id="crop-settings">
+        <div class="panel-head"><div><div class="eyebrow">BATCH WORKFLOW</div><h2>Save settings</h2></div><span class="saved-badge">Saved for next time</span></div>
+        <p class="settings-intro">Choose once. Every crop in this session uses these settings.</p>
+        <div class="settings-group"><div class="section-label">DESTINATION</div>
+          <label class="radio-card"><input type="radio" name="mode" value="subfolder"><span class="radio-visual"></span><span><strong>Source subfolder</strong><small>Keep originals together with results</small></span></label>
+          <label class="radio-card"><input type="radio" name="mode" value="beside"><span class="radio-visual"></span><span><strong>Beside original</strong><small>Create another file in the same folder</small></span></label>
+          <label class="radio-card"><input type="radio" name="mode" value="folder"><span class="radio-visual"></span><span><strong>Another folder</strong><small>Send all crops to one chosen folder</small></span></label>
+          <label class="radio-card danger-card"><input type="radio" name="mode" value="replace"><span class="radio-visual"></span><span><strong>Replace original</strong><small>Overwrite each source image</small></span></label>
+        </div>
+        <div class="settings-fields">
+          <label class="field"><span>Output proportions</span><select id="crop-aspect"><option value="auto">Estimate from corners</option><option value="2:3">Photo 2:3</option><option value="3:4">Photo 3:4</option><option value="4:5">Photo 4:5</option><option value="1:1">Square</option><option value="custom">Custom width : height</option></select></label>
+          <label id="crop-aspect-custom-field" class="field hidden"><span>Width : height</span><input id="crop-aspect-custom" value="2:3" placeholder="e.g. 1353:1950" spellcheck="false"></label>
+          <p class="aspect-note">Four corners cannot always reveal the print’s true shape. Review the result and choose a photo proportion if it looks stretched. For an older crop, open it, choose Whole image, and save a corrected copy.</p>
+          <label id="subfolder-field" class="field"><span>Subfolder name</span><input id="subfolder" value="Cropped" spellcheck="false"></label>
+          <div id="folder-field" class="field hidden"><span>Output folder</span><div class="browse-field"><input id="output-folder" placeholder="Choose a folder" spellcheck="false"><button id="output-browse" class="text-button">Browse…</button></div></div>
+          <div id="naming-fields" class="name-fields"><label class="field"><span>Filename prefix <em>optional</em></span><input id="prefix" placeholder="e.g. scan_" spellcheck="false"></label><label class="field"><span>Filename suffix <em>optional</em></span><input id="suffix" placeholder="e.g. _cropped" spellcheck="false"></label></div>
+        </div>
+        <div class="settings-spacer"></div>
+        <label class="toggle-line"><input type="checkbox" id="auto-next" checked><span class="switch"></span><span>Move to next image after saving</span></label>
+        <button class="button button-quiet preview-button" id="crop-preview" disabled>Preview straightened photo</button>
+        <button class="button button-primary save-button" id="save" disabled><span>Crop &amp; save</span><span>↗</span></button>
+        <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p><button id="save-error-browse" class="text-button">Choose another output folder →</button></div>
+        <div class="save-hint" id="save-hint">Select four corners to enable saving</div>
+      </aside>
+      <aside class="settings panel hidden" id="enhance-settings">
+        <div class="panel-head"><div><div class="eyebrow">AUTO IMPROVE</div><h2>Save enhanced copies</h2></div><span class="saved-badge">Saved for next time</span></div>
+        <p class="settings-intro">Cropper balances likely neutral areas, improves contrast, and gently lifts faded colour. Each photo gets its own correction.</p>
+        <div class="settings-group"><div class="section-label">DESTINATION</div>
+          <label class="radio-card"><input type="radio" name="enhance-mode" value="subfolder"><span class="radio-visual"></span><span><strong>Source subfolder</strong><small>Keep originals with enhanced copies</small></span></label>
+          <label class="radio-card"><input type="radio" name="enhance-mode" value="beside"><span class="radio-visual"></span><span><strong>Beside original</strong><small>Create copies in the same folder</small></span></label>
+          <label class="radio-card"><input type="radio" name="enhance-mode" value="folder"><span class="radio-visual"></span><span><strong>Another folder</strong><small>Save the batch in one chosen folder</small></span></label>
+        </div>
+        <div class="settings-fields">
+          <label id="enhance-subfolder-field" class="field"><span>Subfolder name</span><input id="enhance-subfolder" value="Enhanced" spellcheck="false"></label>
+          <div id="enhance-folder-field" class="field hidden"><span>Output folder</span><div class="browse-field"><input id="enhance-output-folder" placeholder="Choose a folder" spellcheck="false"><button id="enhance-output-browse" class="text-button">Browse…</button></div></div>
+          <div class="name-fields"><label class="field"><span>Filename prefix <em>optional</em></span><input id="enhance-prefix" placeholder="e.g. fixed_" spellcheck="false"></label><label class="field"><span>Filename suffix</span><input id="enhance-suffix" value="_enhanced" spellcheck="false"></label></div>
+        </div>
+        <div class="settings-spacer"></div>
+        <button class="button button-primary save-button" id="enhance-save" disabled><span>Save selected copies</span><span>↗</span></button>
+        <div class="save-hint" id="enhance-save-hint">Select photos to enable saving</div>
+      </aside>
+      <aside class="settings panel hidden" id="merge-settings">
+        <div class="panel-head"><div><div class="eyebrow">PHOTO PAIRING</div><h2>Save merged image</h2></div><span class="saved-badge">Saved for next time</span></div>
+        <p class="settings-intro">The first selected image is the front. The second is its back.</p>
+        <div class="settings-group"><div class="section-label">BACK ORIENTATION</div>
+          <label class="field"><span>Rotate the back</span><select id="merge-rotation"><option value="0">Keep as photographed</option><option value="90">Rotate right 90°</option><option value="-90">Rotate left 90°</option><option value="180">Rotate 180°</option></select></label>
+        </div>
+        <div class="settings-group"><div class="section-label">DESTINATION</div>
+          <label class="radio-card"><input type="radio" name="merge-mode" value="subfolder"><span class="radio-visual"></span><span><strong>Source subfolder</strong><small>Keep the pair beside its source</small></span></label>
+          <label class="radio-card"><input type="radio" name="merge-mode" value="beside"><span class="radio-visual"></span><span><strong>Beside original</strong><small>Create another file in the same folder</small></span></label>
+          <label class="radio-card"><input type="radio" name="merge-mode" value="folder"><span class="radio-visual"></span><span><strong>Another folder</strong><small>Send all pairs to one chosen folder</small></span></label>
+        </div>
+        <div class="settings-fields">
+          <label id="merge-subfolder-field" class="field"><span>Subfolder name</span><input id="merge-subfolder" value="Front and Back" spellcheck="false"></label>
+          <div id="merge-folder-field" class="field hidden"><span>Output folder</span><div class="browse-field"><input id="merge-output-folder" placeholder="Choose a folder" spellcheck="false"><button id="merge-output-browse" class="text-button">Browse…</button></div></div>
+          <div class="settings-group merge-name-source"><div class="section-label">USE NAME FROM</div>
+            <label class="radio-card"><input type="radio" name="merge-name-source" value="back"><span class="radio-visual"></span><span><strong>Second image (back)</strong><small>Best for your current files</small></span></label>
+            <label class="radio-card"><input type="radio" name="merge-name-source" value="front"><span class="radio-visual"></span><span><strong>First image (front)</strong><small>Use the front photo’s filename</small></span></label>
+          </div>
+          <div class="name-fields"><label class="field"><span>Filename prefix <em>optional</em></span><input id="merge-prefix" placeholder="e.g. pair_" spellcheck="false"></label><label class="field"><span>Filename suffix <em>optional</em></span><input id="merge-suffix" placeholder="e.g. _front-back" spellcheck="false"></label></div>
+        </div>
+        <div class="settings-spacer"></div>
+        <button class="button button-primary save-button" id="merge-save" disabled><span>Merge &amp; save</span><span>↗</span></button>
+        <div class="save-hint" id="merge-save-hint">Select a front and a back to enable saving</div>
+      </aside>
+    </div>
+  </div>
+  <div id="folder-modal" class="folder-modal hidden" role="dialog" aria-modal="true" aria-labelledby="folder-modal-title">
+    <div class="folder-dialog">
+      <div class="folder-dialog-head"><div><div class="eyebrow">LOCAL FOLDERS</div><h2 id="folder-modal-title">Choose image folder</h2></div><button id="folder-modal-close" class="icon-button" aria-label="Close folder picker">×</button></div>
+      <div class="folder-dialog-body">
+        <div class="folder-locations"><div class="section-label">QUICK LOCATIONS</div><div id="folder-shortcuts"></div><div class="section-label drive-label">DRIVES</div><div id="folder-drives"></div></div>
+        <div class="folder-browser"><div class="folder-address"><button id="folder-modal-up" class="icon-button" aria-label="Parent folder">↑</button><input id="folder-modal-path" aria-label="Folder location" spellcheck="false"><button id="folder-modal-go" class="button button-quiet">Go</button></div><div id="folder-modal-list" class="folder-modal-list"></div><div id="folder-modal-message" class="folder-modal-message"></div></div>
+      </div>
+      <div class="folder-dialog-foot"><span id="folder-modal-current"></span><div><button id="folder-modal-cancel" class="button button-quiet">Cancel</button><button id="folder-modal-select" class="button button-primary">Use this folder</button></div></div>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="crop-preview-modal" class="folder-modal hidden" role="dialog" aria-modal="true" aria-labelledby="crop-preview-title"><div class="crop-preview-dialog"><div class="crop-preview-head"><div><div class="eyebrow">BEFORE SAVING</div><h2 id="crop-preview-title">Straightened photo preview</h2></div><button class="icon-button" id="crop-preview-close" aria-label="Close preview">×</button></div><div class="crop-preview-body"><p id="crop-preview-status">Preparing preview…</p><img id="crop-preview-image" alt="Preview of perspective crop" class="hidden"></div><div class="crop-preview-foot"><span>Check that people and objects look natural. You can change Output proportions and preview again.</span><button class="button button-quiet" id="crop-preview-done">Back to crop</button></div></div></div>
+  <script src="/app.js"></script>
+</body>
+</html>

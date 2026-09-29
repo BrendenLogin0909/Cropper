@@ -1,0 +1,53 @@
+# Cropper
+
+Cropper is a local browser-based image cropper for quickly straightening photos, documents, and other four-corner subjects. The image processing runs on your computer with OpenCV and Pillow. No account, subscription, upload, or internet connection is required.
+
+Cropper also has **Front + Back** for pairing both sides of a print and **Auto improve** for colour cast, contrast, and gentle saturation correction.
+
+## Start
+
+On Windows, double-click **Start Cropper.cmd**. Your browser opens automatically. Keep the command window open while using the app; close it to stop the local server.
+
+If Python reports a missing dependency, run this once in the Cropper folder:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+You can also run `python server.py` directly. Cropper binds only to `127.0.0.1`, using port `8765` so your browser remembers the batch settings between launches. Use `--port` if that port is occupied by another app.
+
+## Batch workflow
+
+1. Choose an image folder with **Open folder**. Its built-in picker lets you browse drives and folders. You can also paste a folder path into Explorer.
+2. Choose a save destination. The setting persists in this browser for later sessions.
+3. Double-click a thumbnail. Click the four corners of the subject in any order.
+4. Hold **Ctrl** to magnify around the mouse pointer for precise clicking or dragging. Release Ctrl to return to the fitted view.
+5. Press **Enter** or click **Crop & save**. With **Move to next image** enabled, the next image opens automatically.
+
+Drag any corner after placing it. Use **Ctrl+Z** to undo the last corner, **Backspace** to reset, and **Left/Right arrow** to move between images. The Rotate buttons rotate the saved crop by 90 degrees.
+
+The image list has its own scrollbar, so a large folder does not move the crop frame off-screen. If Cropper reports that a folder is not writable, choose another output folder or check that folder's Windows permissions.
+
+Output choices:
+
+- **Source subfolder:** saves into a named subfolder beside the source image. Default: `Cropped`.
+- **Beside original:** creates a copy in the same folder, using a prefix or suffix.
+- **Another folder:** sends every crop to one chosen folder.
+- **Replace original:** atomically replaces the source file after the cropped file has been encoded.
+
+For copy modes, an existing destination filename gets a numeric suffix so it is not overwritten. Supported formats: JPEG, PNG, WebP, TIFF, and BMP. Cropper uses a conventional perspective transform; it does not generate new image content.
+
+If the cropped photo looks stretched, choose a standard **Output proportions** setting and use **Preview straightened photo** before saving. **Whole image** selects the four outer corners when you want to correct an existing crop's proportions.
+
+## Front + Back
+
+Select the front photo first, then its matching back. Cropper places the back to the right of a portrait front or below a landscape front. You can rotate the back before saving the pair as a new image.
+
+## Auto improve
+
+1. Open whichever folder contains the images to improve. It can hold original photos, cropped photos, front and back images, or any other supported images.
+2. Select **Auto improve**. Click an image to add it to the batch and see its before and after preview. Click more images, or use **Select all**.
+3. Choose a destination. The default is an `Enhanced` subfolder with `_enhanced` added to filenames. These settings persist in the browser.
+4. Review the preview, then select **Save selected copies**. Cropper analyses each photo individually and reports the batch result.
+
+The automatic correction uses local pixel processing. It can reduce a colour cast and improve faded tones, but it cannot know the original colours of every aged photo. Photos with unusual lighting or intentional sepia tones should be reviewed before saving. The preview is limited to 1,800 pixels; saved copies use the image's full resolution. Originals are preserved in Auto improve.
