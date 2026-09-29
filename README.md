@@ -37,7 +37,11 @@ Output choices:
 
 For copy modes, an existing destination filename gets a numeric suffix so it is not overwritten. Supported formats: JPEG, PNG, WebP, TIFF, and BMP. Cropper uses a conventional perspective transform; it does not generate new image content.
 
-If the cropped photo looks stretched, choose a standard **Output proportions** setting and use **Preview straightened photo** before saving. **Whole image** selects the four outer corners when you want to correct an existing crop's proportions.
+If the cropped photo looks stretched, choose a standard **Output proportions** setting and use **Preview straightened photo** before saving. The list identifies common physical print shapes: 6 × 4 inch prints are 2:3, 7 × 5 are 5:7, 8 × 10 are 4:5, and 11 × 14 are 11:14. Cropper automatically uses the portrait or landscape version of the selected ratio.
+
+**Whole image** selects the four outer corners when you want to correct an existing crop's proportions. Save the repair as a new copy. Re-cropping from the original photograph gives the best result when it remains available.
+
+The four corners determine perspective but do not, by themselves, determine the original physical width-to-height ratio. Cropper's measured-edge option is only a convenient starting point when the camera was nearly square to a flat print. The preview is the safeguard; it lets you compare a likely print shape before a full-resolution file is written.
 
 ## Front + Back
 
@@ -54,8 +58,8 @@ The automatic correction uses local pixel processing. It can reduce a colour cas
 
 The same decision rules run on every image, but the result is measured separately for each one:
 
-- **Colour cast:** Cropper samples bright, relatively neutral areas and uses them to estimate a restrained red, green, and blue balance. It skips this step if suitable areas are scarce or the channels are already close.
-- **Contrast:** It measures the light and dark ends of the photo and gently widens a narrow tonal range. It skips this step when contrast is already broad.
-- **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift. Monochrome photos do not receive this lift.
+- **Colour cast:** Cropper samples bright, relatively neutral areas and adjusts their colour toward grey without changing their measured lightness. It skips this step if suitable areas are scarce or the cast is small.
+- **Contrast:** It measures the light and dark ends of the photo and gently widens a narrow tonal range around that photo's own midpoint. Highlights are protected from a large increase. It skips this step when contrast is already broad or the image is nearly uniform.
+- **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift. Neutral black-and-white photos do not receive this lift.
 
 The preview names the corrections selected for that photo. These adjustments do not remove scratches, sharpen blur, invent missing detail, or accurately reconstruct unknown original colours.

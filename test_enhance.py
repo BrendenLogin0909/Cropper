@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image
 
 from enhance import auto_enhance
@@ -28,6 +29,23 @@ class EnhanceTests(unittest.TestCase):
         channels = np.asarray(improved)
         self.assertLess(int(np.max(np.abs(channels[:, :, 0].astype(int) - channels[:, :, 1].astype(int)))), 3)
         self.assertLess(int(np.max(np.abs(channels[:, :, 1].astype(int) - channels[:, :, 2].astype(int)))), 3)
+
+    def test_bright_photo_keeps_its_exposure_and_highlights(self):
+        bright = np.tile(np.linspace(175, 245, 256, dtype=np.uint8), (256, 1))
+        image = Image.fromarray(np.stack([bright] * 3, axis=2))
+        improved, changes = auto_enhance(image)
+        original_l = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2LAB)[:, :, 0]
+        improved_l = cv2.cvtColor(np.asarray(improved), cv2.COLOR_RGB2LAB)[:, :, 0]
+        self.assertIn("Contrast refined; highlights protected", changes)
+        self.assertLessEqual(abs(float(np.median(improved_l)) - float(np.median(original_l))), 2)
+        self.assertLessEqual(float(np.percentile(improved_l, 95)) - float(np.percentile(original_l, 95)), 6)
+        self.assertEqual(int((improved_l == 255).sum()), 0)
+
+    def test_balanced_white_is_not_modified(self):
+        image = Image.new("RGB", (100, 80), "white")
+        improved, changes = auto_enhance(image)
+        self.assertEqual(changes, ["No safe adjustment detected"])
+        self.assertEqual(improved.tobytes(), image.tobytes())
 
     def test_saves_unique_copies_and_keeps_original(self):
         with tempfile.TemporaryDirectory() as temporary:
