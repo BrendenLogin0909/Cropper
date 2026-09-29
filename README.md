@@ -51,3 +51,11 @@ Select the front photo first, then its matching back. Cropper places the back to
 4. Review the preview, then select **Save selected copies**. Cropper analyses each photo individually and reports the batch result.
 
 The automatic correction uses local pixel processing. It can reduce a colour cast and improve faded tones, but it cannot know the original colours of every aged photo. Photos with unusual lighting or intentional sepia tones should be reviewed before saving. The preview is limited to 1,800 pixels; saved copies use the image's full resolution. Originals are preserved in Auto improve.
+
+The same decision rules run on every image, but the result is measured separately for each one:
+
+- **Colour cast:** Cropper samples bright, relatively neutral areas and uses them to estimate a restrained red, green, and blue balance. It skips this step if suitable areas are scarce or the channels are already close.
+- **Contrast:** It measures the light and dark ends of the photo and gently widens a narrow tonal range. It skips this step when contrast is already broad.
+- **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift. Monochrome photos do not receive this lift.
+
+The preview names the corrections selected for that photo. These adjustments do not remove scratches, sharpen blur, invent missing detail, or accurately reconstruct unknown original colours.

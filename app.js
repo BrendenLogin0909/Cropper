@@ -210,7 +210,7 @@ async function previewEnhance(index) {
     if (state.enhance.previewUrl) URL.revokeObjectURL(state.enhance.previewUrl);
     state.enhance.previewUrl = URL.createObjectURL(blob);
     $('enhance-after').src = state.enhance.previewUrl;
-    $('enhance-changes').textContent = `${changes}. Preview may differ slightly from the saved file.`;
+    $('enhance-changes').textContent = changes === 'Already balanced' ? 'This photo appears balanced; no substantial correction was needed.' : `Applied to this photo: ${changes}. Preview may differ slightly from the saved file.`;
   } catch (error) { if (ticket === state.enhance.requestId) { $('enhance-changes').textContent = error.message; toast(error.message, true); } }
 }
 function selectEnhanceImage(index) {
