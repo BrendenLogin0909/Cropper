@@ -32,10 +32,12 @@ def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
     sampled_lab = cv2.cvtColor(sampled_rgb, cv2.COLOR_RGB2LAB)
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     changes: list[str] = []
+    neutral_reference = None
 
     if likely_neutral.sum() >= max(120, sample.shape[0] * 0.008):
         # Move a plausible paper white/grey toward neutral without changing lightness.
         reference = np.median(sampled_lab.reshape(-1, 3)[likely_neutral, 1:], axis=0)
+        neutral_reference = reference
         shifts = np.clip((128.0 - reference) * 0.78, -18.0, 18.0)
         if float(np.max(np.abs(shifts))) >= 3.0:
             for channel, shift in ((1, shifts[0]), (2, shifts[1])):
@@ -68,6 +70,23 @@ def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
         hsv[:, :, 1] = cv2.LUT(hsv[:, :, 1], boost)
         toned = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
         changes.append("Faded color lifted")
+
+    # Old colour prints can retain a warm veil after their whites are balanced.
+    # Compress excess yellow and red chroma without moving nearly neutral whites.
+    # The cast estimate controls strength separately for each photograph.
+    if neutral_reference is not None and neutral_reference[1] >= 138 and float(np.median(sampled_lab[:, :, 2])) >= 145:
+        corrected_lab = cv2.cvtColor(toned, cv2.COLOR_RGB2LAB)
+        yellow = np.arange(256, dtype=np.float32)
+        yellow_strength = float(np.clip((neutral_reference[1] - 134.0) * 0.07, 0.25, 0.6))
+        yellow -= np.minimum(np.maximum(yellow - 133.0, 0.0) * yellow_strength, 10.0)
+        corrected_lab[:, :, 2] = cv2.LUT(corrected_lab[:, :, 2], yellow.astype(np.uint8))
+        red_strength = float(np.clip((neutral_reference[0] - 129.0) * 0.18, 0.0, 0.35))
+        if red_strength:
+            red = np.arange(256, dtype=np.float32)
+            red -= np.minimum(np.maximum(red - 133.0, 0.0) * red_strength, 5.0)
+            corrected_lab[:, :, 1] = cv2.LUT(corrected_lab[:, :, 1], red.astype(np.uint8))
+        toned = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2RGB)
+        changes.append("Residual warm cast softened")
 
     if not changes:
         changes.append("No safe adjustment detected")

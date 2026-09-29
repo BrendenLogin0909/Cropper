@@ -47,6 +47,19 @@ class EnhanceTests(unittest.TestCase):
         self.assertEqual(changes, ["No safe adjustment detected"])
         self.assertEqual(improved.tobytes(), image.tobytes())
 
+    def test_warm_print_loses_yellow_without_tinting_whites(self):
+        pixels = np.empty((240, 240, 3), dtype=np.uint8)
+        pixels[:, :144] = (211, 171, 134)  # warm stone or yellowed paper
+        pixels[:, 144:216] = (220, 204, 180)  # faded white fabric
+        pixels[:, 216:] = (89, 121, 165)  # a genuinely blue area
+        improved, changes = auto_enhance(Image.fromarray(pixels))
+        original_lab = cv2.cvtColor(pixels, cv2.COLOR_RGB2LAB)
+        result_lab = cv2.cvtColor(np.asarray(improved), cv2.COLOR_RGB2LAB)
+        self.assertIn("Residual warm cast softened", changes)
+        self.assertLess(int(result_lab[20, 20, 2]), int(original_lab[20, 20, 2]) - 10)
+        self.assertLess(abs(int(result_lab[20, 170, 2]) - 128), 6)
+        self.assertLess(int(result_lab[20, 230, 2]), 128)
+
     def test_saves_unique_copies_and_keeps_original(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "old.jpg"

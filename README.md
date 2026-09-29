@@ -59,6 +59,7 @@ The automatic correction uses local pixel processing. It can reduce a colour cas
 The same decision rules run on every image, but the result is measured separately for each one:
 
 - **Colour cast:** Cropper samples bright, relatively neutral areas and adjusts their colour toward grey without changing their measured lightness. It skips this step if suitable areas are scarce or the cast is small.
+- **Lingering yellow:** If those areas indicate a strong warm cast across the photo, Cropper also softens excess yellow and some red in already-warm colours. Nearly neutral whites are left alone. The strength depends on that photo's measured cast, and the reduction is capped so naturally warm objects retain colour.
 - **Contrast:** It measures the light and dark ends of the photo and gently widens a narrow tonal range around that photo's own midpoint. Highlights are protected from a large increase. It skips this step when contrast is already broad or the image is nearly uniform.
 - **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift. Neutral black-and-white photos do not receive this lift.
 
