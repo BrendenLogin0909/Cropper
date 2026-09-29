@@ -60,6 +60,21 @@ class EnhanceTests(unittest.TestCase):
         self.assertLess(abs(int(result_lab[20, 170, 2]) - 128), 6)
         self.assertLess(int(result_lab[20, 230, 2]), 128)
 
+    def test_faded_red_shadows_and_dull_whites_get_separate_correction(self):
+        pixels = np.empty((240, 240, 3), dtype=np.uint8)
+        pixels[:, :85] = (89, 53, 50)  # a faded, reddish black
+        pixels[:, 85:160] = (165, 127, 108)
+        pixels[:, 160:] = (221, 203, 180)  # a yellowed white
+        improved, changes = auto_enhance(Image.fromarray(pixels))
+        result = cv2.cvtColor(np.asarray(improved), cv2.COLOR_RGB2LAB)
+        self.assertIn("Shadows and whites balanced", changes)
+        self.assertIn("Faded blacks and whites restored", changes)
+        self.assertLess(int(result[20, 20, 0]), 25)
+        self.assertLess(int(result[20, 20, 1]), 139)
+        self.assertGreater(int(result[20, 200, 0]), 230)
+        self.assertLess(abs(int(result[20, 200, 2]) - 128), 8)
+        self.assertEqual(int((result[:, :, 0] == 255).sum()), 0)
+
     def test_saves_unique_copies_and_keeps_original(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "old.jpg"

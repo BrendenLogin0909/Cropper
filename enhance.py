@@ -1,4 +1,4 @@
-"""Conservative, local automatic correction for faded print photographs.
+"""Bounded, local automatic correction for faded print photographs.
 
 The corrections are deterministic pixel adjustments. They do not infer or
 invent missing scene content, so a preview remains important for difficult
@@ -21,7 +21,7 @@ def _sample(rgb: np.ndarray, limit: int = 900) -> np.ndarray:
 
 
 def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
-    """Balance likely neutral areas, recover tonal range, and gently lift color."""
+    """Balance whites and shadows, recover faded tones, and gently lift color."""
     rgb = np.asarray(image.convert("RGB"))
     sampled_rgb = _sample(rgb)
     sample = sampled_rgb.reshape(-1, 3).astype(np.float32)
@@ -35,20 +35,47 @@ def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
     neutral_reference = None
 
     if likely_neutral.sum() >= max(120, sample.shape[0] * 0.008):
-        # Move a plausible paper white/grey toward neutral without changing lightness.
+        # A white garment or paper gives the light end of the colour cast.
         reference = np.median(sampled_lab.reshape(-1, 3)[likely_neutral, 1:], axis=0)
         neutral_reference = reference
-        shifts = np.clip((128.0 - reference) * 0.78, -18.0, 18.0)
-        if float(np.max(np.abs(shifts))) >= 3.0:
-            for channel, shift in ((1, shifts[0]), (2, shifts[1])):
-                table = np.clip(np.arange(256, dtype=np.float32) + shift, 0, 255).astype(np.uint8)
-                lab[:, :, channel] = cv2.LUT(lab[:, :, channel], table)
-            changes.append("Color cast reduced")
+        light_shifts = np.clip((128.0 - reference) * 0.78, -18.0, 18.0)
+
+        # Faded prints often have red/brown blacks even after whites are fixed.
+        # Estimate those separately, using the least colourful darker pixels so
+        # a bright red carpet or similarly coloured object has less influence.
+        sample_lightness = sampled_lab[:, :, 0]
+        dark_low, dark_high = np.percentile(sample_lightness, [5, 20])
+        darker = (sample_lightness >= dark_low) & (sample_lightness <= dark_high)
+        chroma = np.linalg.norm(sampled_lab[:, :, 1:].astype(np.float32) - 128.0, axis=2)
+        darker &= chroma <= np.percentile(chroma[darker], 60)
+        dark_shifts = np.zeros(2, dtype=np.float32)
+        if darker.sum() >= max(120, sample.shape[0] * 0.008):
+            dark_reference = np.median(sampled_lab[darker, 1:], axis=0)
+            dark_shifts[0] = np.clip((128.0 - dark_reference[0]) * 0.75, -20.0, 20.0)
+            dark_shifts[1] = np.clip((128.0 - dark_reference[1]) * 0.35, -8.0, 8.0)
+
+        if max(float(np.max(np.abs(light_shifts))), float(np.max(np.abs(dark_shifts)))) >= 3.0:
+            fade_start, fade_end = np.percentile(sample_lightness, [20, 85])
+            weight = np.clip((lab[:, :, 0].astype(np.float32) - fade_start) / max(fade_end - fade_start, 1), 0, 1)
+            for channel, dark_shift, light_shift in ((1, dark_shifts[0], light_shifts[0]), (2, dark_shifts[1], light_shifts[1])):
+                shift = dark_shift + (light_shift - dark_shift) * weight
+                lab[:, :, channel] = np.clip(lab[:, :, channel].astype(np.float32) + shift, 0, 255).astype(np.uint8)
+            changes.append("Shadows and whites balanced" if float(np.max(np.abs(dark_shifts - light_shifts))) >= 5 else "Color cast reduced")
 
     low, high = np.percentile(sampled_lab[:, :, 0], [2, 98])
     span = max(float(high - low), 1.0)
     slope = min(1.4, 195.0 / span)
-    if span >= 20.0 and slope > 1.07:
+    neutral_highlights = neutral_reference is not None and likely_neutral.mean() >= 0.04 and float(np.linalg.norm(neutral_reference - 128.0)) <= 20
+    if neutral_highlights and 32 <= low <= 80 and 170 <= high <= 220 and 90 <= span <= 185:
+        # A faded print can have grey blacks and dull whites. Stretch its measured
+        # range while keeping a soft toe and shoulder so texture is not clipped.
+        values = np.arange(256, dtype=np.float32)
+        tone = 12.0 + (values - low) * (230.0 / span)
+        tone = np.where(values < low, values * (12.0 / low), tone)
+        tone = np.where(values > high, 242.0 + (values - high) * (13.0 / (255.0 - high)), tone)
+        lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(tone, 0, 255).astype(np.uint8))
+        changes.append("Faded blacks and whites restored")
+    elif span >= 20.0 and slope > 1.07:
         # Pivot at this photo's midpoint. Ease toward black and white, and never
         # lift a highlight by more than six lightness levels.
         pivot = float(np.median(sampled_lab[:, :, 0]))
