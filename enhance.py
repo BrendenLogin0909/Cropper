@@ -20,6 +20,19 @@ def _sample(rgb: np.ndarray, limit: int = 900) -> np.ndarray:
     return cv2.resize(rgb, (max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_AREA)
 
 
+def _lift_weak_color(rgb: np.ndarray) -> tuple[np.ndarray, bool]:
+    hsv_sample = cv2.cvtColor(_sample(rgb), cv2.COLOR_RGB2HSV)
+    colored = hsv_sample[:, :, 1] > 25
+    if colored.mean() <= 0.08 or float(np.median(hsv_sample[:, :, 1][colored])) >= 115:
+        return rgb, False
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    levels = np.arange(256, dtype=np.float32)
+    # Vibrance tapers to zero for pixels that are already colourful.
+    boost = np.clip(levels + 0.22 * levels * np.maximum(1.0 - levels / 170.0, 0), 0, 255).astype(np.uint8)
+    hsv[:, :, 1] = cv2.LUT(hsv[:, :, 1], boost)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB), True
+
+
 def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
     """Balance whites and shadows, recover faded tones, and gently lift color."""
     rgb = np.asarray(image.convert("RGB"))
@@ -75,6 +88,32 @@ def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
         tone = np.where(values > high, 242.0 + (values - high) * (13.0 / (255.0 - high)), tone)
         lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(tone, 0, 255).astype(np.uint8))
         changes.append("Faded blacks and whites restored")
+    elif neutral_highlights and np.percentile(saturation, 75) < 0.24 and 80 <= low <= 145 and 175 <= high <= 240 and 70 <= span <= 145:
+        # A strong print veil can leave even the darkest two percent mid-gray.
+        # Move that floor down gently, with a soft toe and shoulder so white
+        # clothing and paper still have texture.
+        target_low = low - min(55.0, (low - 65.0) * 0.9)
+        target_high = high + min(12.0, (245.0 - high) * 0.7)
+        values = np.arange(256, dtype=np.float32)
+        tone = target_low + (values - low) * ((target_high - target_low) / span)
+        tone = np.where(values < low, values * (target_low / low), tone)
+        tone = np.where(values > high, target_high + (values - high) * ((255.0 - target_high) / (255.0 - high)), tone)
+        lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(tone, 0, 255).astype(np.uint8))
+        changes.append("Gray veil reduced")
+
+        # Only the flattest prints get a small, clipped local contrast lift.
+        # The limited blend keeps grain, scratches, and flat paper from taking
+        # on the hard look of full adaptive equalization.
+        sample_l = sample_lightness.astype(np.float32)
+        local_mean = cv2.GaussianBlur(sample_l, (0, 0), 10)
+        local_variance = cv2.GaussianBlur(sample_l * sample_l, (0, 0), 10) - local_mean * local_mean
+        if float(np.median(np.sqrt(np.maximum(local_variance, 0)))) < 12.0:
+            lightness = lab[:, :, 0]
+            equalized = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(lightness)
+            delta = np.clip(equalized.astype(np.float32) - lightness.astype(np.float32), -14, 14)
+            taper = np.minimum(lightness.astype(np.float32) / 40.0, (255.0 - lightness.astype(np.float32)) / 35.0)
+            lab[:, :, 0] = np.clip(lightness.astype(np.float32) + delta * 0.25 * np.clip(taper, 0, 1), 0, 255).astype(np.uint8)
+            changes.append("Local detail clarified")
     elif span >= 20.0 and slope > 1.07:
         # Pivot at this photo's midpoint. Ease toward black and white, and never
         # lift a highlight by more than six lightness levels.
@@ -89,13 +128,8 @@ def auto_enhance(image: Image.Image) -> tuple[Image.Image, list[str]]:
         changes.append("Contrast refined; highlights protected")
     toned = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    hsv_sample = cv2.cvtColor(_sample(toned), cv2.COLOR_RGB2HSV)
-    colored = hsv_sample[:, :, 1] > 25
-    if colored.mean() > 0.08 and float(np.median(hsv_sample[:, :, 1][colored])) < 115:
-        hsv = cv2.cvtColor(toned, cv2.COLOR_RGB2HSV)
-        boost = np.clip(np.arange(256, dtype=np.float32) * 1.08, 0, 255).astype(np.uint8)
-        hsv[:, :, 1] = cv2.LUT(hsv[:, :, 1], boost)
-        toned = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    toned, color_lifted = _lift_weak_color(toned)
+    if color_lifted:
         changes.append("Faded color lifted")
 
     # Old colour prints can retain a warm veil after their whites are balanced.

@@ -37,11 +37,11 @@ Output choices:
 
 For copy modes, an existing destination filename gets a numeric suffix so it is not overwritten. Supported formats: JPEG, PNG, WebP, TIFF, and BMP. Cropper uses a conventional perspective transform; it does not generate new image content.
 
-If the cropped photo looks stretched, choose a standard **Output proportions** setting and use **Preview straightened photo** before saving. The list identifies common physical print shapes: 6 × 4 inch prints are 2:3, 7 × 5 are 5:7, 8 × 10 are 4:5, and 11 × 14 are 11:14. Cropper automatically uses the portrait or landscape version of the selected ratio.
+If the cropped photo looks stretched, choose a standard **Output proportions** setting and check the live straightened preview before saving. The list identifies common physical print shapes: 6 × 4 inch prints are 2:3, 7 × 5 are 5:7, 8 × 10 are 4:5, and 11 × 14 are 11:14. Cropper automatically uses the portrait or landscape version of the selected ratio.
 
 **Whole image** selects the four outer corners when you want to correct an existing crop's proportions. Save the repair as a new copy. Re-cropping from the original photograph gives the best result when it remains available.
 
-The four corners determine perspective but do not, by themselves, determine the original physical width-to-height ratio. Cropper's measured-edge option is only a convenient starting point when the camera was nearly square to a flat print. The preview is the safeguard; it lets you compare a likely print shape before a full-resolution file is written.
+The four corners determine perspective but do not, by themselves, determine the original physical width-to-height ratio. Cropper's measured-edge option is only a convenient starting point when the camera was nearly square to a flat print. The live preview lets you compare a likely print shape before a full-resolution file is written.
 
 ## Front + Back
 
@@ -61,6 +61,7 @@ The same decision rules run on every image, but the result is measured separatel
 - **Colour cast:** Cropper samples likely whites and darker, less colourful areas separately. It balances the two ends of the photo so a reddish black can be corrected without making a white dress blue. It skips this step if suitable areas are scarce or the cast is small.
 - **Lingering yellow:** If those areas indicate a strong warm cast across the photo, Cropper also softens excess yellow and some red in already-warm colours. Nearly neutral whites are left alone. The strength depends on that photo's measured cast, and the reduction is capped so naturally warm objects retain colour.
 - **Contrast:** For prints with faded blacks and dull whites, it expands the measured tonal range with a soft toe and shoulder to retain highlight texture. For other low-contrast photos it uses a gentler midpoint adjustment. It skips this step when contrast is already broad or the image is nearly uniform.
-- **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift. Neutral black-and-white photos do not receive this lift.
+- **Gray veil:** For a nearly neutral print whose darkest areas are still mid gray, it lowers the black floor while protecting bright detail. The flattest of these prints also get a small, limited local contrast lift. Clearer or colourful prints skip this step.
+- **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift to muted pixels. The lift tapers to zero for vivid pixels, and neutral black-and-white photos do not receive it.
 
-The preview names the corrections selected for that photo. These adjustments do not remove scratches, sharpen blur, invent missing detail, or accurately reconstruct unknown original colours.
+The preview names the corrections selected for that photo. These adjustments do not remove scratches, sharpen blur, invent missing detail, or accurately reconstruct unknown original colours. Local contrast can make existing grain and scratches more visible, so check a preview before saving a large batch.

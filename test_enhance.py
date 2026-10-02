@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from enhance import auto_enhance
+from enhance import _lift_weak_color, auto_enhance
 from server import save_enhanced_image
 
 
@@ -74,6 +74,29 @@ class EnhanceTests(unittest.TestCase):
         self.assertGreater(int(result[20, 200, 0]), 230)
         self.assertLess(abs(int(result[20, 200, 2]) - 128), 8)
         self.assertEqual(int((result[:, :, 0] == 255).sum()), 0)
+
+    def test_gray_veil_is_reduced_without_clipping_white_detail(self):
+        gray = np.tile(np.linspace(110, 222, 256, dtype=np.uint8), (256, 1))
+        image = Image.fromarray(np.stack([gray] * 3, axis=2))
+        improved, changes = auto_enhance(image)
+        result = cv2.cvtColor(np.asarray(improved), cv2.COLOR_RGB2LAB)[:, :, 0]
+        self.assertIn("Gray veil reduced", changes)
+        self.assertIn("Local detail clarified", changes)
+        self.assertLess(float(np.percentile(result, 2)), 85)
+        self.assertGreater(float(np.percentile(result, 98)), 225)
+        self.assertLess(float(np.percentile(result, 98)), 250)
+
+    def test_weak_colour_lifts_without_boosting_vivid_colour(self):
+        pixels = np.empty((200, 200, 3), dtype=np.uint8)
+        pixels[:, :100] = (210, 210, 210)
+        pixels[:, 100:180] = (150, 110, 110)
+        pixels[:, 180:] = (170, 25, 20)
+        improved, lifted = _lift_weak_color(pixels)
+        before = cv2.cvtColor(pixels, cv2.COLOR_RGB2HSV)
+        after = cv2.cvtColor(improved, cv2.COLOR_RGB2HSV)
+        self.assertTrue(lifted)
+        self.assertGreater(int(after[20, 130, 1]), int(before[20, 130, 1]) + 3)
+        self.assertLessEqual(int(after[20, 190, 1]), int(before[20, 190, 1]) + 5)
 
     def test_saves_unique_copies_and_archives_original(self):
         with tempfile.TemporaryDirectory() as temporary:
