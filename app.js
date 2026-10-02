@@ -8,6 +8,8 @@ const storedEnhance = JSON.parse(localStorage.getItem('cropper-enhance-settings'
 const enhanceSettings = { mode: storedEnhance.mode || 'subfolder', subfolder: storedEnhance.subfolder || 'Enhanced', folder: storedEnhance.folder || '', prefix: storedEnhance.prefix || '', suffix: storedEnhance.suffix === undefined ? '_enhanced' : storedEnhance.suffix };
 let toastTimer;
 let cropPreviewUrl = null;
+let cropPreviewTimer = null;
+let cropPreviewRequest = 0;
 
 function toast(message, error = false) {
   const element = $('toast'); element.textContent = message; element.classList.toggle('error', error); element.classList.add('show');
@@ -225,18 +227,23 @@ async function saveEnhancedBatch() {
   const paths = state.images.map(image => image.path).filter(path => state.enhance.selected.has(path));
   const batchSettings = { ...enhanceSettings };
   state.enhance.busy = true; state.enhance.stop = false; renderEnhanceControls();
-  let saved = 0; const failed = [];
+  let saved = 0; const failed = []; const archived = new Set();
   for (const [index, path] of paths.entries()) {
     if (state.enhance.stop) break;
     $('enhance-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
-    try { await api('/api/enhance', { path, settings: batchSettings }); state.enhance.selected.delete(path); saved++; }
+    try { await api('/api/enhance', { path, settings: batchSettings }); state.enhance.selected.delete(path); archived.add(path); saved++; }
     catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (error.code === 'permission_denied') state.enhance.stop = true; }
     refreshEnhanceTiles(); renderEnhanceControls();
   }
   const stopped = state.enhance.stop;
   state.enhance.busy = false; renderEnhanceControls();
-  $('enhance-progress').textContent = `${saved} saved${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · batch stopped' : ''}`;
-  if (failed.length) toast(failed[0], true); else toast(`${saved} enhanced ${saved === 1 ? 'copy' : 'copies'} saved${stopped ? ' before stopping' : ''}.`);
+  if (archived.size) {
+    state.images = state.images.filter(image => !archived.has(image.path));
+    $('image-count').textContent = state.images.length;
+    clearEnhancePreview(); renderImages(); renderEnhanceControls();
+  }
+  $('enhance-progress').textContent = `${saved} saved and original${saved === 1 ? '' : 's'} archived${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · batch stopped' : ''}`;
+  if (failed.length) toast(failed[0], true); else toast(`${saved} enhanced ${saved === 1 ? 'copy' : 'copies'} saved; original${saved === 1 ? '' : 's'} moved to Pre-Enhancement${stopped ? ' before stopping' : ''}.`);
 }
 async function pickFolder(forOutput = false) {
   state.picker = { forOutput, path: (forOutput ? (forOutput === 'merge' ? mergeSettings.folder : forOutput === 'enhance' ? enhanceSettings.folder : settings.folder) : state.folder) || state.home, parent: null };
@@ -339,6 +346,7 @@ function clearEditor() {
 async function openImage(index) {
   if (index < 0 || index >= state.images.length) return;
   const ticket = ++state.requestId; state.index = index; state.points = []; state.rotation = 0; endZoom();
+  clearLiveCropPreview();
   const item = state.images[index];
   $('image-title').textContent = item.name; $('image-subtitle').textContent = `${formatBytes(item.bytes)}  ·  Loading image…`;
   $('position').textContent = `${index + 1} / ${state.images.length}`;
@@ -360,6 +368,8 @@ function fitImage() {
   const frame = $('canvas-shell'); const pad = 42;
   const scale = Math.min((frame.clientWidth - pad) / state.width, (frame.clientHeight - pad) / state.height);
   const layer = $('image-layer'); layer.style.width = `${Math.max(1, state.width * scale)}px`; layer.style.height = `${Math.max(1, state.height * scale)}px`;
+  const preview = $('live-preview-image');
+  preview.style.height = layer.style.height; preview.style.maxHeight = layer.style.height;
   $('overlay').setAttribute('viewBox', `0 0 ${state.width} ${state.height}`);
   renderOverlay();
 }
@@ -402,10 +412,10 @@ function updateControls() {
   $('canvas-help').textContent = count < 4 ? 'Click the four corners in any order' : complete ? 'Drag corners to refine · Enter to save' : 'Drag a point to make a four-sided area';
   $('undo').disabled = !count; $('reset').disabled = !count; $('rotate-left').disabled = state.index < 0; $('rotate-right').disabled = state.index < 0;
   $('save').disabled = !complete || state.busy || !!validSettings();
-  $('crop-preview').disabled = !complete || state.busy || !!validSettings();
   $('select-whole').disabled = state.index < 0 || !state.width || state.busy;
   $('save-hint').textContent = state.busy ? 'Saving crop…' : validSettings() || (complete ? 'Ready to save the straightened image' : 'Select four corners to enable saving');
   $('prev').disabled = state.index <= 0; $('next').disabled = state.index < 0 || state.index >= state.images.length - 1;
+  scheduleLiveCropPreview();
 }
 function startZoom() {
   if (state.zoom || state.index < 0 || $('image-layer').classList.contains('hidden')) return;
@@ -415,6 +425,11 @@ function startZoom() {
   layer.style.transformOrigin = `${x}px ${y}px`; layer.style.transform = 'scale(3)'; state.zoom = true; $('zoom-label').classList.remove('hidden');
 }
 function endZoom() { state.zoom = false; $('image-layer').style.transform = 'scale(1)'; $('zoom-label').classList.add('hidden'); }
+function selectWholeImage() {
+  if (!state.width || !state.height || state.busy) return;
+  state.points = [{ x: 0, y: 0 }, { x: state.width - 1, y: 0 }, { x: state.width - 1, y: state.height - 1 }, { x: 0, y: state.height - 1 }];
+  renderOverlay(); updateControls();
+}
 async function cropSave() {
   if (state.busy || state.index < 0 || !ordered(state.points)) return;
   const problem = validSettings(); if (problem) { toast(problem,true); return; }
@@ -436,27 +451,40 @@ async function cropSave() {
   }
   finally { state.busy = false; updateControls(); }
 }
-function closeCropPreview() {
-  $('crop-preview-modal').classList.add('hidden');
+function clearLiveCropPreview(message = 'Select four corners to see the result here.') {
+  ++cropPreviewRequest; clearTimeout(cropPreviewTimer);
   if (cropPreviewUrl) URL.revokeObjectURL(cropPreviewUrl);
-  cropPreviewUrl = null; $('crop-preview-image').classList.add('hidden');
+  cropPreviewUrl = null; $('live-preview-image').removeAttribute('src'); $('live-preview-image').classList.add('hidden');
+  $('live-preview-status').textContent = message; $('live-preview-status').classList.remove('hidden'); $('live-preview-ratio').textContent = '—';
 }
-async function previewCrop() {
-  if (!ordered(state.points) || validSettings()) return;
-  $('crop-preview-modal').classList.remove('hidden');
-  $('crop-preview-status').textContent = 'Preparing preview…';
-  $('crop-preview-status').classList.remove('hidden');
-  $('crop-preview-image').classList.add('hidden');
+function previewRatioLabel() {
+  if (settings.aspect === 'auto') return 'Measured ratio';
+  if (settings.aspect === 'custom') return settings.customAspect || 'Custom ratio';
+  return settings.aspect;
+}
+function scheduleLiveCropPreview() {
+  const ready = state.index >= 0 && !state.busy && !!ordered(state.points);
+  if (!ready) { clearLiveCropPreview(); return; }
+  const problem = validSettings();
+  if (problem) { clearLiveCropPreview(problem); return; }
+  clearTimeout(cropPreviewTimer);
+  const ticket = ++cropPreviewRequest;
+  $('live-preview-status').textContent = 'Updating preview…'; $('live-preview-status').classList.remove('hidden');
+  $('live-preview-ratio').textContent = previewRatioLabel();
+  const source = state.images[state.index];
+  const points = state.points.map(point => [point.x, point.y]); const rotation = state.rotation; const aspectRatio = cropAspectRatio();
+  cropPreviewTimer = setTimeout(() => renderLiveCropPreview(ticket, source, points, rotation, aspectRatio), 180);
+}
+async function renderLiveCropPreview(ticket, source, points, rotation, aspectRatio) {
   try {
-    const response = await fetch('/api/crop-preview', { method:'POST', headers:{'X-Cropper-Token':state.token,'Content-Type':'application/json'}, body:JSON.stringify({path:state.images[state.index].path,points:state.points.map(p=>[p.x,p.y]),rotation:state.rotation,aspect_ratio:cropAspectRatio()}) });
+    const response = await fetch('/api/crop-preview', { method:'POST', headers:{'X-Cropper-Token':state.token,'Content-Type':'application/json'}, body:JSON.stringify({path:source.path,points,rotation,aspect_ratio:aspectRatio}) });
     if (!response.ok) throw new Error((await response.json()).error || 'Could not make the preview.');
     const blob = await response.blob();
-    if ($('crop-preview-modal').classList.contains('hidden')) return;
+    if (ticket !== cropPreviewRequest) return;
     if (cropPreviewUrl) URL.revokeObjectURL(cropPreviewUrl);
     cropPreviewUrl = URL.createObjectURL(blob);
-    $('crop-preview-image').src = cropPreviewUrl; $('crop-preview-image').classList.remove('hidden');
-    $('crop-preview-status').classList.add('hidden');
-  } catch (error) { $('crop-preview-status').textContent = error.message; }
+    $('live-preview-image').src = cropPreviewUrl; $('live-preview-image').classList.remove('hidden'); $('live-preview-status').classList.add('hidden');
+  } catch (error) { if (ticket === cropPreviewRequest) $('live-preview-status').textContent = error.message; }
 }
 
 function wire() {
@@ -491,14 +519,10 @@ function wire() {
   $('prev').addEventListener('click',()=>openImage(state.index-1)); $('next').addEventListener('click',()=>openImage(state.index+1));
   $('undo').addEventListener('click',()=>{state.points.pop();renderOverlay();updateControls();});
   $('reset').addEventListener('click',()=>{state.points=[];state.rotation=0;renderOverlay();updateControls();});
-  $('select-whole').addEventListener('click',()=>{if(!state.width||!state.height)return;state.points=[{x:0,y:0},{x:state.width-1,y:0},{x:state.width-1,y:state.height-1},{x:0,y:state.height-1}];renderOverlay();updateControls();});
-  $('rotate-left').addEventListener('click',()=>{state.rotation=((state.rotation-90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`);});
-  $('rotate-right').addEventListener('click',()=>{state.rotation=((state.rotation+90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`);});
+  $('select-whole').addEventListener('click',selectWholeImage);
+  $('rotate-left').addEventListener('click',()=>{state.rotation=((state.rotation-90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
+  $('rotate-right').addEventListener('click',()=>{state.rotation=((state.rotation+90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
   $('save').addEventListener('click',cropSave);
-  $('crop-preview').addEventListener('click',previewCrop);
-  $('crop-preview-close').addEventListener('click',closeCropPreview);
-  $('crop-preview-done').addEventListener('click',closeCropPreview);
-  $('crop-preview-modal').addEventListener('click',event=>{if(event.target===$('crop-preview-modal'))closeCropPreview();});
   const layer = $('image-layer');
   layer.addEventListener('pointerdown',event=>{
     if(state.index<0||state.busy)return;
@@ -510,11 +534,11 @@ function wire() {
   layer.addEventListener('pointerup',()=>{state.drag=-1;}); layer.addEventListener('pointercancel',()=>{state.drag=-1;});
   document.addEventListener('keydown',event=>{
     if(!$('folder-modal').classList.contains('hidden')){if(event.key==='Escape')closePicker();return;}
-    if(!$('crop-preview-modal').classList.contains('hidden')){if(event.key==='Escape')closeCropPreview();return;}
     if (state.view !== 'crop') return;
     if(event.key==='Control'){startZoom();return;}
     if(['INPUT','TEXTAREA'].includes(document.activeElement?.tagName))return;
-    if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
+    if(event.key.toLowerCase()==='a'&&event.ctrlKey){event.preventDefault();selectWholeImage();}
+    else if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
     else if(event.key==='ArrowRight'){event.preventDefault();openImage(state.index+1);}
     else if(event.key==='Enter'){event.preventDefault();cropSave();}
     else if(event.key==='Backspace'){event.preventDefault();state.points=[];renderOverlay();updateControls();}

@@ -233,12 +233,32 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     return destination, merged.size
 
 
-def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, int], list[str]]:
+def archive_enhancement_source(source: Path) -> Path:
+    """Move a successfully enhanced source aside, keeping all originals recoverable."""
+    if source.parent.name.casefold() == "pre-enhancement":
+        return source
+    archive_folder = source.parent / "Pre-Enhancement"
+    archive_folder.mkdir(parents=True, exist_ok=True)
+    destination = archive_folder / source.name
+    if destination.exists():
+        for index in range(2, 10000):
+            candidate = archive_folder / f"{source.stem}_{index}{source.suffix}"
+            if not candidate.exists():
+                destination = candidate
+                break
+        else:
+            raise OSError("Could not find a free name in Pre-Enhancement.")
+    os.replace(source, destination)
+    return destination
+
+
+def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, int], list[str], Path]:
     image, info = load_image(source)
     enhanced, changes = auto_enhance(image)
     destination = choose_output(source, settings)
     save_rendered(enhanced, destination, info)
-    return destination, enhanced.size, changes
+    archived_source = archive_enhancement_source(source)
+    return destination, enhanced.size, changes, archived_source
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -368,8 +388,8 @@ class Handler(BaseHTTPRequestHandler):
                 requested = data.get("settings", {})
                 if requested.get("mode") == "replace":
                     raise ValueError("Auto improve saves a copy so you can compare it with the original.")
-                destination, size, changes = save_enhanced_image(path, requested)
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes})
+                destination, size, changes, archived_source = save_enhanced_image(path, requested)
+                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source)})
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:

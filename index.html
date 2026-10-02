@@ -48,6 +48,7 @@
           <div class="editor-title"><div class="eyebrow">PERSPECTIVE CROP</div><h1 id="image-title">Ready when you are</h1><p id="image-subtitle">Open a folder, then double-click an image to begin.</p></div>
           <div class="navigation"><button class="icon-button" id="prev" title="Previous image (left arrow)" aria-label="Previous image">←</button><span id="position">— / —</span><button class="icon-button" id="next" title="Next image (right arrow)" aria-label="Next image">→</button></div>
         </div>
+        <div class="crop-stage">
         <div class="canvas-shell" id="canvas-shell">
           <div id="empty-state" class="empty-state">
             <div class="empty-symbol"><span class="corner a"></span><span class="corner b"></span><span class="corner c"></span><span class="corner d"></span><span>✦</span></div>
@@ -62,9 +63,15 @@
           <div id="zoom-label" class="zoom-label hidden"><span>⌕</span> Precision zoom ×3 <kbd>CTRL</kbd></div>
           <div class="canvas-help" id="canvas-help">Click the four corners in any order</div>
         </div>
+        <section class="live-crop-preview" aria-labelledby="live-preview-title">
+          <div class="live-preview-head"><div><div class="eyebrow">LIVE RESULT</div><h2 id="live-preview-title">Straightened preview</h2></div><span id="live-preview-ratio">—</span></div>
+          <div class="live-preview-image-wrap"><img id="live-preview-image" class="hidden" alt="Live preview of the straightened crop"><p id="live-preview-status">Select four corners to see the result here.</p></div>
+          <p class="live-preview-note">Updates automatically when you move a corner or change the output proportions.</p>
+        </section>
+        </div>
         <div class="editor-bottom">
           <div class="progress-group"><div class="progress-dots" id="progress-dots"><span></span><span></span><span></span><span></span></div><div><strong id="step-title">Select four corners</strong><small id="step-detail">Click once for each corner, or drag a point to refine it.</small></div></div>
-          <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point (Ctrl+Z)">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="select-whole" title="Select all four corners of this image">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
+          <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point (Ctrl+Z)">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="select-whole" title="Select all four corners of this image (Ctrl+A)">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
         </div>
         <div class="shortcut-strip"><span><kbd>CTRL</kbd> hold to zoom for precise clicks</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
         </div>
@@ -110,14 +117,13 @@
         </div>
         <div class="settings-spacer"></div>
         <label class="toggle-line"><input type="checkbox" id="auto-next" checked><span class="switch"></span><span>Move to next image after saving</span></label>
-        <button class="button button-quiet preview-button" id="crop-preview" disabled>Preview straightened photo</button>
         <button class="button button-primary save-button" id="save" disabled><span>Crop &amp; save</span><span>↗</span></button>
         <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p><button id="save-error-browse" class="text-button">Choose another output folder →</button></div>
         <div class="save-hint" id="save-hint">Select four corners to enable saving</div>
       </aside>
       <aside class="settings panel hidden" id="enhance-settings">
         <div class="panel-head"><div><div class="eyebrow">AUTO IMPROVE</div><h2>Save enhanced copies</h2></div><span class="saved-badge">Saved for next time</span></div>
-        <p class="settings-intro">Cropper balances likely neutral areas, improves contrast, and gently lifts faded colour. Each photo gets its own correction.</p>
+        <p class="settings-intro">Cropper balances likely neutral areas, improves contrast, and gently lifts faded colour. After a copy saves successfully, its source moves into a <strong>Pre-Enhancement</strong> subfolder.</p>
         <details class="enhance-explainer"><summary>How does it decide?</summary><p>This is an automatic, rule-based correction. Each photo is measured separately. Cropper balances likely whites and darker areas independently to reduce yellow or red casts. For faded prints it restores the range between dull whites and grey blacks while keeping highlight texture; other photos get a gentler contrast adjustment. It can also soften remaining warmth and lift weak colour. It skips corrections that do not appear needed. Review the preview, especially for intentionally warm or sepia photos. It cannot reconstruct missing facial detail.</p></details>
         <div class="settings-group"><div class="section-label">DESTINATION</div>
           <label class="radio-card"><input type="radio" name="enhance-mode" value="subfolder"><span class="radio-visual"></span><span><strong>Source subfolder</strong><small>Keep originals with enhanced copies</small></span></label>
@@ -170,7 +176,6 @@
     </div>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <div id="crop-preview-modal" class="folder-modal hidden" role="dialog" aria-modal="true" aria-labelledby="crop-preview-title"><div class="crop-preview-dialog"><div class="crop-preview-head"><div><div class="eyebrow">BEFORE SAVING</div><h2 id="crop-preview-title">Straightened photo preview</h2></div><button class="icon-button" id="crop-preview-close" aria-label="Close preview">×</button></div><div class="crop-preview-body"><p id="crop-preview-status">Preparing preview…</p><img id="crop-preview-image" alt="Preview of perspective crop" class="hidden"></div><div class="crop-preview-foot"><span>Check that people and objects look natural. You can change Output proportions and preview again.</span><button class="button button-quiet" id="crop-preview-done">Back to crop</button></div></div></div>
   <script src="/app.js"></script>
 </body>
 </html>

@@ -75,18 +75,18 @@ class EnhanceTests(unittest.TestCase):
         self.assertLess(abs(int(result[20, 200, 2]) - 128), 8)
         self.assertEqual(int((result[:, :, 0] == 255).sum()), 0)
 
-    def test_saves_unique_copies_and_keeps_original(self):
+    def test_saves_unique_copies_and_archives_original(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "old.jpg"
             Image.new("RGB", (80, 60), (170, 150, 120)).save(source)
             original = source.read_bytes()
             settings = {"mode": "subfolder", "subfolder": "Enhanced", "suffix": "_enhanced"}
-            first, size, _ = save_enhanced_image(source, settings)
-            second, _, _ = save_enhanced_image(source, settings)
+            first, size, _, archived = save_enhanced_image(source, settings)
             self.assertEqual(size, (80, 60))
             self.assertEqual(first.name, "old_enhanced.jpg")
-            self.assertEqual(second.name, "old_enhanced_2.jpg")
-            self.assertEqual(source.read_bytes(), original)
+            self.assertFalse(source.exists())
+            self.assertEqual(archived, Path(temporary) / "Pre-Enhancement" / "old.jpg")
+            self.assertEqual(archived.read_bytes(), original)
 
 
 if __name__ == "__main__":

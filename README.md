@@ -24,7 +24,7 @@ You can also run `python server.py` directly. Cropper binds only to `127.0.0.1`,
 4. Hold **Ctrl** to magnify around the mouse pointer for precise clicking or dragging. Release Ctrl to return to the fitted view.
 5. Press **Enter** or click **Crop & save**. With **Move to next image** enabled, the next image opens automatically.
 
-Drag any corner after placing it. Use **Ctrl+Z** to undo the last corner, **Backspace** to reset, and **Left/Right arrow** to move between images. The Rotate buttons rotate the saved crop by 90 degrees.
+Drag any corner after placing it. Use **Ctrl+A** to select the whole image, **Ctrl+Z** to undo the last corner, **Backspace** to reset, and **Left/Right arrow** to move between images. The Rotate buttons rotate the saved crop by 90 degrees.
 
 The image list has its own scrollbar, so a large folder does not move the crop frame off-screen. If Cropper reports that a folder is not writable, choose another output folder or check that folder's Windows permissions.
 
@@ -51,7 +51,7 @@ Select the front photo first, then its matching back. Cropper places the back to
 
 1. Open whichever folder contains the images to improve. It can hold original photos, cropped photos, front and back images, or any other supported images.
 2. Select **Auto improve**. Click an image to add it to the batch and see its before and after preview. Click more images, or use **Select all**.
-3. Choose a destination. The default is an `Enhanced` subfolder with `_enhanced` added to filenames. These settings persist in the browser.
+3. Choose a destination. The default is an `Enhanced` subfolder with `_enhanced` added to filenames. These settings persist in the browser. After an enhanced copy is written successfully, Cropper moves the source into a `Pre-Enhancement` subfolder beside it, preserving the original for later comparison or recovery.
 4. Review the preview, then select **Save selected copies**. Cropper analyses each photo individually and reports the batch result.
 
 The automatic correction uses local pixel processing. It can reduce a colour cast and improve faded tones, but it cannot know the original colours of every aged photo. Photos with unusual lighting or intentional sepia tones should be reviewed before saving. The preview is limited to 1,800 pixels; saved copies use the image's full resolution. Originals are preserved in Auto improve.
