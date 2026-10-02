@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from enhance import auto_enhance
-from restore import OPERATIONS, preview_dust_marks, restore
+from restore import OPERATIONS, preview_dust_marks, restore, useful_change
 
 
 HERE = Path(__file__).resolve().parent
@@ -263,13 +263,15 @@ def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, 
     return destination, enhanced.size, changes, archived_source
 
 
-def save_restored_image(source: Path, operation: str, strokes: list | None = None) -> tuple[Path, tuple[int, int], list[str], Path]:
+def save_restored_image(source: Path, operation: str, strokes: list | None = None) -> tuple[Path | None, tuple[int, int], list[str], Path | None]:
     if operation not in OPERATIONS:
         raise ValueError("Choose a valid restoration tab.")
     output_name, archive_name = OPERATIONS[operation]
     with RESTORE_LOCK:
         image, info = load_image(source)
         restored, changes = restore(image, operation, strokes)
+        if not useful_change(changes):
+            return None, restored.size, changes, None
         destination = choose_output(source, {"mode": "subfolder", "subfolder": output_name})
         save_rendered(restored, destination, info)
         try:
@@ -444,12 +446,15 @@ class Handler(BaseHTTPRequestHandler):
                 preview.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 payload = io.BytesIO()
                 preview.save(payload, format="JPEG", quality=89, optimize=True)
-                self.reply(200, payload.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
+                self.reply(200, payload.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes),
+                                                                   "X-Cropper-Useful": str(useful_change(changes)).lower()})
                 return
             if self.path == "/api/restore":
                 path = image_path(data.get("path", ""))
                 destination, size, changes, archived = save_restored_image(path, data.get("operation", ""), data.get("strokes"))
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived)})
+                self.json(200, {"path": str(destination or path), "name": (destination or path).name,
+                                "width": size[0], "height": size[1], "changes": changes,
+                                "archived_path": str(archived) if archived else None, "skipped": destination is None})
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:

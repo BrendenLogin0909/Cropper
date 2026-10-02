@@ -31,6 +31,11 @@ def _monochrome(rgb: np.ndarray) -> bool:
     return float(np.percentile(np.max(sample, axis=2) - np.min(sample, axis=2), 95)) <= 3
 
 
+def _nearly_monochrome(rgb: np.ndarray) -> bool:
+    sample = rgb[:: max(1, rgb.shape[0] // 600), :: max(1, rgb.shape[1] // 600)].astype(np.int16)
+    return float(np.percentile(np.max(sample, axis=2) - np.min(sample, axis=2), 95)) <= 12
+
+
 def _noise_level(gray: np.ndarray) -> float:
     # Work at native pixel scale: resizing first would average away scan noise.
     height, width = gray.shape
@@ -69,6 +74,31 @@ def _dust_mask(rgb: np.ndarray) -> np.ndarray:
         if 2 <= area <= maximum_area and max(width, height) <= max(25, min(lightness.shape) // 25):
             region = mask[y:y + height, x:x + width]
             region[labels[y:y + height, x:x + width] == label] = 255
+
+    # Smooth, faded monochrome prints can hold many pale flecks missed by a
+    # small median filter. Limit this wider search to low-colour, low-contrast
+    # prints; on other scenes it catches real facial and fabric detail.
+    height, width = lightness.shape
+    interior = lightness[height // 20: height - height // 20,
+                         width // 20: width - width // 20]
+    dark, bright = np.percentile(interior[::4, ::4], (5, 95))
+    if _nearly_monochrome(rgb) and dark > 55 and bright - dark < 150:
+        gray = _gray(rgb)
+        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        pale_marks = cv2.subtract(gray, opened)
+        smooth = cv2.GaussianBlur(gray, (0, 0), 5)
+        gradient_x = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3)
+        candidates = ((pale_marks > 24) & (np.hypot(gradient_x, gradient_y) < 6)).astype(np.uint8)
+        candidates[:4] = 0; candidates[-4:] = 0
+        candidates[:, :4] = 0; candidates[:, -4:] = 0
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(candidates, 8)
+        for label in range(1, count):
+            x, y, mark_width, mark_height, area = stats[label]
+            if 3 <= area <= 600 and min(mark_width, mark_height) <= 7 and max(mark_width, mark_height) <= 130:
+                region = mask[y:y + mark_height, x:x + mark_width]
+                region[labels[y:y + mark_height, x:x + mark_width] == label] = 255
     if np.count_nonzero(mask) > lightness.size * 0.006:
         return np.zeros_like(mask)
     return cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
@@ -119,8 +149,9 @@ def preview_dust_marks(image: Image.Image, strokes: list | None = None) -> tuple
 def repair_dust(image: Image.Image, strokes: list | None = None) -> tuple[Image.Image, list[str]]:
     rgb = _rgb(image)
     mask = _combined_dust_mask(rgb, strokes)
-    if not np.any(mask):
-        return image.copy(), ["No high-confidence dust or short scratches detected"]
+    amount = int(np.count_nonzero(mask))
+    if amount < max(8, round(mask.size * 0.00015)) and not strokes:
+        return image.copy(), ["No useful automatic dust repair found; mark a visible scratch if needed"]
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     repaired = cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
     label = "Detected dust and marked scratches repaired" if strokes else "Isolated dust and short scratches repaired"
@@ -143,25 +174,62 @@ def reduce_noise(image: Image.Image) -> tuple[Image.Image, list[str]]:
 
 def sharpen_detail(image: Image.Image) -> tuple[Image.Image, list[str]]:
     rgb = _rgb(image)
+    if min(rgb.shape[:2]) < 16:
+        return image.copy(), ["No useful change: image is too small for safe detail correction"]
     gray = _gray(rgb)
     noise = _noise_level(gray)
     if noise >= 7.0:
-        return image.copy(), ["Noise is too strong for safe automatic sharpening"]
+        return image.copy(), ["No safe detail correction: this photo has strong grain"]
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     lightness = lab[:, :, 0].astype(np.float32)
+    height, width = lightness.shape
+    interior = lightness[height // 20: height - height // 20,
+                         width // 20: width - width // 20]
+    dark, middle, bright = np.percentile(interior[::4, ::4], (5, 50, 95))
+    tonal_width = bright - dark
+    fade_strength = float(np.clip((180 - tonal_width) / 80, 0, 1)
+                          * np.clip((dark - 45) / 80, 0, 1) * 0.65)
+    if bright >= 245:
+        fade_strength = 0.0
+
+    scale = min(1.0, 1200 / max(width, height))
+    sample = cv2.resize(gray, (max(1, round(width * scale)), max(1, round(height * scale))))
+    softened_sample = cv2.GaussianBlur(sample, (0, 0), 1)
+    edge_variance = float(cv2.Laplacian(softened_sample, cv2.CV_32F).var())
+    gradient_x = cv2.Sobel(softened_sample, cv2.CV_32F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(softened_sample, cv2.CV_32F, 0, 1, ksize=3)
+    strong_edge = float(np.percentile(np.hypot(gradient_x, gradient_y), 99))
+    if fade_strength < 0.15 and (edge_variance >= 25 or strong_edge >= 180):
+        return image.copy(), ["No useful change: this photo already has clear tones and edges"]
+
+    changes = []
+    if fade_strength >= 0.15 and dark + 5 < middle < bright - 5:
+        anchors = np.array([0, dark, middle, bright, 255], dtype=np.float32)
+        targets = np.array([0, 35, 140, 230, 255], dtype=np.float32)
+        curve = np.interp(np.arange(256), anchors, targets)
+        curve = np.clip((1 - fade_strength) * np.arange(256) + fade_strength * curve, 0, 255).astype(np.uint8)
+        lightness = cv2.LUT(lightness.astype(np.uint8), curve).astype(np.float32)
+        changes.append("Faded tonal range recovered")
+
     blur = cv2.GaussianBlur(lightness, (0, 0), 1.2)
     detail = lightness - blur
-    threshold = max(2.5, noise * 1.3)
+    threshold = max(2.0, noise * 1.3)
     visible = np.abs(detail) > threshold
-    if visible.mean() < 0.006:
-        return image.copy(), ["No recoverable edge detail detected"]
-    amount = 0.26 if visible.mean() > 0.12 else 0.43
-    adjustment = np.clip(detail * amount, -9.0, 9.0)
+    if visible.mean() < 0.006 and not changes:
+        return image.copy(), ["No useful change: too little recoverable edge detail"]
+    amount = 0.35 if visible.mean() > 0.12 else 0.75
+    adjustment = np.clip(detail * amount, -13.0, 13.0)
     taper = np.minimum(lightness / 28.0, (255.0 - lightness) / 28.0)
     new_lightness = np.clip(lightness + adjustment * visible * np.clip(taper, 0, 1), 0, 255).astype(np.uint8)
     lab[:, :, 0] = new_lightness
     result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    return Image.fromarray(result), ["Existing edges gently sharpened"]
+    if visible.mean() >= 0.006:
+        changes.append("Existing edges clarified")
+    return Image.fromarray(result), changes
+
+
+def useful_change(changes: list[str]) -> bool:
+    return bool(changes) and not changes[0].startswith("No ")
 
 
 def restore(image: Image.Image, operation: str, strokes: list | None = None) -> tuple[Image.Image, list[str]]:

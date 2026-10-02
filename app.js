@@ -1,9 +1,9 @@
 const $ = id => document.getElementById(id);
-const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
+const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: 'Dust Repaired', archive: 'Before Dust Repair', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
   noise: { title: 'Noise reduction', output: 'Noise Reduced', archive: 'Before Noise Reduction', description: 'Measures fine grain and colour speckles in each photo. It skips clearer photos and uses a limited, detail-preserving correction where noise is present.' },
-  sharpen: { title: 'Sharpening', output: 'Sharpened', archive: 'Before Sharpening', description: 'Adds a small lift to existing edges while limiting halos and avoiding very noisy photos. It cannot recover detail missing from an out-of-focus image.' }
+  sharpen: { title: 'Detail & clarity', output: 'Sharpened', archive: 'Before Sharpening', description: 'Finds photos with faded gray tones or soft edges, then restores a measured tonal range and clarifies existing detail. Clear photos are skipped. It cannot recreate detail missing from an out-of-focus image.' }
 };
 const stored = JSON.parse(localStorage.getItem('cropper-settings') || '{}');
 const settings = { mode: stored.mode || 'subfolder', subfolder: stored.subfolder || 'Cropped', folder: stored.folder || '', prefix: stored.prefix || '', suffix: stored.suffix || '', autoNext: stored.autoNext !== false, aspect: stored.aspect || 'auto', customAspect: stored.customAspect || '2:3' };
@@ -131,7 +131,7 @@ function setView(view) {
   $('restore-workspace').classList.toggle('hidden', !restoring); $('restore-settings').classList.toggle('hidden', !restoring);
   for (const name of Object.keys(RESTORE_INFO)) { const active = view === name; $(`${name}-tab`).classList.toggle('active', active); $(`${name}-tab`).setAttribute('aria-selected', String(active)); }
   if (restoring && previous !== view) {
-    state.restore.selected.clear(); state.restore.marks.clear(); state.restore.brush = false; state.restore.showMarks = false;
+    state.restore.selected.clear(); state.restore.notNeeded.clear(); state.restore.marks.clear(); state.restore.brush = false; state.restore.showMarks = false;
     clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden');
     const info = RESTORE_INFO[view];
     $('restore-title').textContent = info.title; $('restore-settings-title').textContent = info.title;
@@ -264,10 +264,11 @@ async function saveEnhancedBatch() {
 }
 function renderRestorationControls() {
   const count = state.restore.selected.size;
-  $('restore-selection-count').textContent = `${count} selected`;
-  $('restore-save').disabled = !count || state.restore.busy;
+  const useful = [...state.restore.selected].filter(path => !state.restore.notNeeded.has(path)).length;
+  $('restore-selection-count').textContent = `${count} selected${count > useful ? ` · ${count - useful} no change needed` : ''}`;
+  $('restore-save').disabled = !useful || state.restore.busy;
   $('restore-save').firstElementChild.textContent = !count ? 'Save selected photos' : count === 1 ? 'Save restored photo' : `Save ${count} selected photos`;
-  $('restore-save-hint').textContent = state.restore.busy ? 'Processing selected photos…' : count ? 'Review the preview, then save the batch' : 'Select photos to enable saving';
+  $('restore-save-hint').textContent = state.restore.busy ? 'Processing selected photos…' : count && !useful ? 'No useful change for the selected photo; choose another image or tab' : count ? 'Review the preview, then save the batch' : 'Select photos to enable saving';
   const dust = state.view === 'dust'; const previewPath = state.images[state.restore.preview]?.path;
   for (const id of ['restore-mark-scratch', 'restore-clear-marks', 'restore-show-marks']) $(id).classList.toggle('hidden', !dust);
   $('restore-mark-scratch').disabled = !dust || !previewPath || state.restore.busy;
@@ -289,6 +290,7 @@ function refreshRestorationTiles() {
   document.querySelectorAll('#images .image-tile').forEach((tile, index) => {
     tile.classList.toggle('restore-selected', state.restore.selected.has(state.images[index].path));
     tile.classList.toggle('restore-previewed', state.restore.preview === index);
+    tile.classList.toggle('restore-not-needed', state.restore.notNeeded.has(state.images[index].path));
   });
 }
 function clearRestorationPreview() {
@@ -300,6 +302,7 @@ function clearRestorationPreview() {
   $('restore-comparison').classList.add('hidden'); $('restore-empty').classList.remove('hidden');
   $('restore-subtitle').textContent = 'Open a folder, then select photos to preview.';
   $('restore-changes').textContent = 'Each image is analysed separately. Review the preview before saving.';
+  $('restore-changes').classList.remove('no-useful-change');
   $('restore-after-label').textContent = 'AFTER';
 }
 async function previewRestoration(index) {
@@ -317,11 +320,15 @@ async function previewRestoration(index) {
     const response = await fetch('/api/restore-preview', { method: 'POST', headers: { 'X-Cropper-Token': state.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path, operation, strokes: state.restore.marks.get(item.path) || [], show_marks: state.restore.showMarks && operation === 'dust' }) });
     if (!response.ok) { const data = await response.json(); throw new Error(data.error || 'Could not generate the preview.'); }
     const changes = response.headers.get('X-Cropper-Adjustments') || 'Restoration preview ready';
+    const useful = response.headers.get('X-Cropper-Useful') !== 'false';
     const blob = await response.blob();
     if (ticket !== state.restore.requestId) return;
+    if (useful) state.restore.notNeeded.delete(item.path); else state.restore.notNeeded.add(item.path);
     if (state.restore.previewUrl) URL.revokeObjectURL(state.restore.previewUrl);
     state.restore.previewUrl = URL.createObjectURL(blob); $('restore-after').src = state.restore.previewUrl;
-    $('restore-changes').textContent = changes;
+    $('restore-changes').textContent = useful ? changes : `${changes}. Skip this step for this photo.`;
+    $('restore-changes').classList.toggle('no-useful-change', !useful);
+    refreshRestorationTiles(); renderRestorationControls();
   } catch (error) { if (ticket === state.restore.requestId) { $('restore-changes').textContent = error.message; toast(error.message, true); } }
 }
 function brushPoint(event) {
@@ -357,19 +364,23 @@ function selectRestorationImage(index) {
   previewRestoration(index); renderRestorationControls();
 }
 async function saveRestorationBatch() {
-  if (state.restore.busy || !state.restore.selected.size || !RESTORE_INFO[state.view]) return;
+  if (state.restore.busy || ![...state.restore.selected].some(path => !state.restore.notNeeded.has(path)) || !RESTORE_INFO[state.view]) return;
   const operation = state.view; const info = RESTORE_INFO[operation];
   const paths = state.images.map(image => image.path).filter(path => state.restore.selected.has(path));
   state.restore.busy = true; state.restore.stop = false; renderRestorationControls();
-  let saved = 0; const failed = []; const archived = new Set();
+  let saved = 0, skipped = 0; const failed = []; const archived = new Set();
   for (const [index, path] of paths.entries()) {
     if (state.restore.stop) break;
     $('restore-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
     try {
       const result = await api('/api/restore', { path, operation, strokes: state.restore.marks.get(path) || [] });
-      state.restore.selected.delete(path); archived.add(path); saved++;
-      state.restore.marks.delete(path);
-      state.restore.resultsFolder = result.path.slice(0, Math.max(result.path.lastIndexOf('/'), result.path.lastIndexOf('\\')));
+      state.restore.selected.delete(path);
+      if (result.skipped) { state.restore.notNeeded.add(path); skipped++; }
+      else {
+        archived.add(path); saved++;
+        state.restore.marks.delete(path);
+        state.restore.resultsFolder = result.path.slice(0, Math.max(result.path.lastIndexOf('/'), result.path.lastIndexOf('\\')));
+      }
     } catch (error) {
       failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`);
       if (error.code === 'permission_denied') state.restore.stop = true;
@@ -389,8 +400,8 @@ async function saveRestorationBatch() {
     renderImages(); $('restore-open-results').classList.remove('hidden');
   }
   renderRestorationControls();
-  $('restore-progress').textContent = `${saved} saved to ${info.output}; ${saved} previous ${saved === 1 ? 'version' : 'versions'} moved to ${info.archive}${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
-  if (failed.length) toast(failed[0], true); else toast(`${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}.`);
+  $('restore-progress').textContent = `${saved} saved to ${info.output}; ${skipped} skipped because no useful change was found${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
+  if (failed.length) toast(failed[0], true); else toast(saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`);
 }
 async function pickFolder(forOutput = false) {
   state.picker = { forOutput, path: (forOutput ? (forOutput === 'merge' ? mergeSettings.folder : forOutput === 'enhance' ? enhanceSettings.folder : settings.folder) : state.folder) || state.home, parent: null };
@@ -446,7 +457,7 @@ async function loadFolder(path, preserve = false) {
     if (data.path !== state.folder) $('images').scrollTop = 0;
     state.folder = data.path; state.parent = data.parent; state.images = data.images; state.folders = data.folders;
     state.enhance.selected.clear(); clearEnhancePreview(); $('enhance-progress').textContent = ''; renderEnhanceControls();
-    state.restore.selected.clear(); state.restore.marks.clear(); clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden'); renderRestorationControls();
+    state.restore.selected.clear(); state.restore.notNeeded.clear(); state.restore.marks.clear(); clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden'); renderRestorationControls();
     localStorage.setItem('cropper-last-folder', data.path); $('folder-path').value = data.path;
     $('folder-count').textContent = data.folders.length; $('image-count').textContent = data.images.length;
     $('go-parent').disabled = !data.parent;
@@ -483,6 +494,7 @@ function renderImages() {
     tile.classList.toggle('enhance-previewed', state.view === 'enhance' && state.enhance.preview === index);
     tile.classList.toggle('restore-selected', !!RESTORE_INFO[state.view] && state.restore.selected.has(image.path));
     tile.classList.toggle('restore-previewed', !!RESTORE_INFO[state.view] && state.restore.preview === index);
+    tile.classList.toggle('restore-not-needed', !!RESTORE_INFO[state.view] && state.restore.notNeeded.has(image.path));
     host.append(tile);
   }
   host.scrollTop = previousScroll;
@@ -654,7 +666,7 @@ function wire() {
   $('enhance-clear').addEventListener('click',()=>{ state.enhance.selected.clear(); refreshEnhanceTiles(); renderEnhanceControls(); });
   $('enhance-save').addEventListener('click',saveEnhancedBatch);
   $('enhance-stop').addEventListener('click',()=>{ state.enhance.stop = true; renderEnhanceControls(); });
-  $('restore-select-all').addEventListener('click',()=>{ state.restore.selected = new Set(state.images.map(image=>image.path)); refreshRestorationTiles(); renderRestorationControls(); if (state.images.length && state.restore.preview < 0) previewRestoration(0); });
+  $('restore-select-all').addEventListener('click',()=>{ state.restore.selected = new Set(state.images.map(image=>image.path).filter(path=>!state.restore.notNeeded.has(path))); refreshRestorationTiles(); renderRestorationControls(); if (state.images.length && state.restore.preview < 0) previewRestoration(0); });
   $('restore-clear').addEventListener('click',()=>{ state.restore.selected.clear(); refreshRestorationTiles(); renderRestorationControls(); });
   $('restore-save').addEventListener('click',saveRestorationBatch);
   $('restore-stop').addEventListener('click',()=>{ state.restore.stop = true; renderRestorationControls(); });
