@@ -119,6 +119,7 @@ function validEnhanceSettings() {
   return '';
 }
 function setView(view) {
+  if (!['crop', 'merge', 'enhance'].includes(view)) return;
   if ((state.restore.busy || state.enhance.busy) && view !== state.view) { toast('Finish or stop the current batch before switching tabs.', true); return; }
   const previous = state.view;
   state.view = view;
@@ -129,7 +130,6 @@ function setView(view) {
   }
   const restoring = !!RESTORE_INFO[view];
   $('restore-workspace').classList.toggle('hidden', !restoring); $('restore-settings').classList.toggle('hidden', !restoring);
-  for (const name of Object.keys(RESTORE_INFO)) { const active = view === name; $(`${name}-tab`).classList.toggle('active', active); $(`${name}-tab`).setAttribute('aria-selected', String(active)); }
   if (restoring && previous !== view) {
     state.restore.selected.clear(); state.restore.notNeeded.clear(); state.restore.marks.clear(); state.restore.brush = false; state.restore.showMarks = false;
     clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden');
@@ -661,7 +661,6 @@ function wire() {
   $('crop-tab').addEventListener('click',()=>setView('crop'));
   $('merge-tab').addEventListener('click',()=>setView('merge'));
   $('enhance-tab').addEventListener('click',()=>setView('enhance'));
-  for (const operation of Object.keys(RESTORE_INFO)) $(`${operation}-tab`).addEventListener('click',()=>setView(operation));
   $('enhance-select-all').addEventListener('click',()=>{ state.enhance.selected = new Set(state.images.map(image=>image.path)); refreshEnhanceTiles(); renderEnhanceControls(); if (state.images.length && state.enhance.preview < 0) previewEnhance(0); });
   $('enhance-clear').addEventListener('click',()=>{ state.enhance.selected.clear(); refreshEnhanceTiles(); renderEnhanceControls(); });
   $('enhance-save').addEventListener('click',saveEnhancedBatch);
