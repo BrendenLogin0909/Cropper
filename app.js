@@ -1,5 +1,10 @@
 const $ = id => document.getElementById(id);
-const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false } };
+const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
+const RESTORE_INFO = {
+  dust: { title: 'Dust repair', output: 'Dust Repaired', archive: 'Before Dust Repair', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
+  noise: { title: 'Noise reduction', output: 'Noise Reduced', archive: 'Before Noise Reduction', description: 'Measures fine grain and colour speckles in each photo. It skips clearer photos and uses a limited, detail-preserving correction where noise is present.' },
+  sharpen: { title: 'Sharpening', output: 'Sharpened', archive: 'Before Sharpening', description: 'Adds a small lift to existing edges while limiting halos and avoiding very noisy photos. It cannot recover detail missing from an out-of-focus image.' }
+};
 const stored = JSON.parse(localStorage.getItem('cropper-settings') || '{}');
 const settings = { mode: stored.mode || 'subfolder', subfolder: stored.subfolder || 'Cropped', folder: stored.folder || '', prefix: stored.prefix || '', suffix: stored.suffix || '', autoNext: stored.autoNext !== false, aspect: stored.aspect || 'auto', customAspect: stored.customAspect || '2:3' };
 const storedMerge = JSON.parse(localStorage.getItem('cropper-merge-settings') || '{}');
@@ -114,14 +119,26 @@ function validEnhanceSettings() {
   return '';
 }
 function setView(view) {
+  if ((state.restore.busy || state.enhance.busy) && view !== state.view) { toast('Finish or stop the current batch before switching tabs.', true); return; }
+  const previous = state.view;
   state.view = view;
   for (const name of ['crop', 'merge', 'enhance']) {
     const active = view === name;
     $(`${name}-workspace`).classList.toggle('hidden', !active); $(`${name}-settings`).classList.toggle('hidden', !active);
     $(`${name}-tab`).classList.toggle('active', active); $(`${name}-tab`).setAttribute('aria-selected', String(active));
   }
-  $('explorer-foot').textContent = view === 'enhance' ? 'Click photos to select and preview' : view === 'merge' ? 'Click front, then back' : '↕ Browse files · double-click to open';
-  renderImages(); if (view === 'merge') renderMerge(); if (view === 'enhance') renderEnhanceControls();
+  const restoring = !!RESTORE_INFO[view];
+  $('restore-workspace').classList.toggle('hidden', !restoring); $('restore-settings').classList.toggle('hidden', !restoring);
+  for (const name of Object.keys(RESTORE_INFO)) { const active = view === name; $(`${name}-tab`).classList.toggle('active', active); $(`${name}-tab`).setAttribute('aria-selected', String(active)); }
+  if (restoring && previous !== view) {
+    state.restore.selected.clear(); state.restore.marks.clear(); state.restore.brush = false; state.restore.showMarks = false;
+    clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden');
+    const info = RESTORE_INFO[view];
+    $('restore-title').textContent = info.title; $('restore-settings-title').textContent = info.title;
+    $('restore-description').textContent = info.description; $('restore-output-name').textContent = info.output; $('restore-archive-name').textContent = info.archive;
+  }
+  $('explorer-foot').textContent = view === 'enhance' || restoring ? 'Click photos to select and preview' : view === 'merge' ? 'Click front, then back' : '↕ Browse files · double-click to open';
+  renderImages(); if (view === 'merge') renderMerge(); if (view === 'enhance') renderEnhanceControls(); if (restoring) renderRestorationControls();
 }
 function selectionCard(label, image) {
   const card = document.createElement('div'); card.className = 'merge-card';
@@ -245,6 +262,136 @@ async function saveEnhancedBatch() {
   $('enhance-progress').textContent = `${saved} saved and original${saved === 1 ? '' : 's'} archived${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · batch stopped' : ''}`;
   if (failed.length) toast(failed[0], true); else toast(`${saved} enhanced ${saved === 1 ? 'copy' : 'copies'} saved; original${saved === 1 ? '' : 's'} moved to Pre-Enhancement${stopped ? ' before stopping' : ''}.`);
 }
+function renderRestorationControls() {
+  const count = state.restore.selected.size;
+  $('restore-selection-count').textContent = `${count} selected`;
+  $('restore-save').disabled = !count || state.restore.busy;
+  $('restore-save').firstElementChild.textContent = !count ? 'Save selected photos' : count === 1 ? 'Save restored photo' : `Save ${count} selected photos`;
+  $('restore-save-hint').textContent = state.restore.busy ? 'Processing selected photos…' : count ? 'Review the preview, then save the batch' : 'Select photos to enable saving';
+  const dust = state.view === 'dust'; const previewPath = state.images[state.restore.preview]?.path;
+  for (const id of ['restore-mark-scratch', 'restore-clear-marks', 'restore-show-marks']) $(id).classList.toggle('hidden', !dust);
+  $('restore-mark-scratch').disabled = !dust || !previewPath || state.restore.busy;
+  $('restore-clear-marks').disabled = !dust || !previewPath || !state.restore.marks.get(previewPath)?.length || state.restore.busy;
+  $('restore-show-marks').disabled = !dust || !previewPath || state.restore.busy;
+  $('restore-mark-scratch').setAttribute('aria-pressed', String(dust && state.restore.brush));
+  $('restore-mark-scratch').textContent = state.restore.brush ? 'Done marking' : 'Mark a scratch';
+  $('restore-show-marks').setAttribute('aria-pressed', String(dust && state.restore.showMarks));
+  $('restore-show-marks').textContent = state.restore.showMarks ? 'Show result' : 'Show repair marks';
+  $('restore-before-wrap').classList.toggle('brush-active', dust && state.restore.brush && !state.restore.busy);
+  $('restore-select-all').disabled = !state.images.length || state.restore.busy;
+  $('restore-clear').disabled = !count || state.restore.busy;
+  $('restore-stop').classList.toggle('hidden', !state.restore.busy);
+  $('restore-stop').disabled = state.restore.stop;
+  $('restore-stop').textContent = state.restore.stop ? 'Stopping…' : 'Stop after current';
+}
+function refreshRestorationTiles() {
+  if (!RESTORE_INFO[state.view]) return;
+  document.querySelectorAll('#images .image-tile').forEach((tile, index) => {
+    tile.classList.toggle('restore-selected', state.restore.selected.has(state.images[index].path));
+    tile.classList.toggle('restore-previewed', state.restore.preview === index);
+  });
+}
+function clearRestorationPreview() {
+  ++state.restore.requestId;
+  if (state.restore.previewUrl) URL.revokeObjectURL(state.restore.previewUrl);
+  state.restore.previewUrl = null; state.restore.preview = -1;
+  state.restore.drawing = null; drawBrushCanvas();
+  $('restore-before').removeAttribute('src'); $('restore-after').removeAttribute('src');
+  $('restore-comparison').classList.add('hidden'); $('restore-empty').classList.remove('hidden');
+  $('restore-subtitle').textContent = 'Open a folder, then select photos to preview.';
+  $('restore-changes').textContent = 'Each image is analysed separately. Review the preview before saving.';
+  $('restore-after-label').textContent = 'AFTER';
+}
+async function previewRestoration(index) {
+  if (index < 0 || index >= state.images.length || !RESTORE_INFO[state.view]) return;
+  const item = state.images[index]; const operation = state.view; const ticket = ++state.restore.requestId;
+  state.restore.preview = index;
+  $('restore-empty').classList.add('hidden'); $('restore-comparison').classList.remove('hidden');
+  $('restore-before').onload = drawBrushCanvas;
+  $('restore-before').src = url('/api/enhance-original', item.path) + `&v=${item.modified}`;
+  $('restore-after').removeAttribute('src'); $('restore-subtitle').textContent = item.name;
+  $('restore-changes').textContent = 'Analysing this photo…'; refreshRestorationTiles();
+  $('restore-after-label').textContent = state.restore.showMarks && operation === 'dust' ? 'DETECTED MARKS' : 'AFTER';
+  renderRestorationControls(); drawBrushCanvas();
+  try {
+    const response = await fetch('/api/restore-preview', { method: 'POST', headers: { 'X-Cropper-Token': state.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path, operation, strokes: state.restore.marks.get(item.path) || [], show_marks: state.restore.showMarks && operation === 'dust' }) });
+    if (!response.ok) { const data = await response.json(); throw new Error(data.error || 'Could not generate the preview.'); }
+    const changes = response.headers.get('X-Cropper-Adjustments') || 'Restoration preview ready';
+    const blob = await response.blob();
+    if (ticket !== state.restore.requestId) return;
+    if (state.restore.previewUrl) URL.revokeObjectURL(state.restore.previewUrl);
+    state.restore.previewUrl = URL.createObjectURL(blob); $('restore-after').src = state.restore.previewUrl;
+    $('restore-changes').textContent = changes;
+  } catch (error) { if (ticket === state.restore.requestId) { $('restore-changes').textContent = error.message; toast(error.message, true); } }
+}
+function brushPoint(event) {
+  const canvas = $('restore-brush-canvas'); const image = $('restore-before'); const rect = canvas.getBoundingClientRect();
+  if (!image.naturalWidth || !image.naturalHeight || !rect.width || !rect.height) return null;
+  const scale = Math.min(rect.width / image.naturalWidth, rect.height / image.naturalHeight);
+  const width = image.naturalWidth * scale, height = image.naturalHeight * scale;
+  const left = (rect.width - width) / 2, top = (rect.height - height) / 2;
+  const x = (event.clientX - rect.left - left) / width, y = (event.clientY - rect.top - top) / height;
+  return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? [x, y] : null;
+}
+function drawBrushCanvas() {
+  const canvas = $('restore-brush-canvas'); const image = $('restore-before'); const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width * ratio); canvas.height = Math.round(rect.height * ratio);
+  const ctx = canvas.getContext('2d'); ctx.scale(ratio, ratio); ctx.clearRect(0, 0, rect.width, rect.height);
+  const path = state.images[state.restore.preview]?.path; const strokes = state.restore.marks.get(path) || [];
+  if (!strokes.length || !image.naturalWidth || !image.naturalHeight) return;
+  const scale = Math.min(rect.width / image.naturalWidth, rect.height / image.naturalHeight);
+  const width = image.naturalWidth * scale, height = image.naturalHeight * scale;
+  const left = (rect.width - width) / 2, top = (rect.height - height) / 2;
+  ctx.strokeStyle = '#ff4c59'; ctx.fillStyle = '#ff4c59'; ctx.lineWidth = 5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const stroke of strokes) {
+    ctx.beginPath(); stroke.forEach(([x, y], index) => index ? ctx.lineTo(left + x * width, top + y * height) : ctx.moveTo(left + x * width, top + y * height));
+    ctx.stroke(); if (stroke.length === 1) { const [x, y] = stroke[0]; ctx.beginPath(); ctx.arc(left + x * width, top + y * height, 3, 0, Math.PI * 2); ctx.fill(); }
+  }
+}
+function selectRestorationImage(index) {
+  if (state.restore.busy) return;
+  const path = state.images[index].path;
+  if (state.restore.selected.has(path)) state.restore.selected.delete(path); else state.restore.selected.add(path);
+  previewRestoration(index); renderRestorationControls();
+}
+async function saveRestorationBatch() {
+  if (state.restore.busy || !state.restore.selected.size || !RESTORE_INFO[state.view]) return;
+  const operation = state.view; const info = RESTORE_INFO[operation];
+  const paths = state.images.map(image => image.path).filter(path => state.restore.selected.has(path));
+  state.restore.busy = true; state.restore.stop = false; renderRestorationControls();
+  let saved = 0; const failed = []; const archived = new Set();
+  for (const [index, path] of paths.entries()) {
+    if (state.restore.stop) break;
+    $('restore-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
+    try {
+      const result = await api('/api/restore', { path, operation, strokes: state.restore.marks.get(path) || [] });
+      state.restore.selected.delete(path); archived.add(path); saved++;
+      state.restore.marks.delete(path);
+      state.restore.resultsFolder = result.path.slice(0, Math.max(result.path.lastIndexOf('/'), result.path.lastIndexOf('\\')));
+    } catch (error) {
+      failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`);
+      if (error.code === 'permission_denied') state.restore.stop = true;
+    }
+    refreshRestorationTiles(); renderRestorationControls();
+  }
+  const stopped = state.restore.stop;
+  state.restore.busy = false;
+  if (archived.size) {
+    const current = state.images[state.index]?.path;
+    state.images = state.images.filter(image => !archived.has(image.path));
+    $('image-count').textContent = state.images.length;
+    clearRestorationPreview();
+    if (archived.has(current)) { state.index = -1; clearEditor(); updateControls(); }
+    try { const folders = await api(`/api/folders?path=${encodeURIComponent(state.folder)}`); state.folders = folders.folders; $('folder-count').textContent = folders.folders.length; renderFolders(); }
+    catch (error) { toast(error.message, true); }
+    renderImages(); $('restore-open-results').classList.remove('hidden');
+  }
+  renderRestorationControls();
+  $('restore-progress').textContent = `${saved} saved to ${info.output}; ${saved} previous ${saved === 1 ? 'version' : 'versions'} moved to ${info.archive}${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
+  if (failed.length) toast(failed[0], true); else toast(`${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}.`);
+}
 async function pickFolder(forOutput = false) {
   state.picker = { forOutput, path: (forOutput ? (forOutput === 'merge' ? mergeSettings.folder : forOutput === 'enhance' ? enhanceSettings.folder : settings.folder) : state.folder) || state.home, parent: null };
   $('folder-modal-title').textContent = forOutput ? 'Choose output folder' : 'Choose image folder';
@@ -292,12 +439,14 @@ async function selectPickerFolder() {
 }
 async function loadFolder(path, preserve = false) {
   if (state.enhance.busy) { toast('Stop or finish the enhancement batch before changing folders.', true); return; }
+  if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
   try {
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
     const prior = preserve && state.index >= 0 ? state.images[state.index]?.path : null;
     if (data.path !== state.folder) $('images').scrollTop = 0;
     state.folder = data.path; state.parent = data.parent; state.images = data.images; state.folders = data.folders;
     state.enhance.selected.clear(); clearEnhancePreview(); $('enhance-progress').textContent = ''; renderEnhanceControls();
+    state.restore.selected.clear(); state.restore.marks.clear(); clearRestorationPreview(); $('restore-progress').textContent = ''; $('restore-open-results').classList.add('hidden'); renderRestorationControls();
     localStorage.setItem('cropper-last-folder', data.path); $('folder-path').value = data.path;
     $('folder-count').textContent = data.folders.length; $('image-count').textContent = data.images.length;
     $('go-parent').disabled = !data.parent;
@@ -322,16 +471,18 @@ function renderFolders() {
 function renderImages() {
   const host = $('images'); const previousScroll = host.scrollTop; host.replaceChildren();
   for (const [index, image] of state.images.entries()) {
-    const tile = document.createElement('button'); tile.className = 'image-tile'; tile.title = state.view === 'enhance' ? `${image.name} — select and preview` : state.view === 'merge' ? `${image.name} — choose as front or back` : `${image.name} — double-click to open`;
+    const tile = document.createElement('button'); tile.className = 'image-tile'; tile.title = state.view === 'enhance' || RESTORE_INFO[state.view] ? `${image.name} — select and preview` : state.view === 'merge' ? `${image.name} — choose as front or back` : `${image.name} — double-click to open`;
     const picture = document.createElement('div'); picture.className = 'tile-photo';
     const thumbnail = document.createElement('img'); thumbnail.loading = 'lazy'; thumbnail.alt = ''; thumbnail.src = url('/api/thumb', image.path); picture.append(thumbnail);
     const name = document.createElement('div'); name.className = 'tile-name'; name.textContent = image.name;
     const meta = document.createElement('div'); meta.className = 'tile-meta'; meta.textContent = formatBytes(image.bytes);
     tile.append(picture, name, meta); tile.addEventListener('dblclick', () => { if (state.view === 'crop') openImage(index); });
-    tile.addEventListener('click', () => { if (state.view === 'enhance') selectEnhanceImage(index); else if (state.view === 'merge') selectMergeImage(index); else { document.querySelectorAll('.image-tile.selected').forEach(el => el.classList.remove('selected')); tile.classList.add('selected'); } });
+    tile.addEventListener('click', () => { if (state.view === 'enhance') selectEnhanceImage(index); else if (RESTORE_INFO[state.view]) selectRestorationImage(index); else if (state.view === 'merge') selectMergeImage(index); else { document.querySelectorAll('.image-tile.selected').forEach(el => el.classList.remove('selected')); tile.classList.add('selected'); } });
     tile.classList.toggle('merge-front', state.view === 'merge' && state.merge.front === index); tile.classList.toggle('merge-back', state.view === 'merge' && state.merge.back === index);
     tile.classList.toggle('enhance-selected', state.view === 'enhance' && state.enhance.selected.has(image.path));
     tile.classList.toggle('enhance-previewed', state.view === 'enhance' && state.enhance.preview === index);
+    tile.classList.toggle('restore-selected', !!RESTORE_INFO[state.view] && state.restore.selected.has(image.path));
+    tile.classList.toggle('restore-previewed', !!RESTORE_INFO[state.view] && state.restore.preview === index);
     host.append(tile);
   }
   host.scrollTop = previousScroll;
@@ -498,10 +649,35 @@ function wire() {
   $('crop-tab').addEventListener('click',()=>setView('crop'));
   $('merge-tab').addEventListener('click',()=>setView('merge'));
   $('enhance-tab').addEventListener('click',()=>setView('enhance'));
+  for (const operation of Object.keys(RESTORE_INFO)) $(`${operation}-tab`).addEventListener('click',()=>setView(operation));
   $('enhance-select-all').addEventListener('click',()=>{ state.enhance.selected = new Set(state.images.map(image=>image.path)); refreshEnhanceTiles(); renderEnhanceControls(); if (state.images.length && state.enhance.preview < 0) previewEnhance(0); });
   $('enhance-clear').addEventListener('click',()=>{ state.enhance.selected.clear(); refreshEnhanceTiles(); renderEnhanceControls(); });
   $('enhance-save').addEventListener('click',saveEnhancedBatch);
   $('enhance-stop').addEventListener('click',()=>{ state.enhance.stop = true; renderEnhanceControls(); });
+  $('restore-select-all').addEventListener('click',()=>{ state.restore.selected = new Set(state.images.map(image=>image.path)); refreshRestorationTiles(); renderRestorationControls(); if (state.images.length && state.restore.preview < 0) previewRestoration(0); });
+  $('restore-clear').addEventListener('click',()=>{ state.restore.selected.clear(); refreshRestorationTiles(); renderRestorationControls(); });
+  $('restore-save').addEventListener('click',saveRestorationBatch);
+  $('restore-stop').addEventListener('click',()=>{ state.restore.stop = true; renderRestorationControls(); });
+  $('restore-open-results').addEventListener('click',()=>state.restore.resultsFolder&&loadFolder(state.restore.resultsFolder));
+  $('restore-mark-scratch').addEventListener('click',()=>{ state.restore.brush = !state.restore.brush; renderRestorationControls(); });
+  $('restore-show-marks').addEventListener('click',()=>{ state.restore.showMarks = !state.restore.showMarks; renderRestorationControls(); if (state.restore.preview >= 0) previewRestoration(state.restore.preview); });
+  $('restore-clear-marks').addEventListener('click',()=>{ const path = state.images[state.restore.preview]?.path; if (!path) return; state.restore.marks.delete(path); drawBrushCanvas(); renderRestorationControls(); previewRestoration(state.restore.preview); });
+  const brushCanvas = $('restore-brush-canvas');
+  brushCanvas.addEventListener('pointerdown',event=>{
+    if (state.view !== 'dust' || !state.restore.brush || state.restore.busy || state.restore.preview < 0) return;
+    const point = brushPoint(event); if (!point) return;
+    const path = state.images[state.restore.preview].path;
+    const strokes = state.restore.marks.get(path) || []; strokes.push([point]); state.restore.marks.set(path, strokes);
+    state.restore.drawing = strokes[strokes.length - 1]; brushCanvas.setPointerCapture(event.pointerId);
+    event.preventDefault(); drawBrushCanvas(); renderRestorationControls();
+  });
+  brushCanvas.addEventListener('pointermove',event=>{
+    if (!state.restore.drawing) return; const point = brushPoint(event); if (!point) return;
+    const last = state.restore.drawing[state.restore.drawing.length - 1];
+    if (Math.hypot(point[0]-last[0],point[1]-last[1]) > 0.002) { state.restore.drawing.push(point); drawBrushCanvas(); }
+  });
+  const finishBrush = ()=>{ if (!state.restore.drawing) return; state.restore.drawing = null; if (state.restore.preview >= 0) previewRestoration(state.restore.preview); };
+  brushCanvas.addEventListener('pointerup',finishBrush); brushCanvas.addEventListener('pointercancel',finishBrush);
   $('merge-clear').addEventListener('click',()=>{ state.merge = { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }; renderImages(); renderMerge(); });
   $('merge-save').addEventListener('click',mergeSave);
   $('folder-modal-close').addEventListener('click',closePicker);
@@ -547,6 +723,7 @@ function wire() {
   document.addEventListener('keyup',event=>{if(event.key==='Control')endZoom();}); window.addEventListener('blur',endZoom);
   $('canvas-shell').addEventListener('wheel',event=>{if(event.ctrlKey)event.preventDefault();},{passive:false});
   new ResizeObserver(fitImage).observe($('canvas-shell'));
+  new ResizeObserver(drawBrushCanvas).observe($('restore-before-wrap'));
   updateControls();
 }
 async function init() {

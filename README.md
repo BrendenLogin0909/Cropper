@@ -2,7 +2,7 @@
 
 Cropper is a local browser-based image cropper for quickly straightening photos, documents, and other four-corner subjects. The image processing runs on your computer with OpenCV and Pillow. No account, subscription, upload, or internet connection is required.
 
-Cropper also has **Front + Back** for pairing both sides of a print and **Auto improve** for colour cast, contrast, and gentle saturation correction.
+Cropper also has **Front + Back** for pairing both sides of a print, **Auto improve** for colour cast and tonal correction, and separate **Dust repair**, **Noise reduction**, and **Sharpen** tabs.
 
 ## Start
 
@@ -65,3 +65,19 @@ The same decision rules run on every image, but the result is measured separatel
 - **Saturation:** If the image contains coloured areas that appear weak, it adds a small colour lift to muted pixels. The lift tapers to zero for vivid pixels, and neutral black-and-white photos do not receive it.
 
 The preview names the corrections selected for that photo. These adjustments do not remove scratches, sharpen blur, invent missing detail, or accurately reconstruct unknown original colours. Local contrast can make existing grain and scratches more visible, so check a preview before saving a large batch.
+
+## Dust repair, Noise reduction, and Sharpen
+
+Each restoration step has its own tab. Open the folder you want to process, click photos to select them, review the before and after preview, then choose **Save selected photos**. **Select all** adds every image in the current folder. Cropper measures every photo separately and applies only a bounded adjustment when it detects a suitable issue. An image that needs no adjustment is still copied into the results folder so the batch can move forward without processing it twice.
+
+| Tab | Automatic change | New image folder | Previous version folder |
+| --- | --- | --- | --- |
+| Dust repair | Removes small, isolated marks and short scratches only where the mark is clearly distinct from nearby image detail. | `Dust Repaired` | `Before Dust Repair` |
+| Noise reduction | Reduces fine grain and colour speckles in photos with measurable noise; leaves cleaner photos alone. | `Noise Reduced` | `Before Noise Reduction` |
+| Sharpen | Adds a modest edge contrast boost where existing detail can be recovered; skips images with too much noise or too little edge detail. | `Sharpened` | `Before Sharpening` |
+
+After a successful save, the previous file moves into the corresponding **Before…** folder beside its old location. The current folder then contains only images that have not gone through that step. **Open results folder** opens the new files so you can select the next restoration tab. You can start with any tab or any folder; the steps do not require a fixed order. The old version remains available in its archive folder. Existing result or archive filenames get a number appended so they are not overwritten.
+
+Long scratches often need guidance. On the Dust repair tab, select a photo and choose **Mark a scratch**, then draw over the scratch in the **Before** preview. Choose **Done marking** when finished. **Show repair marks** displays in red exactly which pixels will be repaired; **Show result** returns to the repaired preview. **Clear marks** removes all hand-drawn marks for that photo. Marks stay associated with the selected photo until its save completes or you change folders.
+
+These steps use OpenCV pixel processing on your computer. They do not create new scene detail or reliably repair severe damage, motion blur, or an out-of-focus face. Automatic dust detection is deliberately cautious around faces and textured areas; use the marking tool for remaining scratches and review the preview before saving. Previews are limited to 1,800 pixels while saved images use the original resolution.

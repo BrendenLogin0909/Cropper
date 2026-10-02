@@ -15,6 +15,9 @@
           <button class="tool-tab active" id="crop-tab" role="tab" aria-selected="true">Crop</button>
           <button class="tool-tab" id="merge-tab" role="tab" aria-selected="false">Front + Back</button>
           <button class="tool-tab" id="enhance-tab" role="tab" aria-selected="false">Auto improve</button>
+          <button class="tool-tab" id="dust-tab" role="tab" aria-selected="false">Dust repair</button>
+          <button class="tool-tab" id="noise-tab" role="tab" aria-selected="false">Noise reduction</button>
+          <button class="tool-tab" id="sharpen-tab" role="tab" aria-selected="false">Sharpen</button>
         </div>
         <span class="local-pill"><i></i> Runs on this computer</span>
         <button class="button button-quiet" id="open-folder-top"><span class="icon">▣</span> Open folder</button>
@@ -96,6 +99,15 @@
           </div>
           <div class="enhance-bottom"><p id="enhance-changes">Each image is analysed separately. Review the preview before saving.</p><p id="enhance-progress" role="status" aria-live="polite"></p></div>
         </section>
+        <section id="restore-workspace" class="enhance-workspace hidden" aria-labelledby="restore-title">
+          <div class="editor-top"><div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="restore-title">Dust repair</h1><p id="restore-subtitle">Open a folder, then select photos to preview.</p></div></div>
+          <div class="enhance-toolbar"><span id="restore-selection-count">0 selected</span><div><button id="restore-mark-scratch" class="button button-quiet hidden" aria-pressed="false">Mark a scratch</button><button id="restore-clear-marks" class="button button-quiet hidden">Clear marks</button><button id="restore-show-marks" class="button button-quiet hidden" aria-pressed="false">Show repair marks</button><button id="restore-select-all" class="button button-quiet">Select all</button><button id="restore-clear" class="button button-quiet">Clear</button><button id="restore-stop" class="button button-quiet hidden">Stop after current</button></div></div>
+          <div class="enhance-preview-shell">
+            <div id="restore-empty" class="empty-state"><div class="empty-symbol">✦</div><h2>Preview this restoration</h2><p>Click a photo in the Explorer. Click more photos to include them in a batch.</p></div>
+            <div id="restore-comparison" class="enhance-comparison hidden"><div class="enhance-pane"><strong>BEFORE</strong><div class="restore-before-wrap" id="restore-before-wrap"><img id="restore-before" alt="Source photo"><canvas id="restore-brush-canvas" aria-label="Mark a scratch on the source photo"></canvas></div></div><div class="enhance-pane"><strong id="restore-after-label">AFTER</strong><img id="restore-after" alt="Restored photo"></div></div>
+          </div>
+          <div class="enhance-bottom"><p id="restore-changes">Each image is analysed separately. Review the preview before saving.</p><p id="restore-progress" role="status" aria-live="polite"></p></div>
+        </section>
       </main>
 
       <aside class="settings panel" id="crop-settings">
@@ -138,6 +150,16 @@
         <div class="settings-spacer"></div>
         <button class="button button-primary save-button" id="enhance-save" disabled><span>Save selected copies</span><span>↗</span></button>
         <div class="save-hint" id="enhance-save-hint">Select photos to enable saving</div>
+      </aside>
+      <aside class="settings panel hidden" id="restore-settings">
+        <div class="panel-head"><div><div class="eyebrow">RESTORATION STEP</div><h2 id="restore-settings-title">Dust repair</h2></div><span class="saved-badge">Local processing</span></div>
+        <p class="settings-intro" id="restore-description"></p>
+        <div class="settings-group"><div class="section-label">AFTER A SUCCESSFUL SAVE</div><div class="restore-folder-card"><strong id="restore-output-name">Dust Repaired</strong><small>New image saved in this subfolder</small></div><div class="restore-folder-card"><strong id="restore-archive-name">Before Dust Repair</strong><small>Previous version moved here</small></div></div>
+        <p class="restore-guidance">Your current folder then shows only photos still waiting for this step. Open the new results folder to run the next tab.</p>
+        <div class="settings-spacer"></div>
+        <button class="button button-primary save-button" id="restore-save" disabled><span>Save selected photos</span><span>↗</span></button>
+        <button class="button button-quiet restore-open-results hidden" id="restore-open-results">Open results folder →</button>
+        <div class="save-hint" id="restore-save-hint">Select photos to enable saving</div>
       </aside>
       <aside class="settings panel hidden" id="merge-settings">
         <div class="panel-head"><div><div class="eyebrow">PHOTO PAIRING</div><h2>Save merged image</h2></div><span class="saved-badge">Saved for next time</span></div>

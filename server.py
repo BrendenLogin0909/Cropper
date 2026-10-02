@@ -19,12 +19,14 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from enhance import auto_enhance
+from restore import OPERATIONS, preview_dust_marks, restore
 
 
 HERE = Path(__file__).resolve().parent
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
 MIME = {".html": "text/html", ".css": "text/css", ".js": "text/javascript"}
 TOKEN = secrets.token_urlsafe(32)
+RESTORE_LOCK = threading.Lock()
 
 
 def clean_path(value: str) -> Path:
@@ -261,6 +263,36 @@ def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, 
     return destination, enhanced.size, changes, archived_source
 
 
+def save_restored_image(source: Path, operation: str, strokes: list | None = None) -> tuple[Path, tuple[int, int], list[str], Path]:
+    if operation not in OPERATIONS:
+        raise ValueError("Choose a valid restoration tab.")
+    output_name, archive_name = OPERATIONS[operation]
+    with RESTORE_LOCK:
+        image, info = load_image(source)
+        restored, changes = restore(image, operation, strokes)
+        destination = choose_output(source, {"mode": "subfolder", "subfolder": output_name})
+        save_rendered(restored, destination, info)
+        try:
+            archive_folder = source.parent / archive_name
+            archive_folder.mkdir(parents=True, exist_ok=True)
+            archived = archive_folder / source.name
+            if archived.exists():
+                for index in range(2, 10000):
+                    candidate = archive_folder / f"{source.stem}_{index}{source.suffix}"
+                    if not candidate.exists():
+                        archived = candidate
+                        break
+                else:
+                    raise OSError(f"Could not find a free name in {archive_name}.")
+            os.replace(source, archived)
+        except OSError:
+            # A failed archive must leave the source in place and no apparent
+            # completed result in the output folder.
+            destination.unlink(missing_ok=True)
+            raise
+    return destination, restored.size, changes, archived
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Cropper/1.0"
 
@@ -340,6 +372,16 @@ class Handler(BaseHTTPRequestHandler):
                 enhanced.save(data, format="JPEG", quality=89, optimize=True)
                 self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
                 return
+            if parsed.path == "/api/restore-preview":
+                path = image_path(query.get("path", [""])[0])
+                operation = query.get("operation", [""])[0]
+                image, _ = load_image(path)
+                restored, changes = restore(image, operation)
+                restored.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+                data = io.BytesIO()
+                restored.save(data, format="JPEG", quality=89, optimize=True)
+                self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
+                return
             if parsed.path == "/api/info":
                 path = image_path(query.get("path", [""])[0])
                 with Image.open(path) as image:
@@ -390,6 +432,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Auto improve saves a copy so you can compare it with the original.")
                 destination, size, changes, archived_source = save_enhanced_image(path, requested)
                 self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source)})
+                return
+            if self.path == "/api/restore-preview":
+                path = image_path(data.get("path", ""))
+                operation = data.get("operation", "")
+                image, _ = load_image(path)
+                if data.get("show_marks") and operation == "dust":
+                    preview, changes = preview_dust_marks(image, data.get("strokes"))
+                else:
+                    preview, changes = restore(image, operation, data.get("strokes"))
+                preview.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+                payload = io.BytesIO()
+                preview.save(payload, format="JPEG", quality=89, optimize=True)
+                self.reply(200, payload.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
+                return
+            if self.path == "/api/restore":
+                path = image_path(data.get("path", ""))
+                destination, size, changes, archived = save_restored_image(path, data.get("operation", ""), data.get("strokes"))
+                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived)})
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
