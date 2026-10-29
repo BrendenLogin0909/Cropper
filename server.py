@@ -45,7 +45,6 @@ REVIEW_LOCKS = {}
 REVIEW_LOCKS_GUARD = threading.Lock()
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 GPS_IFD = 0x8825
-OVERWRITE_SKIP_SESSION: set[str] = set()
 
 
 def request_guidance(data, record=None):
@@ -379,22 +378,53 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
     return destination, restored.size, changes, planned['snapshots'][0]
 
 
+def _matching_batch_ack(payload: dict, plans: list[dict], *flags: str) -> bool:
+    """True only when a client flag is bound to this batch's id. Unknown/mismatch fail."""
+    given = str(payload.get("batch_id") or "")
+    if not given:
+        return False
+    if given != stage_files.batch_id_for(plans):
+        return False
+    return any(payload.get(flag) for flag in flags)
+
+
 def overwrite_response(plans: list[dict], data: dict | None) -> dict | None:
     """Return a 409 payload when this batch would overwrite and has not been confirmed."""
     payload = data if isinstance(data, dict) else {}
     targets = stage_files.planned_overwrites(plans)
     if not targets:
         return None
-    if payload.get("skip_overwrite_prompt"):
-        OVERWRITE_SKIP_SESSION.add(TOKEN)
-    if payload.get("confirm_overwrite") or TOKEN in OVERWRITE_SKIP_SESSION:
+    if _matching_batch_ack(payload, plans, "confirm_overwrite", "skip_overwrite_prompt"):
         return None
     return {
         "code": "overwrite_confirmation_required",
         "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
+        "batch_id": stage_files.batch_id_for(plans),
     }
+
+
+def replace_response(plans: list[dict], data: dict | None) -> dict | None:
+    """Return a 409 payload when Replace original has not been confirmed for this batch."""
+    payload = data if isinstance(data, dict) else {}
+    targets = stage_files.planned_replaces(plans)
+    if not targets:
+        return None
+    if _matching_batch_ack(payload, plans, "confirm_replace"):
+        return None
+    return {
+        "code": "replace_confirmation_required",
+        "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
+        "count": len(targets),
+        "names": [path.name for path in targets],
+        "batch_id": stage_files.batch_id_for(plans),
+    }
+
+
+def confirmation_response(plans: list[dict], data: dict | None) -> dict | None:
+    """Replace original is independent of Skip/Overwrite/Auto-suffix."""
+    return replace_response(plans, data) or overwrite_response(plans, data)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -584,18 +614,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not raw_paths:
                     raise ValueError("Select photos to check.")
                 paths = [image_path(value) for value in raw_paths]
-                plans = [stage_files.plan(path, operation, index=i + 1, batch_size=len(paths))
-                         for i, path in enumerate(paths)]
+                plans = stage_files.plan_many(paths, operation)
                 targets = stage_files.planned_overwrites(plans)
+                replaces = stage_files.planned_replaces(plans)
                 self.json(200, {
                     "count": len(targets),
                     "names": [path.name for path in targets],
                     "paths": [str(path) for path in targets],
+                    "batch_id": stage_files.batch_id_for(plans),
+                    "replace_count": len(replaces),
+                    "replace_names": [path.name for path in replaces],
+                    "replace_paths": [str(path) for path in replaces],
                 })
                 return
             if self.path == "/api/crop":
                 path = image_path(data.get("path", ""))
-                refusal = overwrite_response([stage_files.plan(path, "crop")], data)
+                refusal = confirmation_response([stage_files.plan(path, "crop")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -621,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/enhance":
                 path = image_path(data.get("path", ""))
-                refusal = overwrite_response([stage_files.plan(path, "enhance")], data)
+                refusal = confirmation_response([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -649,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/restore":
                 path = image_path(data.get("path", ""))
-                refusal = overwrite_response([stage_files.plan(path, "enhance")], data)
+                refusal = confirmation_response([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -819,7 +853,7 @@ class Handler(BaseHTTPRequestHandler):
                                     bool(item.get("overwrite"))
                                     or (app_settings.load_settings().get("conflict_policy") == "overwrite")
                                 )
-                        refusal = overwrite_response(plans, data)
+                        refusal = confirmation_response(plans, data)
                         if refusal:
                             self.json(409, refusal)
                             return

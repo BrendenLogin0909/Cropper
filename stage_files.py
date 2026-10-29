@@ -115,6 +115,27 @@ def format_index(index: int, batch_size: int = 1) -> str:
     return str(max(value, 0)).zfill(width)
 
 
+def uses_index_template(template: str | None = None) -> bool:
+    text = template if template is not None else str(_settings().get('filename_template') or '')
+    return '{index}' in text
+
+
+def next_free_index(source: Path, operation: str, output_dir: Path, taken: set[Path] | None = None,
+                    start: int = 1, batch_size: int = 1) -> int:
+    """Next {index} whose rendered name is free on disk and not already taken."""
+    occupied = {path_key(path) for path in (taken or ())}
+    try:
+        index = max(int(start), 1)
+    except (TypeError, ValueError):
+        index = 1
+    for _ in range(10000):
+        candidate = Path(output_dir) / render_filename(source, operation, index=index, batch_size=batch_size)
+        if path_key(candidate) not in occupied and not candidate.exists():
+            return index
+        index += 1
+    raise ValueError('Could not find a free output index.')
+
+
 def is_backup_path(path: Path | str) -> bool:
     return any(part == BACKUPS for part in Path(path).parts)
 
@@ -459,8 +480,7 @@ def sweep_stale_reservations(now: float | None = None) -> None:
 def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None) -> list[dict]:
     """Reserve saveable output names before a paid AI call."""
     sources = [front] + ([composite] if composite is not None else [])
-    batch_size = len(sources)
-    plans = [plan(source, operation, index=i + 1, batch_size=batch_size) for i, source in enumerate(sources)]
+    plans = plan_many(sources, operation)
     if len({item['root'] for item in plans}) != 1:
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:
@@ -478,7 +498,29 @@ def plan_root(item: dict) -> Path:
     return parent.parent if parent.name in FOLDERS else parent
 
 
-def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1) -> dict:
+def batch_id_for(plans: list[dict]) -> str:
+    """Stable id for this batch root. Used to bind overwrite/replace acknowledgement."""
+    roots = sorted({path_key(plan_root(item)) for item in plans})
+    if not roots:
+        raise ValueError('Select photos to check.')
+    return hashlib.sha256('\n'.join(roots).encode('utf-8')).hexdigest()[:32]
+
+
+def plan_many(sources: list[Path], operation: str) -> list[dict]:
+    """Plan each source, accumulating taken {index} names so later files count up."""
+    taken = set(taken_outputs())
+    plans = []
+    batch_size = len(sources)
+    for i, source in enumerate(sources):
+        item = plan(source, operation, index=i + 1, batch_size=batch_size, taken=taken)
+        plans.append(item)
+        if item.get('output') is not None:
+            taken.add(Path(item['output']))
+    return plans
+
+
+def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
+         taken: set[Path] | None = None) -> dict:
     source = source.resolve()
     parent = source.parent
     if any(ancestor.name in FOLDERS for ancestor in parent.parents):
@@ -523,18 +565,27 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1) -> d
             backup = unique_path(backup, {backup})
         snapshots = [backup]
         output = source
-        return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output, 'overwrite': True}
-    return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output, 'overwrite': False}
+        return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output,
+                'overwrite': True, 'replace': True, 'operation': operation}
+    if output is not None and uses_index_template(settings.get('filename_template')):
+        occupied = set(taken or ())
+        occupied |= taken_outputs()
+        chosen = next_free_index(source, operation, output.parent, occupied, start=index, batch_size=batch_size)
+        output = output.parent / render_filename(source, operation, index=chosen, batch_size=batch_size)
+    return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output,
+            'overwrite': False, 'replace': False, 'operation': operation}
 
 
 def planned_overwrites(plans: list[dict]) -> list[Path]:
-    """Existing files this batch would replace under Overwrite or Replace original."""
+    """Existing OUTPUT files this batch would replace under Overwrite. Not replace-original."""
     policy = (_settings().get('conflict_policy') or 'skip').lower()
     taken = taken_outputs()
     taken_keys = {path_key(path) for path in taken}
     targets = []
     seen = set()
     for item in plans:
+        if item.get('replace'):
+            continue
         output = item.get('output')
         if output is None:
             continue
@@ -549,6 +600,50 @@ def planned_overwrites(plans: list[dict]) -> list[Path]:
                 seen.add(key)
                 targets.append(path)
     return targets
+
+
+def planned_replaces(plans: list[dict]) -> list[Path]:
+    """Original files this batch would replace. Independent of Skip/Overwrite/Auto-suffix."""
+    targets = []
+    seen = set()
+    for item in plans:
+        if not item.get('replace'):
+            continue
+        source = Path(item['source'])
+        output = item.get('output')
+        if output is None or not same_path(output, source):
+            continue
+        path = Path(output)
+        if not path.exists():
+            continue
+        key = path_key(path)
+        if key not in seen:
+            seen.add(key)
+            targets.append(path)
+    return targets
+
+
+def resolve_index_outputs(plans: list[dict]) -> None:
+    """Assign next-free {index} names. Caller must hold the batch lock."""
+    if not uses_index_template():
+        return
+    occupied: set[Path] = set(taken_outputs())
+    for item in plans:
+        occupied.add(Path(item['source']))
+        for snap in item.get('snapshots') or []:
+            occupied.add(Path(snap))
+    batch_size = max(len(plans), 1)
+    for item in plans:
+        if item.get('replace') or item.get('fixed_output') or item.get('output') is None:
+            continue
+        operation = item.get('operation')
+        if not operation or operation == 'finish':
+            continue
+        output_dir = Path(item['output']).parent
+        index = next_free_index(item['source'], operation, output_dir, occupied, start=1, batch_size=batch_size)
+        chosen = output_dir / render_filename(item['source'], operation, index=index, batch_size=batch_size)
+        item['output'] = chosen
+        occupied.add(chosen)
 
 
 def _atomic_create(target: Path, data: bytes, overwrite: bool = False) -> bool:
@@ -588,6 +683,7 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
     lock_path = data_lock_path(root)
     try:
         with interprocess_lock(lock_path), LOCK:
+            resolve_index_outputs(plans)
             sources = [item['source'] for item in plans]
             if len(set(sources)) != len(sources):
                 raise ValueError('The same source was selected more than once.')
@@ -687,8 +783,7 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
 
 def file_results(sources: list[Path], payloads: list[bytes], operation: str,
                  output_paths: list[Path] | None = None) -> list[Path]:
-    batch_size = len(sources)
-    plans = [plan(source, operation, index=i + 1, batch_size=batch_size) for i, source in enumerate(sources)]
+    plans = plan_many(sources, operation)
     if len({item['root'] for item in plans}) != 1:
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:
@@ -701,4 +796,5 @@ def file_results(sources: list[Path], payloads: list[bytes], operation: str,
             if dest is not None:
                 item['output'] = Path(dest)
                 item['overwrite'] = Path(dest).exists() and (_settings().get('conflict_policy') == 'overwrite')
+                item['fixed_output'] = True
     return commit(plans, payloads)

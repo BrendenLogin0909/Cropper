@@ -381,6 +381,57 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertEqual(outputs[0].name, '001.png')
             self.assertEqual(outputs[1].name, '002.png')
 
+    def test_index_increments_across_separate_file_results_calls(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self.source(root, 'a_c.png')
+            second = self.source(root, 'b_c.png')
+            with patch.object(stages, '_settings', return_value={
+                'filename_template': 'scan_{index}{ext}',
+                'conflict_policy': 'skip', 'replace_original': False,
+                'backup_originals': True, 'output_folder': '',
+            }):
+                out1 = stages.file_results([first], [png('blue')], 'restore')[0]
+                out2 = stages.file_results([second], [png('green')], 'restore')[0]
+            self.assertEqual(out1.name, 'scan_001.png')
+            self.assertEqual(out2.name, 'scan_002.png')
+
+    def test_index_increments_across_separate_crop_calls(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        root = Path(self.folder.name)
+        photo1 = root / 'photo1.png'
+        photo2 = root / 'photo2.png'
+        Image.new('RGB', (16, 16), 'red').save(photo1)
+        Image.new('RGB', (16, 16), 'blue').save(photo2)
+        app_settings.save_settings({
+            'filename_template': 'scan_{index}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': False,
+            'backup_originals': True,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+
+        def crop(path):
+            request = Request(
+                f'http://127.0.0.1:{http.server_port}/api/crop',
+                json.dumps({'path': str(path), 'points': corners, 'rotation': 0}).encode(),
+                {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'},
+            )
+            with urlopen(request) as response:
+                return json.load(response)
+
+        first = crop(photo1)
+        second = crop(photo2)
+        self.assertEqual(first['name'], 'scan_001.png')
+        self.assertEqual(second['name'], 'scan_002.png')
+        queue = root / stages.CROP_QUEUE
+        self.assertTrue((queue / 'scan_001.png').is_file())
+        self.assertTrue((queue / 'scan_002.png').is_file())
+        self.assertNotEqual(first['path'], second['path'])
+
     def test_commit_removes_batch_lock_file(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -436,12 +487,26 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertIn('CROPPER_PORT must be an integer port', blob)
         self.assertNotIn('Traceback', blob)
 
-    def test_overwrite_confirmation_once_per_batch(self):
+    def _json(self, port, path, body):
+        request = Request(
+            f'http://127.0.0.1:{port}{path}',
+            json.dumps(body).encode(),
+            {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'},
+        )
+        try:
+            with urlopen(request) as response:
+                return response.status, json.load(response)
+        except HTTPError as exc:
+            payload = json.loads(exc.read().decode())
+            exc.close()
+            return exc.code, payload
+
+    def test_overwrite_confirmation_is_per_batch_id(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
-        server.OVERWRITE_SKIP_SESSION.clear()
+        self.assertFalse(hasattr(server, 'OVERWRITE_SKIP_SESSION'))
         queue = Path(self.folder.name) / stages.CROP_QUEUE
         queue.mkdir(parents=True)
         source = queue / 'photo_c.png'
@@ -449,40 +514,180 @@ class OutputHandlingTests(unittest.TestCase):
         existing = Path(self.folder.name) / stages.AI_QUEUE / 'photo_c_ai.png'
         existing.parent.mkdir(parents=True)
         existing.write_bytes(b'existing')
+        other_dir = TemporaryDirectory()
+        self.addCleanup(other_dir.cleanup)
+        other_root = Path(other_dir.name)
+        other_queue = other_root / stages.CROP_QUEUE
+        other_queue.mkdir(parents=True)
+        other_source = other_queue / 'other_c.png'
+        Image.new('RGB', (8, 8), 'gray').save(other_source)
+        other_existing = other_root / stages.AI_QUEUE / 'other_c_ai.png'
+        other_existing.parent.mkdir(parents=True)
+        other_existing.write_bytes(b'existing')
         app_settings.save_settings({'conflict_policy': 'overwrite', 'replace_original': False})
 
-        def post(payload, confirmed=None):
-            body = {'front_path': str(source), 'operation': 'restore'}
-            if confirmed is not None:
-                body.update(confirmed)
-            request = Request(
-                f'http://127.0.0.1:{http.server_port}/api/overwrite-preview',
-                json.dumps({'path': str(source), 'operation': 'restore'}).encode(),
-                {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'},
-            )
-            with urlopen(request) as response:
-                preview = json.load(response)
-            return preview
-
-        preview = post({})
+        status, preview = self._json(http.server_port, '/api/overwrite-preview',
+                                     {'path': str(source), 'operation': 'restore'})
+        self.assertEqual(status, 200)
         self.assertGreaterEqual(preview['count'], 1)
         self.assertIn('photo_c_ai.png', preview['names'])
+        self.assertTrue(preview['batch_id'])
+        self.assertEqual(preview.get('replace_count', 0), 0)
 
-        # Direct overwrite gate via restore plan:
         with patch.object(stages, '_settings', return_value={
             'filename_template': '{name}{suffix}{ext}',
             'conflict_policy': 'overwrite', 'replace_original': False,
             'backup_originals': True, 'output_folder': '',
         }):
             plans = [stages.plan(source, 'restore')]
+            other_plans = [stages.plan(other_source, 'restore')]
             refusal = server.overwrite_response(plans, {})
             self.assertIsNotNone(refusal)
             self.assertEqual(refusal['code'], 'overwrite_confirmation_required')
             self.assertEqual(refusal['count'], 1)
-            self.assertIsNone(server.overwrite_response(plans, {'confirm_overwrite': True}))
-            self.assertIsNone(server.overwrite_response(plans, {'skip_overwrite_prompt': True}))
+            batch_id = refusal['batch_id']
+            other_id = stages.batch_id_for(other_plans)
+            self.assertNotEqual(batch_id, other_id)
+            self.assertIsNotNone(server.overwrite_response(plans, {'confirm_overwrite': True}))
+            self.assertIsNotNone(server.overwrite_response(plans, {'skip_overwrite_prompt': True}))
+            self.assertIsNotNone(server.overwrite_response(plans, {
+                'skip_overwrite_prompt': True, 'batch_id': 'forged-batch-id',
+            }))
+            self.assertIsNotNone(server.overwrite_response(plans, {
+                'skip_overwrite_prompt': True, 'batch_id': other_id,
+            }))
+            self.assertIsNone(server.overwrite_response(plans, {
+                'confirm_overwrite': True, 'batch_id': batch_id,
+            }))
+            self.assertIsNone(server.overwrite_response(plans, {
+                'skip_overwrite_prompt': True, 'batch_id': batch_id,
+            }))
+            self.assertIsNotNone(server.overwrite_response(plans, {}))
+            other_refusal = server.overwrite_response(other_plans, {
+                'skip_overwrite_prompt': True, 'batch_id': batch_id,
+            })
+            self.assertIsNotNone(other_refusal)
+            self.assertEqual(other_refusal['code'], 'overwrite_confirmation_required')
+            self.assertEqual(other_refusal['batch_id'], other_id)
+
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        crop_source = Path(self.folder.name) / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(crop_source)
+        crop_existing = Path(self.folder.name) / stages.CROP_QUEUE / 'photo_c.png'
+        crop_existing.parent.mkdir(parents=True, exist_ok=True)
+        crop_existing.write_bytes(b'existing-crop')
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(crop_source), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'overwrite_confirmation_required')
+        crop_id = body['batch_id']
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(crop_source), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True, 'batch_id': 'forged-batch-id',
+        })
+        self.assertEqual(status, 409)
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(crop_source), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True, 'batch_id': other_id,
+        })
+        self.assertEqual(status, 409)
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(crop_source), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True, 'batch_id': crop_id,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(result['name'], 'photo_c.png')
+
+    def test_replace_confirmation_once_per_batch_independent_of_conflict_policy(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        root = Path(self.folder.name)
+        photo1 = root / 'keep_me.png'
+        photo2 = root / 'keep_me_too.png'
+        Image.new('RGB', (16, 16), 'red').save(photo1)
+        Image.new('RGB', (16, 16), 'blue').save(photo2)
+        original1 = photo1.read_bytes()
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': True,
+            'backup_originals': True,
+        })
+        with patch.object(stages, '_settings', return_value={
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip', 'replace_original': True,
+            'backup_originals': True, 'output_folder': '',
+        }):
+            plans = [stages.plan(photo1, 'crop')]
+            self.assertTrue(plans[0]['replace'])
             self.assertIsNone(server.overwrite_response(plans, {}))
-        server.OVERWRITE_SKIP_SESSION.clear()
+            refusal = server.replace_response(plans, {})
+            self.assertEqual(refusal['code'], 'replace_confirmation_required')
+            batch_id = refusal['batch_id']
+            self.assertIsNotNone(server.replace_response(plans, {
+                'confirm_overwrite': True, 'skip_overwrite_prompt': True, 'batch_id': batch_id,
+            }))
+            self.assertIsNotNone(server.replace_response(plans, {
+                'confirm_replace': True, 'batch_id': 'forged-batch-id',
+            }))
+            self.assertIsNone(server.replace_response(plans, {
+                'confirm_replace': True, 'batch_id': batch_id,
+            }))
+            other_dir = TemporaryDirectory()
+            self.addCleanup(other_dir.cleanup)
+            other_photo = Path(other_dir.name) / 'other.png'
+            Image.new('RGB', (16, 16), 'green').save(other_photo)
+            other_plans = [stages.plan(other_photo, 'crop')]
+            other_id = stages.batch_id_for(other_plans)
+            self.assertNotEqual(batch_id, other_id)
+            second = server.replace_response(other_plans, {
+                'confirm_replace': True, 'batch_id': batch_id,
+            })
+            self.assertIsNotNone(second)
+            self.assertEqual(second['code'], 'replace_confirmation_required')
+
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'replace_confirmation_required')
+        batch_id = body['batch_id']
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True, 'batch_id': batch_id,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'replace_confirmation_required')
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+            'confirm_replace': True, 'batch_id': batch_id,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(photo1.exists())
+        self.assertNotEqual(photo1.read_bytes(), original1)
+        self.assertEqual((root / stages.BACKUPS / photo1.name).read_bytes(), original1)
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(photo2), 'points': corners, 'rotation': 0,
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'replace_confirmation_required')
+        self.assertEqual(body['batch_id'], batch_id)
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(photo2), 'points': corners, 'rotation': 0,
+            'confirm_replace': True, 'batch_id': batch_id,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue((root / stages.BACKUPS / photo2.name).is_file())
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
