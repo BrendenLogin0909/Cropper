@@ -179,12 +179,18 @@ def install_memory_keyring():
     return keyring.get_keyring()
 
 
-def stored_api_key() -> str:
+def _read_stored_api_key() -> tuple[str, str]:
+    """Return (password, error). Error is set when the credential store is unavailable."""
     try:
         value = _keyring().get_password(SERVICE_NAME, KEY_USERNAME)
     except Exception:
-        return ""
-    return (value or "").strip()
+        return "", "Cropper could not read the API key from the system credential store."
+    return (value or "").strip(), ""
+
+
+def stored_api_key() -> str:
+    value, _error = _read_stored_api_key()
+    return value
 
 
 def set_stored_api_key(value: str) -> None:
@@ -223,8 +229,17 @@ def key_source() -> str:
 
 def public_settings() -> dict:
     data = load_settings()
-    source = key_source()
-    key = env_api_key() if source == "env" else stored_api_key() if source == "stored" else ""
+    env_key = env_api_key()
+    stored, keyring_error = _read_stored_api_key()
+    if env_key:
+        source = "env"
+        key = env_key
+    elif stored:
+        source = "stored"
+        key = stored
+    else:
+        source = "none"
+        key = ""
     return {
         "model": data["model"],
         "quality": data["quality"],
@@ -237,6 +252,7 @@ def public_settings() -> dict:
         "has_key": bool(key),
         "key_masked": mask_key(key),
         "key_source": source,
+        "keyring_error": keyring_error,
         "default_model": DEFAULT_MODEL,
     }
 

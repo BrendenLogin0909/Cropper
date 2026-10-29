@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -110,12 +111,13 @@ class StageFilesTests(unittest.TestCase):
     def test_write_failure_removes_partial_outputs_and_keeps_sources(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);source=self.source(root,stages.CROP_QUEUE)
-            original_open=Path.open
-            def fail_output(path,*args,**kwargs):
-                if path.parent.name==stages.AI_QUEUE and args and args[0]=='xb':
+            original_replace=os.replace
+            def fail_output(src, dst, *args, **kwargs):
+                dest=Path(dst)
+                if dest.parent.name==stages.AI_QUEUE:
                     raise OSError('simulated disk error')
-                return original_open(path,*args,**kwargs)
-            with patch.object(Path,'open',fail_output):
+                return original_replace(src, dst, *args, **kwargs)
+            with patch.object(os,'replace',fail_output):
                 with self.assertRaises(OSError): file_accepted(source,png('blue'),stage_routing=True)
             self.assertTrue(source.exists())
             self.assertFalse((root/stages.CROPPED/source.name).exists())

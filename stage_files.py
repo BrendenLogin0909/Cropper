@@ -28,6 +28,13 @@ LOCK = threading.RLock()
 OPERATION_SUFFIX = {'crop': '_c', 'enhance': '_e', 'restore': '_ai', 'colorize': '_col'}
 INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 TEMPLATE_FIELDS = {'name', 'date', 'index', 'ext', 'suffix'}
+LOCK_TIMEOUT_SECONDS = 30
+WINDOWS_RESERVED_STEMS = frozenset(
+    {'CON', 'PRN', 'AUX', 'NUL'}
+    | {f'COM{i}' for i in range(10)}
+    | {f'LPT{i}' for i in range(10)}
+)
+FILE_LOCKED_SUFFIXES = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp', '.bmp', '.gif', '.json'}
 
 
 def _settings():
@@ -37,6 +44,73 @@ def _settings():
     except Exception:
         return {'filename_template': '{name}{suffix}{ext}', 'conflict_policy': 'skip',
                 'replace_original': False, 'backup_originals': True, 'output_folder': ''}
+
+
+def path_key(path: Path) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _is_windows() -> bool:
+    return os.name == 'nt'
+
+
+def windows_long_path(path: Path) -> Path:
+    """Prefix a Windows long-path marker so paths over 260 characters can be opened."""
+    text = os.fspath(path)
+    if not _is_windows() or text.startswith('\\\\?\\'):
+        return Path(path)
+    absolute = str(Path(path).absolute())
+    if absolute.startswith('\\\\'):
+        return Path('\\\\?\\UNC\\' + absolute[2:])
+    return Path('\\\\?\\' + absolute)
+
+
+def windows_safe_filename(name: str) -> str:
+    """Reject invalid characters and rewrite Windows reserved device names."""
+    name = (name or '').strip().rstrip(' .')
+    if not name or name in {'.', '..'} or INVALID_NAME.search(name) or '/' in name or '\\' in name:
+        raise ValueError('Filename template produces invalid characters.')
+    stem, suffix = Path(name).stem, Path(name).suffix
+    if stem.upper() in WINDOWS_RESERVED_STEMS:
+        name = f'_{stem}{suffix}'
+    return name
+
+
+def recovered_path(source: Path) -> Path:
+    base = source.with_name(source.name + '.cropper-recovered')
+    if not base.exists():
+        return base
+    n = 2
+    while n <= 10000:
+        candidate = source.with_name(f'{source.name}.cropper-recovered-{n}')
+        if not candidate.exists():
+            return candidate
+        n += 1
+    raise ValueError('Could not find a free recovered name.')
+
+
+def permission_error_response(exc: PermissionError) -> tuple[int, dict]:
+    name = getattr(exc, 'filename', None)
+    path = Path(name) if name else None
+    locked_file = False
+    if path is not None:
+        try:
+            locked_file = path.is_file()
+        except OSError:
+            locked_file = False
+        if not locked_file:
+            locked_file = path.suffix.lower() in FILE_LOCKED_SUFFIXES
+    if locked_file:
+        return 403, {
+            'code': 'file_locked',
+            'error': f'Cropper cannot write {path.name}. Close the file in other programs and retry.',
+            'path': str(path),
+        }
+    return 403, {
+        'code': 'permission_denied',
+        'error': "Cropper cannot write to this location. Choose another output folder or check this folder's permissions.",
+        'path': str(path) if path is not None else None,
+    }
 
 
 def validate_template(template: str) -> str:
@@ -62,27 +136,24 @@ def render_filename(source: Path, operation: str, index: int = 1, template: str 
                                index=str(index), ext=ext, suffix=suffix)
     except (KeyError, ValueError, IndexError) as exc:
         raise ValueError('Filename template supports {name}, {date}, {index} and {ext}.') from exc
-    name = name.strip()
-    if not name or INVALID_NAME.search(name) or name in {'.', '..'} or '/' in name or '\\' in name:
-        raise ValueError('Filename template produces invalid characters.')
-    return name
+    return windows_safe_filename(name)
 
 
 def unique_path(path: Path, taken: set[Path]) -> Path:
-    resolved = {item.resolve() for item in taken}
+    resolved = {path_key(item) for item in taken}
     candidate = path
     n = 1
-    while candidate.resolve() in resolved or candidate.exists():
+    while path_key(candidate) in resolved or candidate.exists():
         n += 1
         if n > 10000:
             raise ValueError('Could not find a free output name.')
-        candidate = path.with_name(f'{path.stem}-{n}{path.suffix}')
+        candidate = path.with_name(windows_safe_filename(f'{path.stem}-{n}{path.suffix}'))
     return candidate
 
 
 def apply_conflict(path: Path, taken: set[Path], policy: str) -> tuple[Path, bool]:
     policy = (policy or 'skip').lower()
-    exists = path.resolve() in {item.resolve() for item in taken} or path.exists()
+    exists = path_key(path) in {path_key(item) for item in taken} or path.exists()
     if not exists:
         return path, False
     if policy == 'overwrite':
@@ -93,27 +164,44 @@ def apply_conflict(path: Path, taken: set[Path], policy: str) -> tuple[Path, boo
 
 
 @contextmanager
-def interprocess_lock(path: Path):
+def interprocess_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS):
+    path = windows_long_path(Path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, 'a+')
+    handle = open(path, 'a+b')
     try:
-        if os.name == 'nt':
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b'\0')
+            handle.flush()
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        if _is_windows():
             import msvcrt
-            locked = False
-            while not locked:
+            while True:
                 try:
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    locked = True
+                    break
                 except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'Cropper could not lock files because another Cropper is busy. Try again.'
+                        )
                     time.sleep(0.05)
         else:
             import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'Cropper could not lock files because another Cropper is busy. Try again.'
+                        )
+                    time.sleep(0.05)
         yield
     finally:
         try:
-            if os.name == 'nt':
+            if _is_windows():
                 import msvcrt
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
@@ -130,31 +218,63 @@ def reservation_file() -> Path:
     return data_dir() / 'output-reservations.json'
 
 
-def reserved_paths() -> set[Path]:
+def _load_reservation_entries() -> list[dict]:
     path = reservation_file()
     if not path.is_file():
-        return set()
+        return []
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
-        return set()
-    return {Path(item).resolve() for item in data if item}
+        return []
+    entries = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str) and item:
+                entries.append({'path': item, 'id': None, 'created': 0})
+            elif isinstance(item, dict) and item.get('path'):
+                entries.append({
+                    'path': str(item['path']),
+                    'id': item.get('id') or None,
+                    'created': float(item.get('created') or 0),
+                })
+    return entries
 
 
-def _write_reservations(paths: set[Path]) -> None:
+def reserved_paths() -> set[Path]:
+    return {Path(item['path']).resolve() for item in _load_reservation_entries() if item.get('path')}
+
+
+def _write_reservation_entries(entries: list[dict]) -> None:
     path = reservation_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temp_name = tempfile.mkstemp(prefix='.cropper-', suffix='.json', dir=path.parent)
+    payload = [{'path': item['path'], 'id': item.get('id'), 'created': item.get('created') or 0}
+               for item in entries if item.get('path')]
+    handle, temp_name = tempfile.mkstemp(prefix='.cropper-', suffix='.json', dir=str(windows_long_path(path.parent)))
     temp = Path(temp_name)
     try:
         with os.fdopen(handle, 'w', encoding='utf-8') as target:
-            json.dump(sorted(str(item) for item in paths), target)
+            json.dump(payload, target)
             target.flush()
             os.fsync(target.fileno())
-        os.replace(temp, path)
+        os.replace(temp, windows_long_path(path))
     except Exception:
         temp.unlink(missing_ok=True)
         raise
+
+
+def _write_reservations(paths: set[Path]) -> None:
+    now = time.time()
+    previous = {path_key(Path(item['path'])): item for item in _load_reservation_entries() if item.get('path')}
+    entries = []
+    for item in paths:
+        key = path_key(item)
+        existing = previous.get(key, {})
+        entries.append({
+            'path': str(Path(item).resolve()),
+            'id': existing.get('id'),
+            'created': existing.get('created') or now,
+        })
+    _write_reservation_entries(entries)
 
 
 def pending_output_paths() -> set[Path]:
@@ -199,12 +319,69 @@ def reserve_plan_outputs(plans: list[dict], policy: str | None = None) -> list[d
 
 
 def release_outputs(paths: list[Path | str]) -> None:
+    if not paths or not reservation_file().is_file():
+        return
     lock_path = reservation_file().with_suffix('.lock')
     with interprocess_lock(lock_path), LOCK:
-        current = reserved_paths()
-        for path in paths:
-            current.discard(Path(path).resolve())
-        _write_reservations(current)
+        drop = {path_key(Path(path)) for path in paths}
+        entries = [item for item in _load_reservation_entries()
+                   if item.get('path') and path_key(Path(item['path'])) not in drop]
+        _write_reservation_entries(entries)
+
+
+def bind_reservation_ids(paths: list[Path | str], stage_id: str) -> None:
+    if not paths or not stage_id or not reservation_file().is_file():
+        return
+    lock_path = reservation_file().with_suffix('.lock')
+    with interprocess_lock(lock_path), LOCK:
+        keys = {path_key(Path(path)) for path in paths}
+        now = time.time()
+        entries = _load_reservation_entries()
+        for item in entries:
+            if item.get('path') and path_key(Path(item['path'])) in keys:
+                item['id'] = stage_id
+                item['created'] = item.get('created') or now
+        _write_reservation_entries(entries)
+
+
+def release_pending_reservations(stage_id: str, extra_paths: list[Path | str] | None = None) -> None:
+    if not reservation_file().is_file():
+        return
+    lock_path = reservation_file().with_suffix('.lock')
+    with interprocess_lock(lock_path), LOCK:
+        extra = {path_key(Path(path)) for path in (extra_paths or [])}
+        entries = []
+        for item in _load_reservation_entries():
+            if item.get('id') and item.get('id') == stage_id:
+                continue
+            if item.get('path') and path_key(Path(item['path'])) in extra:
+                continue
+            entries.append(item)
+        _write_reservation_entries(entries)
+
+
+def sweep_stale_reservations() -> None:
+    """Drop reservations whose pending id is gone."""
+    if not reservation_file().is_file():
+        return
+    from chatgpt_pending import default_pending_root
+    lock_path = reservation_file().with_suffix('.lock')
+    with interprocess_lock(lock_path), LOCK:
+        root = default_pending_root()
+        live = set()
+        if root.is_dir():
+            live = {path.stem for path in root.glob('*.json') if not path.name.startswith('.cropper-')}
+            live |= {path.stem for path in root.glob('*.png') if not path.name.startswith('.cropper-')}
+        entries = []
+        changed = False
+        for item in _load_reservation_entries():
+            ident = item.get('id')
+            if ident and ident not in live:
+                changed = True
+                continue
+            entries.append(item)
+        if changed:
+            _write_reservation_entries(entries)
 
 
 def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None) -> list[dict]:
@@ -277,21 +454,25 @@ def plan(source: Path, operation: str) -> dict:
 
 
 def _atomic_create(target: Path, data: bytes, overwrite: bool = False) -> bool:
-    """Write target. Returns True if this call created a new file to roll back."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if overwrite:
-        handle, temp_name = tempfile.mkstemp(prefix='.cropper-', suffix=target.suffix, dir=target.parent)
-        os.close(handle)
-        temp = Path(temp_name)
-        try:
-            temp.write_bytes(data)
-            os.replace(temp, target)
-        finally:
-            temp.unlink(missing_ok=True)
-        return False
-    with target.open('xb') as handle:
-        handle.write(data)
-    return True
+    """Write target via temp + os.replace. Returns True if this call created a new file to roll back."""
+    target = Path(target)
+    parent = windows_long_path(target.parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    destination = windows_long_path(target)
+    if not overwrite and destination.exists():
+        raise FileExistsError(str(target))
+    handle, temp_name = tempfile.mkstemp(prefix='.cropper-', suffix=target.suffix or '.tmp', dir=str(parent))
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(handle, 'wb') as writer:
+            writer.write(data)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temp, destination)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
+    return not overwrite
 
 
 def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
@@ -361,27 +542,26 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                     if source.read_bytes() != originals[source]:
                         raise ValueError(f'Source changed while saving: {source.name}')
                     removed.append(source)
-                    source.unlink()
+                    windows_long_path(source).unlink()
         except Exception:
             restored_all = True
             for source in removed:
                 try:
                     if source.exists() and source.read_bytes() == originals[source]:
                         continue
-                    with source.open('xb') as handle:
-                        handle.write(originals[source])
+                    _atomic_create(source, originals[source], overwrite=False)
                 except Exception:
                     restored_all = False
-                    recovered = source.with_name(source.name + '.cropper-recovered')
+                    recovered = recovered_path(source)
                     try:
-                        recovered.write_bytes(originals[source])
+                        _atomic_create(recovered, originals[source], overwrite=False)
                     except Exception:
                         pass
             if restored_all:
                 for target in reversed(created):
-                    target.unlink(missing_ok=True)
+                    windows_long_path(target).unlink(missing_ok=True)
                 for target, previous in overwrites.items():
-                    target.write_bytes(previous)
+                    _atomic_create(target, previous, overwrite=True)
             raise
         return outputs
 

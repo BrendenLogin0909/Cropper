@@ -274,8 +274,9 @@
   <dialog id="app-settings-dialog" class="app-settings-dialog" aria-labelledby="app-settings-title">
     <div class="chatgpt-preview-head"><h2 id="app-settings-title">Settings</h2><button id="app-settings-close" class="button button-quiet">Close</button></div>
     <p class="aspect-note">Saved on this computer. The API key is stored in Windows Credential Manager, not in the project folder. Other options go in your Cropper app data folder.</p>
+    <p id="settings-keyring-warning" class="settings-keyring-warning hidden" role="alert"></p>
     <div class="settings-fields">
-      <label class="field"><span>OpenAI API key</span><input id="settings-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste key — it is never shown in full"></label>
+      <label class="field"><span>OpenAI API key</span><input id="settings-api-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste key — it is never shown in full"></label>
       <p id="settings-key-masked" class="aspect-note">No key saved. AI restore is disabled until you add one, or set OPENAI_API_KEY.</p>
       <p id="settings-key-source" class="aspect-note"></p>
       <div class="chatgpt-zoom-tools" style="margin-bottom:12px">

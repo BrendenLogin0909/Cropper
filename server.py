@@ -379,6 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                     "stage_routing_version": 2,
                     "has_key": info["has_key"],
                     "key_source": info["key_source"],
+                    "keyring_error": info.get("keyring_error") or "",
                     "model": info["model"],
                     "quality": info["quality"],
                 })
@@ -488,6 +489,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = data.pop("api_key", None)
                 if key is not None and str(key).strip():
                     app_settings.set_stored_api_key(str(key))
+                key = None
                 app_settings.save_settings(data)
                 self.json(200, app_settings.public_settings())
                 return
@@ -733,7 +735,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
-            self.json(403, {"code": "permission_denied", "error": "Cropper cannot write to this location. Choose another output folder or check this folder's permissions.", "path": exc.filename})
+            self.json(*stage_files.permission_error_response(exc))
         except (ValueError, OSError, json.JSONDecodeError, cv2.error) as exc:
             self.json(400, {"error": str(exc)})
 

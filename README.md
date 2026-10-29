@@ -86,6 +86,8 @@ Open Settings to paste an OpenAI API key. Cropper stores it in Windows Credentia
 Manager, never in a plaintext file. Other settings are saved in
 `%APPDATA%\Cropper\settings.json`. If `OPENAI_API_KEY` is set in the environment,
 it takes precedence. The UI shows only the last four characters of a key.
+`OPENAI_BASE_URL` may be set for tests or HTTP proxies; it defaults to
+`https://api.openai.com/v1`.
 The default image model is `gpt-image-2.5-sunburst`. Quality defaults to medium;
 low is used for previews; high is an opt-in labelled about 20c per photo.
 Without a key, AI restore is disabled and every other tool still works offline.
