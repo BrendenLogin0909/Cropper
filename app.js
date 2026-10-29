@@ -1412,6 +1412,16 @@ function applyServerSettings(data) {
   if ($('settings-model')) $('settings-model').value = data.model || 'gpt-image-2.5-sunburst';
   if ($('settings-quality')) $('settings-quality').value = data.quality || 'medium';
   const env = data.key_source === 'env';
+  const warning = $('settings-keyring-warning');
+  if (warning) {
+    if (data.keyring_error) {
+      warning.textContent = data.keyring_error;
+      warning.classList.remove('hidden');
+    } else {
+      warning.textContent = '';
+      warning.classList.add('hidden');
+    }
+  }
   if ($('settings-api-key')) {
     $('settings-api-key').value = '';
     $('settings-api-key').disabled = env;
@@ -1437,11 +1447,14 @@ async function openAppSettings() {
 }
 async function saveAppSettings() {
   const payload = { model: $('settings-model').value.trim(), quality: $('settings-quality').value, guide_seen: true };
-  const typed = $('settings-api-key').value.trim();
+  const input = $('settings-api-key');
+  const typed = input ? input.value.trim() : '';
   if (typed) payload.api_key = typed;
+  if (input) input.value = '';
   try {
-    applyServerSettings(await api('/api/settings', payload));
-    $('settings-api-key').value = '';
+    const saved = await api('/api/settings', payload);
+    payload.api_key = '';
+    applyServerSettings(saved);
     $('settings-key-status').textContent = 'Settings saved.';
     toast('Settings saved.');
   } catch (error) { $('settings-key-status').textContent = error.message; toast(error.message, true); }
@@ -1477,6 +1490,7 @@ async function init() {
     try {
       const settings = await api('/api/settings');
       applyServerSettings(settings);
+      if (settings.keyring_error) toast(settings.keyring_error, true);
       if (!settings.guide_seen) {
         try { $('first-run-dialog').showModal(); }
         catch (_) {}

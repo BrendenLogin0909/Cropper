@@ -56,6 +56,28 @@ class AppSettingsTests(unittest.TestCase):
         app_settings.save_settings({"quality": "high", "model": "gpt-image-2.5-sunburst"})
         self.assertEqual(app_settings.load_settings()["quality"], "high")
 
+    def test_keyring_failure_sets_visible_error_and_no_key(self):
+        with patch.object(app_settings, "_keyring") as ring:
+            ring.side_effect = RuntimeError("backend missing")
+            self.assertEqual(app_settings.stored_api_key(), "")
+            public = app_settings.public_settings()
+        self.assertFalse(public["has_key"])
+        self.assertEqual(public["key_source"], "none")
+        self.assertEqual(public["key_masked"], "")
+        self.assertIn("credential store", public["keyring_error"].lower())
+        self.assertNotIn("backend missing", public["keyring_error"])
+
+    def test_env_key_still_works_when_keyring_fails(self):
+        os.environ["OPENAI_API_KEY"] = "sk-env-ABCD"
+        with patch.object(app_settings, "_keyring") as ring:
+            ring.side_effect = RuntimeError("backend missing")
+            self.assertEqual(app_settings.resolved_api_key(), "sk-env-ABCD")
+            public = app_settings.public_settings()
+        self.assertTrue(public["has_key"])
+        self.assertEqual(public["key_source"], "env")
+        self.assertEqual(public["key_masked"], "****ABCD")
+        self.assertIn("credential store", public["keyring_error"].lower())
+
     def test_data_dir_flag(self):
         other = TemporaryDirectory()
         self.addCleanup(other.cleanup)

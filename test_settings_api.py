@@ -36,11 +36,26 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(body["key_masked"], "****9999")
         self.assertTrue(body["has_key"])
         self.assertEqual(body["quality"], "high")
-        self.assertNotIn("sk-live-secret-9999", json.dumps(body))
+        dumped = json.dumps(body)
+        self.assertNotIn("sk-live-secret-9999", dumped)
+        self.assertNotIn("api_key", body)
+        self.assertEqual(body.get("keyring_error", ""), "")
         saved = (app_settings.data_dir() / "settings.json").read_text(encoding="utf-8")
         self.assertNotIn("sk-live-secret-9999", saved)
         cleared = self.post("/api/settings/clear-key", {})
         self.assertFalse(cleared["has_key"])
+        self.assertEqual(cleared["key_masked"], "")
+
+    def test_keyring_failure_is_returned_to_the_ui(self):
+        with patch.object(app_settings, "_keyring") as ring:
+            ring.side_effect = RuntimeError("backend missing")
+            request = Request(self.base + "/api/settings", headers=self.headers)
+            with urlopen(request) as response:
+                body = json.load(response)
+        self.assertFalse(body["has_key"])
+        self.assertEqual(body["key_masked"], "")
+        self.assertIn("credential store", body["keyring_error"].lower())
+        self.assertNotIn("backend missing", json.dumps(body))
 
     def test_test_key_classifies_without_raw_provider_text(self):
         with patch("chatgpt_restore.openai_client") as ctor:
