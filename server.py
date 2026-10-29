@@ -49,6 +49,10 @@ GPS_IFD = 0x8825
 CONFIRMATION_TTL_SECONDS = 15 * 60
 CONFIRMATIONS: dict[str, dict] = {}
 CONFIRMATIONS_LOCK = threading.Lock()
+TABS: dict[tuple[str, str], float] = {}
+TABS_LOCK = threading.Lock()
+TAB_ID_MIN_LEN = 16
+TAB_ID_MAX_LEN = 128
 
 
 def hostname_of(host_header: str) -> str:
@@ -368,6 +372,41 @@ def reset_confirmations() -> None:
         CONFIRMATIONS.clear()
 
 
+def reset_tabs() -> None:
+    """Drop registered browser tabs. Restarts empty this store."""
+    with TABS_LOCK:
+        TABS.clear()
+
+
+def normalize_tab_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not TAB_ID_MIN_LEN <= len(text) <= TAB_ID_MAX_LEN:
+        return ""
+    if not all(char.isalnum() or char in "-_" for char in text):
+        return ""
+    return text
+
+
+def register_tab(tab_id: str, session: str | None = None) -> str:
+    """Remember this browser tab for the current app session."""
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        raise ValueError("This browser tab must register a random id first.")
+    with TABS_LOCK:
+        TABS[(session, tab_id)] = time.time()
+    return tab_id
+
+
+def tab_is_registered(tab_id: str, session: str | None = None) -> bool:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return False
+    with TABS_LOCK:
+        return (session, tab_id) in TABS
+
+
 def _purge_confirmations_locked(now: float | None = None) -> None:
     stamp = time.time() if now is None else now
     expired = [token for token, record in CONFIRMATIONS.items() if record["expires"] <= stamp]
@@ -383,16 +422,17 @@ def _batch_key(plans: list[dict]) -> str:
     return "\n".join(sorted({stage_files.path_key(stage_files.plan_root(item)) for item in plans}))
 
 
-def _session_matches(stored: str, session: str) -> bool:
-    if not stored or not session or len(stored) != len(session):
+def _secret_matches(stored: str, given: str) -> bool:
+    if not stored or not given or len(stored) != len(given):
         return False
-    return secrets.compare_digest(stored, session)
+    return secrets.compare_digest(stored, given)
 
 
 def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
-                      now: float | None = None) -> dict | None:
-    """Return a live same-session record, or None. Does not check target coverage."""
-    if not token:
+                      tab_id: str, now: float | None = None) -> dict | None:
+    """Return a live same-session, same-tab record, or None. Does not check target coverage."""
+    tab_id = normalize_tab_id(tab_id)
+    if not token or not tab_id or not tab_is_registered(tab_id, session):
         return None
     stamp = time.time() if now is None else now
     with CONFIRMATIONS_LOCK:
@@ -400,7 +440,9 @@ def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
         record = CONFIRMATIONS.get(token)
         if record is None:
             return None
-        if record["kind"] != kind or not _session_matches(record["session"], session):
+        if record["kind"] != kind or not _secret_matches(record["session"], session):
+            return None
+        if not _secret_matches(record.get("tab_id") or "", tab_id):
             return None
         if record["expires"] <= stamp:
             CONFIRMATIONS.pop(token, None)
@@ -411,19 +453,26 @@ def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
 
 
 def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
-                       session: str | None = None, payload: dict | None = None) -> str:
-    """Mint a random in-memory token bound to this session, batch, and targets."""
+                       session: str | None = None, payload: dict | None = None,
+                       tab_id: str | None = None) -> str:
+    """Mint a random in-memory token bound to this session, tab, folder, and targets."""
     session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
     covered = set(_target_keys(targets))
+    scope = "files"
     previous = str((payload or {}).get("confirmation_token") or "")
-    inherited = _record_for_token(previous, kind, plans, session)
+    inherited = _record_for_token(previous, kind, plans, session, tab_id)
     if inherited:
-        covered |= set(inherited["targets"])
+        covered |= set(inherited.get("targets") or ())
+        if inherited.get("scope") == "batch":
+            scope = "batch"
     token = secrets.token_urlsafe(32)
     record = {
         "kind": kind,
         "session": session,
+        "tab_id": tab_id,
         "batch": _batch_key(plans),
+        "scope": scope,
         "targets": frozenset(covered),
         "expires": time.time() + CONFIRMATION_TTL_SECONDS,
     }
@@ -434,59 +483,75 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
 
 
 def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: list[Path],
-                        session: str | None = None) -> bool:
-    """True only for a live token from this session that covers every current target."""
+                        session: str | None = None, tab_id: str | None = None) -> bool:
+    """True only for a live registered-tab token covering this folder, and files unless batch-wide."""
     flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
     if not any(payload.get(flag) for flag in flags):
         return False
     token = str(payload.get("confirmation_token") or "")
     session = session or TOKEN
-    record = _record_for_token(token, kind, plans, session)
+    tab_id = normalize_tab_id(tab_id)
+    record = _record_for_token(token, kind, plans, session, tab_id)
     if record is None:
         return False
-    return _target_keys(targets) <= record["targets"]
+    batch_grant = record.get("scope") == "batch"
+    if kind == "overwrite" and payload.get("skip_overwrite_prompt"):
+        batch_grant = True
+    if kind == "replace" and payload.get("confirm_replace"):
+        batch_grant = True
+    if batch_grant:
+        with CONFIRMATIONS_LOCK:
+            live = CONFIRMATIONS.get(token)
+            if live is not None:
+                live["scope"] = "batch"
+        return True
+    return _target_keys(targets) <= (record.get("targets") or frozenset())
 
 
-def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
+def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None,
+                       tab_id: str | None = None) -> dict | None:
     """Return a 409 payload when this batch would overwrite and has not been confirmed."""
     payload = data if isinstance(data, dict) else {}
     targets = stage_files.planned_overwrites(plans)
     if not targets:
         return None
     session = session or TOKEN
-    if confirmation_allows("overwrite", payload, plans, targets, session):
+    if confirmation_allows("overwrite", payload, plans, targets, session, tab_id):
         return None
     return {
         "code": "overwrite_confirmation_required",
         "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "confirmation_token": issue_confirmation("overwrite", plans, targets, session, payload),
+        "confirmation_token": issue_confirmation("overwrite", plans, targets, session, payload, tab_id),
     }
 
 
-def replace_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
+def replace_response(plans: list[dict], data: dict | None, session: str | None = None,
+                     tab_id: str | None = None) -> dict | None:
     """Return a 409 payload when Replace original has not been confirmed for this batch."""
     payload = data if isinstance(data, dict) else {}
     targets = stage_files.planned_replaces(plans)
     if not targets:
         return None
     session = session or TOKEN
-    if confirmation_allows("replace", payload, plans, targets, session):
+    if confirmation_allows("replace", payload, plans, targets, session, tab_id):
         return None
     return {
         "code": "replace_confirmation_required",
         "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "confirmation_token": issue_confirmation("replace", plans, targets, session, payload),
+        "confirmation_token": issue_confirmation("replace", plans, targets, session, payload, tab_id),
     }
 
 
-def confirmation_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
+def confirmation_response(plans: list[dict], data: dict | None, session: str | None = None,
+                          tab_id: str | None = None) -> dict | None:
     """Replace original is independent of Skip/Overwrite/Auto-suffix."""
     session = session or TOKEN
-    return replace_response(plans, data, session) or overwrite_response(plans, data, session)
+    return replace_response(plans, data, session, tab_id) or overwrite_response(
+        plans, data, session, tab_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -517,6 +582,12 @@ class Handler(BaseHTTPRequestHandler):
         given = self.headers.get("X-Cropper-Token", "") or (query or {}).get("token", [""])[0]
         return secrets.compare_digest(given, TOKEN) and request_is_local(self)
 
+    def request_tab_id(self) -> str:
+        return normalize_tab_id(self.headers.get("X-Cropper-Tab", ""))
+
+    def confirm(self, plans: list[dict], data: dict | None) -> dict | None:
+        return confirmation_response(plans, data, TOKEN, self.request_tab_id())
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -525,6 +596,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not request_is_local(self):
                     self.json(403, {"error": "Session is only available on localhost."})
                     return
+                tab_id = self.request_tab_id()
+                if tab_id:
+                    register_tab(tab_id, TOKEN)
                 info = app_settings.public_settings()
                 self.json(200, {
                     "app": "Cropper",
@@ -637,6 +711,14 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > 1_000_000:
                 raise ValueError("Invalid request size.")
             data = json.loads(self.rfile.read(length))
+            if self.path == "/api/tab-register":
+                payload = data if isinstance(data, dict) else {}
+                tab_id = normalize_tab_id(str(payload.get("tab_id") or "") or self.headers.get("X-Cropper-Tab", ""))
+                if not tab_id:
+                    raise ValueError("This browser tab must register a random id first.")
+                register_tab(tab_id, TOKEN)
+                self.json(200, {"registered": True})
+                return
             if self.path == "/api/settings":
                 if not isinstance(data, dict):
                     raise ValueError("Invalid settings.")
@@ -687,15 +769,18 @@ class Handler(BaseHTTPRequestHandler):
                     "replace_names": [path.name for path in replaces],
                     "replace_paths": [str(path) for path in replaces],
                 }
+                tab_id = self.request_tab_id()
                 if targets:
-                    body["confirmation_token"] = issue_confirmation("overwrite", plans, targets)
+                    body["confirmation_token"] = issue_confirmation(
+                        "overwrite", plans, targets, TOKEN, data, tab_id)
                 if replaces:
-                    body["replace_confirmation_token"] = issue_confirmation("replace", plans, replaces)
+                    body["replace_confirmation_token"] = issue_confirmation(
+                        "replace", plans, replaces, TOKEN, data, tab_id)
                 self.json(200, body)
                 return
             if self.path == "/api/crop":
                 path = image_path(data.get("path", ""))
-                refusal = confirmation_response([stage_files.plan(path, "crop")], data)
+                refusal = self.confirm([stage_files.plan(path, "crop")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -721,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/enhance":
                 path = image_path(data.get("path", ""))
-                refusal = confirmation_response([stage_files.plan(path, "enhance")], data)
+                refusal = self.confirm([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -749,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/restore":
                 path = image_path(data.get("path", ""))
-                refusal = confirmation_response([stage_files.plan(path, "enhance")], data)
+                refusal = self.confirm([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -900,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
                                     bool(item.get("overwrite"))
                                     or (app_settings.load_settings().get("conflict_policy") == "overwrite")
                                 )
-                        refusal = confirmation_response(plans, data)
+                        refusal = self.confirm(plans, data)
                         if refusal:
                             self.json(409, refusal)
                             return

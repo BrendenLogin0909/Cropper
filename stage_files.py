@@ -120,17 +120,44 @@ def uses_index_template(template: str | None = None) -> bool:
     return '{index}' in text
 
 
+def index_occupied_dirs(output_dir: Path) -> list[Path]:
+    """Folders whose matching filenames occupy an {index}, including Finish snapshots."""
+    output_dir = Path(output_dir)
+    root = output_dir.parent
+    folders = [
+        output_dir,
+        root / CROP_QUEUE, root / ENHANCE_QUEUE, root / AI_QUEUE,
+        root / CROPPED, root / ENHANCED, root / SKIP_ENHANCE,
+        root / AI, root / COLOR, root / SKIP_AI,
+    ]
+    seen: list[Path] = []
+    keys: set[str] = set()
+    for folder in folders:
+        key = path_key(folder)
+        if key not in keys:
+            keys.add(key)
+            seen.append(folder)
+    return seen
+
+
 def next_free_index(source: Path, operation: str, output_dir: Path, taken: set[Path] | None = None,
                     start: int = 1, batch_size: int = 1) -> int:
-    """Next {index} whose rendered name is free on disk and not already taken."""
+    """Next {index} whose rendered name is free on disk, in Finish folders, and not already taken."""
     occupied = {path_key(path) for path in (taken or ())}
     try:
         index = max(int(start), 1)
     except (TypeError, ValueError):
         index = 1
+    folders = index_occupied_dirs(output_dir)
     for _ in range(10000):
-        candidate = Path(output_dir) / render_filename(source, operation, index=index, batch_size=batch_size)
-        if path_key(candidate) not in occupied and not candidate.exists():
+        name = render_filename(source, operation, index=index, batch_size=batch_size)
+        taken_name = False
+        for folder in folders:
+            candidate = folder / name
+            if path_key(candidate) in occupied or candidate.exists():
+                taken_name = True
+                break
+        if not taken_name:
             return index
         index += 1
     raise ValueError('Could not find a free output index.')

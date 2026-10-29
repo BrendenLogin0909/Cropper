@@ -129,6 +129,21 @@ async function setOutputFolder(path) {
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function url(path, filePath) { return `${path}?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(state.token)}`; }
+function tabId() {
+  const key = 'cropper-tab-id';
+  try {
+    const existing = sessionStorage.getItem(key);
+    if (existing && /^[A-Za-z0-9_-]{16,128}$/.test(existing)) return existing;
+  } catch (_) {}
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const id = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  try { sessionStorage.setItem(key, id); } catch (_) {}
+  return id;
+}
+function requestHeaders(extra) {
+  return { 'X-Cropper-Token': state.token, 'X-Cropper-Tab': tabId(), ...extra };
+}
 const batchPromptState = { overwriteSkip: [], replaceTokens: [] };
 function hasOverwriteSkip(token) { return !!(token && batchPromptState.overwriteSkip.includes(token)); }
 function hasReplaceAck(token) { return !!(token && batchPromptState.replaceTokens.includes(token)); }
@@ -199,7 +214,7 @@ async function api(path, body) {
   }
   let payload = body;
   for (;;) {
-    const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: { 'X-Cropper-Token': state.token, ...(payload === null ? {} : payload === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }) });
+    const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: requestHeaders(payload === null || payload === undefined ? {} : { 'Content-Type': 'application/json' }), ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }) });
     const data = await response.json();
     if (response.status === 409 && payload && typeof payload === 'object' && data.code === 'overwrite_confirmation_required') {
       const token = data.confirmation_token;
@@ -210,6 +225,11 @@ async function api(path, body) {
       }
       if (hasOverwriteSkip(token)) {
         payload = { ...payload, ...overwriteAckForBatch(token, true) };
+        continue;
+      }
+      const storedSkip = latestOverwriteSkip();
+      if (storedSkip && payload.confirmation_token !== storedSkip) {
+        payload = { ...payload, ...overwriteAckForBatch(storedSkip, true) };
         continue;
       }
       const decision = await askOverwrite(data.count, data.names);
@@ -230,6 +250,11 @@ async function api(path, body) {
       }
       if (hasReplaceAck(token)) {
         payload = { ...payload, ...replaceAckForBatch(token) };
+        continue;
+      }
+      const storedReplace = latestReplaceToken();
+      if (storedReplace && payload.confirmation_token !== storedReplace) {
+        payload = { ...payload, ...replaceAckForBatch(storedReplace) };
         continue;
       }
       const decision = await askReplace(data.count, data.names);
@@ -403,7 +428,7 @@ async function previewEnhance(index) {
   $('enhance-changes').textContent = 'Analysing this photo…';
   refreshEnhanceTiles();
   try {
-    const response = await fetch(`/api/enhance-preview?path=${encodeURIComponent(item.path)}`, { headers: { 'X-Cropper-Token': state.token } });
+    const response = await fetch(`/api/enhance-preview?path=${encodeURIComponent(item.path)}`, { headers: requestHeaders() });
     if (!response.ok) { const data = await response.json(); throw new Error(data.error || 'Could not generate the preview.'); }
     const changes = response.headers.get('X-Cropper-Adjustments') || 'Automatic correction applied';
     const blob = await response.blob();
@@ -504,7 +529,7 @@ async function previewRestoration(index) {
   $('restore-after-label').textContent = state.restore.showMarks && operation === 'dust' ? 'DETECTED MARKS' : 'AFTER';
   renderRestorationControls(); drawBrushCanvas();
   try {
-    const response = await fetch('/api/restore-preview', { method: 'POST', headers: { 'X-Cropper-Token': state.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path, operation, strokes: state.restore.marks.get(item.path) || [], show_marks: state.restore.showMarks && operation === 'dust' }) });
+    const response = await fetch('/api/restore-preview', { method: 'POST', headers: requestHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ path: item.path, operation, strokes: state.restore.marks.get(item.path) || [], show_marks: state.restore.showMarks && operation === 'dust' }) });
     if (!response.ok) { const data = await response.json(); throw new Error(data.error || 'Could not generate the preview.'); }
     const changes = response.headers.get('X-Cropper-Adjustments') || 'Restoration preview ready';
     const useful = response.headers.get('X-Cropper-Useful') !== 'false';
@@ -881,7 +906,7 @@ function scheduleLiveCropPreview() {
 }
 async function renderLiveCropPreview(ticket, source, points, rotation, aspectRatio) {
   try {
-    const response = await fetch('/api/crop-preview', { method:'POST', headers:{'X-Cropper-Token':state.token,'Content-Type':'application/json'}, body:JSON.stringify({path:source.path,points,rotation,aspect_ratio:aspectRatio}) });
+    const response = await fetch('/api/crop-preview', { method:'POST', headers:requestHeaders({'Content-Type':'application/json'}), body:JSON.stringify({path:source.path,points,rotation,aspect_ratio:aspectRatio}) });
     if (!response.ok) throw new Error((await response.json()).error || 'Could not make the preview.');
     const blob = await response.blob();
     if (ticket !== cropPreviewRequest) return;
@@ -1704,11 +1729,12 @@ async function clearAppKey() {
 }
 async function init() {
   try {
-    const session = await fetch('/api/session').then(response => {
+    const session = await fetch('/api/session', { headers: { 'X-Cropper-Tab': tabId() } }).then(response => {
       if (!response.ok) throw new Error('Session is only available on localhost.');
       return response.json();
     });
     state.token = session.token; state.home = session.home;
+    try { await api('/api/tab-register', { tab_id: tabId() }); } catch (_) {}
     state.stageRoutingAvailable = session.stage_routing_version >= 2;
     state.hasKey = session.has_key !== false;
     wire();
