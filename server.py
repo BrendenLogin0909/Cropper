@@ -6,7 +6,6 @@ import argparse
 import io
 import json
 import os
-import re
 import secrets
 import tempfile
 import threading
@@ -67,27 +66,51 @@ def guidance_fields(batch_context, photo_note):
 
 
 def hostname_of(host_header: str) -> str:
+    host, _port = host_and_port(host_header)
+    return host
+
+
+def host_and_port(host_header: str) -> tuple[str, int | None]:
     value = (host_header or "").strip().lower()
     if value.startswith("["):
         end = value.find("]")
-        return value[1:end] if end > 0 else ""
+        host = value[1:end] if end > 0 else ""
+        rest = value[end + 1:] if end > 0 else ""
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError:
+                return host, None
+        return host, None
     if value.count(":") == 1:
-        return value.split(":", 1)[0]
-    return value
+        host, raw = value.split(":", 1)
+        try:
+            return host, int(raw)
+        except ValueError:
+            return host, None
+    return value, None
 
 
-def origin_is_local(origin: str) -> bool:
+def origin_matches_server(handler: BaseHTTPRequestHandler, origin: str) -> bool:
+    """Allow only this process's http://localhost|127.0.0.1|::1:<bound-port>."""
     parsed = urlparse(origin)
     host = (parsed.hostname or "").lower()
-    return parsed.scheme in {"http", "https"} and host in LOCAL_HOSTS
+    if parsed.scheme != "http" or host not in LOCAL_HOSTS:
+        return False
+    port = parsed.port if parsed.port is not None else 80
+    return port == int(handler.server.server_port)
 
 
 def request_is_local(handler: BaseHTTPRequestHandler) -> bool:
-    if hostname_of(handler.headers.get("Host", "")) not in LOCAL_HOSTS:
+    hostname, port = host_and_port(handler.headers.get("Host", ""))
+    if hostname not in LOCAL_HOSTS:
+        return False
+    bound = int(handler.server.server_port)
+    if port is not None and port != bound:
         return False
     origin = handler.headers.get("Origin")
     if origin:
-        return origin_is_local(origin)
+        return origin_matches_server(handler, origin)
     return True
 
 
@@ -337,9 +360,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "Cropper/1.0"
 
     def log_message(self, format: str, *args) -> None:
-        text = format % args
-        text = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-***", text)
-        print("%s - %s" % (self.address_string(), text))
+        # Never log query strings or request bodies (keys, notes, settings).
+        path = urlparse(getattr(self, "path", "") or "").path or "-"
+        command = getattr(self, "command", None) or "-"
+        print("%s - \"%s %s\"" % (self.address_string(), command, path))
 
     def reply(self, status: int, body: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         self.send_response(status)
@@ -358,10 +382,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def authorized(self, query: dict | None = None) -> bool:
         given = self.headers.get("X-Cropper-Token", "") or (query or {}).get("token", [""])[0]
-        origin = self.headers.get("Origin")
-        host = self.headers.get("Host", "")
-        origin_ok = not origin or origin == f"http://{host}" or origin_is_local(origin)
-        return secrets.compare_digest(given, TOKEN) and request_is_local(self) and origin_ok
+        return secrets.compare_digest(given, TOKEN) and request_is_local(self)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
