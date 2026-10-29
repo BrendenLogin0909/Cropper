@@ -14,25 +14,27 @@ const TRUNCATION = 'Guidance is limited to 500 characters, so we trimmed the ext
 const OVERRIDE = 'If this note conflicts with the batch context, follow this note.';
 
 const helpers = vm.runInNewContext(
-  between('function graphemeClusters(', 'function updateChatgptControls(') +
-  '\n({graphemeClusters,stripGuidanceControls,sanitizeGuidance,guidanceLength,guidanceWasTruncated,snapshotGuidance,photoHasGuidance,applyGuidanceField,guidanceStore})',
+  between('function stripGuidanceControls(', 'function updateChatgptControls(') +
+  '\n({stripGuidanceControls,sanitizeGuidance,guidanceLength,guidanceWasTruncated,snapshotGuidance,photoHasGuidance,applyGuidanceField,guidanceStore})',
   { state: { chatgpt: { guidance: { batch: '', photos: {} } } } }
 );
 
-test('AC4 grapheme counting, control stripping, trim and 500 cap match the backend rules', () => {
-  const {graphemeClusters, stripGuidanceControls, sanitizeGuidance, guidanceLength, guidanceWasTruncated} = helpers;
-  assert.equal(graphemeClusters('hello').length, 5);
-  assert.equal(graphemeClusters(ACCENT).length, 1);
-  assert.equal(graphemeClusters(FLAG).length, 1);
-  assert.equal(graphemeClusters(FAMILY).length, 1);
+test('AC4 code-point counting, control stripping, trim and 500 cap match the backend rules', () => {
+  const {stripGuidanceControls, sanitizeGuidance, guidanceLength, guidanceWasTruncated} = helpers;
+  assert.equal(guidanceLength('hello'), 5);
+  assert.equal(guidanceLength(ACCENT), 2);
+  assert.equal(guidanceLength(FLAG), 2);
+  assert.equal(guidanceLength(FAMILY), 5);
+  assert.equal(guidanceLength('😀'), 1);
+  assert.equal([...ACCENT].length, 2);
+  assert.equal(Array.from(FAMILY).length, 5);
   assert.equal(stripGuidanceControls('a\x00b\x07c'), 'abc');
   assert.equal(stripGuidanceControls('line1\nline2'), 'line1\nline2');
   assert.equal(sanitizeGuidance('  sailor hats  '), 'sailor hats');
   assert.equal(sanitizeGuidance(' \n\t '), '');
   assert.equal(sanitizeGuidance('a'.repeat(525)), 'a'.repeat(500));
-  assert.equal(sanitizeGuidance(ACCENT.repeat(501)), ACCENT.repeat(500));
-  assert.equal(sanitizeGuidance(FAMILY.repeat(501)), FAMILY.repeat(500));
-  assert.equal(guidanceLength(ACCENT.repeat(500)), 500);
+  assert.equal(sanitizeGuidance(ACCENT.repeat(251)).length, 500);
+  assert.equal(guidanceLength('a'.repeat(500)), 500);
   assert.equal(guidanceWasTruncated('a'.repeat(501)), true);
   assert.equal(guidanceWasTruncated('a'.repeat(500)), false);
 });
@@ -58,7 +60,7 @@ test('AC4 paste truncates with a visible notice; typing over the cap is trimmed 
 test('AC1 empty snapshot sends no guidance; AC5 freezes notes at run start', () => {
   const state = { chatgpt: { guidance: { batch: 'navy uniforms', photos: { a: 'white hat', b: 'pink roses', c: 'skip me' } } } };
   const local = vm.runInNewContext(
-    between('function graphemeClusters(', 'function updateChatgptControls(') +
+    between('function stripGuidanceControls(', 'function updateChatgptControls(') +
     '\n({sanitizeGuidance,snapshotGuidance,photoHasGuidance})',
     { state }
   );
@@ -225,7 +227,7 @@ test('Wren copy, privacy hint, truncation notice and data-testids are present', 
 
 test('Prompt-order contract is documented next to the comments plumbing', () => {
   const restore = fs.readFileSync(__dirname + '/chatgpt_restore.py', 'utf8');
-  assert.match(restore, /Preservation rules, then batch context, then per-photo note, then rerun corrections/);
+  assert.match(restore, /Preservation rules, then batch context, then per-photo note, then the previous-image paragraph, then corrections last/);
   assert.match(restore, new RegExp(OVERRIDE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.doesNotMatch(restore, /C:[\\/]Users/);
 });

@@ -825,35 +825,6 @@ function chatgptReadyPaths(selection, includeQueued = false) {
   const compositePaths = new Set(photoLinks.map(link => link.composite_path));
   return state.images.map(image => image.path).filter(path => selection.has(path) && !blocked.has(path) && !compositePaths.has(path) && (colorEligible(path) || (includeQueued && current.queuedPaths.has(path))));
 }
-function graphemeClusters(text) {
-  const chars = Array.from(String(text ?? ''));
-  const clusters = [];
-  const isMark = ch => /^\p{M}$/u.test(ch);
-  const isRI = ch => { const cp = ch.codePointAt(0); return cp >= 0x1F1E6 && cp <= 0x1F1FF; };
-  let i = 0;
-  while (i < chars.length) {
-    let cluster;
-    if (isRI(chars[i]) && i + 1 < chars.length && isRI(chars[i + 1])) {
-      cluster = chars[i] + chars[i + 1];
-      i += 2;
-    } else {
-      cluster = chars[i];
-      i += 1;
-    }
-    while (i < chars.length && isMark(chars[i])) { cluster += chars[i]; i += 1; }
-    while (i < chars.length && chars[i] === '\u200d') {
-      cluster += chars[i];
-      i += 1;
-      if (i < chars.length) {
-        cluster += chars[i];
-        i += 1;
-        while (i < chars.length && isMark(chars[i])) { cluster += chars[i]; i += 1; }
-      }
-    }
-    clusters.push(cluster);
-  }
-  return clusters;
-}
 function stripGuidanceControls(text) {
   return Array.from(String(text ?? '')).filter(ch => {
     if (ch === '\n') return true;
@@ -864,11 +835,11 @@ function stripGuidanceControls(text) {
 function sanitizeGuidance(text) {
   const cleaned = stripGuidanceControls(String(text ?? '')).trim();
   if (!cleaned) return '';
-  const clusters = graphemeClusters(cleaned);
-  return clusters.length <= 500 ? cleaned : clusters.slice(0, 500).join('');
+  const chars = Array.from(cleaned);
+  return chars.length <= 500 ? cleaned : chars.slice(0, 500).join('');
 }
 function guidanceLength(text) {
-  return graphemeClusters(stripGuidanceControls(String(text ?? '')).trim()).length;
+  return Array.from(stripGuidanceControls(String(text ?? '')).trim()).length;
 }
 function guidanceWasTruncated(text) {
   return guidanceLength(text) > 500;
@@ -895,11 +866,11 @@ function applyGuidanceField(field, counter, truncation, notice) {
   if (!field) return '';
   const raw = String(field.value || '');
   const stripped = stripGuidanceControls(raw);
-  const truncated = graphemeClusters(stripped.trim()).length > 500;
+  const truncated = Array.from(stripped.trim()).length > 500;
   const next = truncated ? sanitizeGuidance(stripped) : stripped;
   if (field.value !== next) field.value = next;
   const sanitized = sanitizeGuidance(next);
-  if (counter) counter.textContent = `${graphemeClusters(sanitized).length}/500`;
+  if (counter) counter.textContent = `${Array.from(sanitized).length}/500`;
   if (truncation && truncation.classList) truncation.classList.toggle('hidden', !(notice && truncated));
   return sanitized;
 }

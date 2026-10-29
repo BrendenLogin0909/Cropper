@@ -43,8 +43,11 @@ def openai_base_url() -> str:
 GUIDANCE_LIMIT = 500
 # Snapshot-tested engineering text; per-photo notes win over batch context.
 OVERRIDE_SENTENCE = "If this note conflicts with the batch context, follow this note."
-_REGIONAL_INDICATOR_START = 0x1F1E6
-_REGIONAL_INDICATOR_END = 0x1F1FF
+PREVIOUS_IMAGE_PARAGRAPH = (
+    "Image 1 is the ORIGINAL and authoritative photographic evidence. Image 2 is a previous "
+    "AI attempt provided only to explain the correction. Do not copy its mistakes or use it "
+    "to override the original's identity, expression, pose, framing or occlusions."
+)
 
 
 def strip_guidance_controls(text: str) -> str:
@@ -52,70 +55,30 @@ def strip_guidance_controls(text: str) -> str:
     return "".join(ch for ch in str(text) if ch == "\n" or unicodedata.category(ch) != "Cc")
 
 
-def _is_mark(ch: str) -> bool:
-    return unicodedata.category(ch) in {"Mn", "Mc", "Me"}
-
-
-def _is_regional_indicator(ch: str) -> bool:
-    code = ord(ch)
-    return _REGIONAL_INDICATOR_START <= code <= _REGIONAL_INDICATOR_END
-
-
-def grapheme_clusters(text: str) -> list[str]:
-    """Extended grapheme clusters used by the 500-character guidance cap."""
-    chars = list(str(text))
-    clusters: list[str] = []
-    index = 0
-    length = len(chars)
-    while index < length:
-        if _is_regional_indicator(chars[index]) and index + 1 < length and _is_regional_indicator(chars[index + 1]):
-            cluster = chars[index] + chars[index + 1]
-            index += 2
-        else:
-            cluster = chars[index]
-            index += 1
-        while index < length and _is_mark(chars[index]):
-            cluster += chars[index]
-            index += 1
-        while index < length and chars[index] == "\u200d":
-            cluster += chars[index]
-            index += 1
-            if index < length:
-                cluster += chars[index]
-                index += 1
-                while index < length and _is_mark(chars[index]):
-                    cluster += chars[index]
-                    index += 1
-        clusters.append(cluster)
-    return clusters
-
-
-def grapheme_count(text: str) -> int:
-    return len(grapheme_clusters(text))
+def guidance_length(text) -> int:
+    """Unicode code-point count after the same trim/control strip as sanitize_guidance."""
+    if not isinstance(text, str):
+        return 0
+    return len(strip_guidance_controls(text).strip())
 
 
 def sanitize_guidance(text) -> str:
-    """Trim, strip controls except newlines, then cap at 500 grapheme clusters."""
+    """Trim and strip controls except newlines. Reject more than 500 Unicode code points."""
     if not isinstance(text, str):
         return ""
     cleaned = strip_guidance_controls(text).strip()
-    if not cleaned:
-        return ""
-    clusters = grapheme_clusters(cleaned)
-    if len(clusters) <= GUIDANCE_LIMIT:
-        return cleaned
-    return "".join(clusters[:GUIDANCE_LIMIT])
+    if len(cleaned) > GUIDANCE_LIMIT:
+        raise ValueError("Guidance is limited to 500 characters.")
+    return cleaned
 
 
 def guidance_was_truncated(text) -> bool:
-    if not isinstance(text, str):
-        return False
-    cleaned = strip_guidance_controls(text).strip()
-    return grapheme_count(cleaned) > GUIDANCE_LIMIT
+    return guidance_length(text) > GUIDANCE_LIMIT
 
 
-def build_edit_prompt(operation="restore", comments=None, batch_context=None, photo_note=None) -> str:
-    """Preservation rules, then batch context, then per-photo note, then rerun corrections."""
+def build_edit_prompt(operation="restore", comments=None, batch_context=None, photo_note=None,
+                      previous=False) -> str:
+    """Preservation rules, then batch context, then per-photo note, then the previous-image paragraph, then corrections last."""
     prompt = COLORIZATION_PROMPT if operation == "colorize" else PROMPT
     batch = sanitize_guidance(batch_context)
     note = sanitize_guidance(photo_note)
@@ -123,6 +86,8 @@ def build_edit_prompt(operation="restore", comments=None, batch_context=None, ph
         prompt += f"\nBatch context:\n{batch}"
     if note:
         prompt += f"\nPer-photo note:\n{note}\n{OVERRIDE_SENTENCE}"
+    if previous:
+        prompt += f"\n{PREVIOUS_IMAGE_PARAGRAPH}"
     if comments:
         prompt += ("\nUser-supplied corrections, in chronological order (later corrections override earlier ones). "
                    "Apply these within the preservation rules above; change only what is necessary:\n" +
@@ -195,15 +160,13 @@ def edit_front(source: Path, client=None, operation="restore", comments=None, pr
         image.save(upload, format="PNG")
     upload.name = "front.png"
     upload.seek(0)
-    prompt = build_edit_prompt(operation, comments=comments, batch_context=batch_context, photo_note=photo_note)
+    prompt = build_edit_prompt(operation, comments=comments, batch_context=batch_context,
+                              photo_note=photo_note, previous=previous is not None)
     inputs = upload
     if previous is not None:
         reference = io.BytesIO(previous.read_bytes())
         reference.name = "previous-ai-attempt.png"
         inputs = [upload, reference]
-        prompt += ("\nImage 1 is the ORIGINAL and authoritative photographic evidence. Image 2 is a previous "
-                   "AI attempt provided only to explain the correction. Do not copy its mistakes or use it "
-                   "to override the original's identity, expression, pose, framing or occlusions.")
     chosen_quality = quality or image_quality(preview=preview)
     chosen_model = model or image_model()
     response = call_images_edit(client, model=chosen_model, image=inputs, prompt=prompt,

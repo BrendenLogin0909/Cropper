@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import threading
+import traceback
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,9 +16,10 @@ import app_settings
 import chatgpt_pending as pending
 import server
 from chatgpt_restore import (
-    COLORIZATION_PROMPT, GUIDANCE_LIMIT, OVERRIDE_SENTENCE, PROMPT, build_edit_prompt,
-    edit_front, grapheme_clusters, grapheme_count, sanitize_guidance, strip_guidance_controls,
+    COLORIZATION_PROMPT, GUIDANCE_LIMIT, OVERRIDE_SENTENCE, PREVIOUS_IMAGE_PARAGRAPH, PROMPT,
+    build_edit_prompt, edit_front, guidance_length, sanitize_guidance, strip_guidance_controls,
 )
+from image_api_errors import image_api_error
 
 
 def png(color='red'):
@@ -32,27 +34,30 @@ ACCENT = 'e\u0301'
 
 
 class GuidanceSanitizeTests(unittest.TestCase):
-    def test_grapheme_clusters_and_control_stripping(self):
-        self.assertEqual(grapheme_count('hello'), 5)
-        self.assertEqual(grapheme_count(ACCENT), 1)
-        self.assertEqual(grapheme_count('é'), 1)
-        self.assertEqual(grapheme_count(FLAG), 1)
-        self.assertEqual(grapheme_count(FAMILY), 1)
-        self.assertEqual(grapheme_count(ACCENT * GUIDANCE_LIMIT), GUIDANCE_LIMIT)
-        self.assertEqual(len(grapheme_clusters(ACCENT * (GUIDANCE_LIMIT + 1))), GUIDANCE_LIMIT + 1)
+    def test_code_point_length_and_control_stripping(self):
+        self.assertEqual(guidance_length('hello'), 5)
+        self.assertEqual(guidance_length(ACCENT), 2)
+        self.assertEqual(guidance_length('é'), 1)
+        self.assertEqual(guidance_length(FLAG), 2)
+        self.assertEqual(guidance_length(FAMILY), 5)
+        self.assertEqual(guidance_length('😀'), 1)
+        self.assertEqual(guidance_length('a' * GUIDANCE_LIMIT), GUIDANCE_LIMIT)
+        self.assertEqual(guidance_length('a' * (GUIDANCE_LIMIT + 1)), GUIDANCE_LIMIT + 1)
         self.assertEqual(strip_guidance_controls('a\x00b\x07c'), 'abc')
         self.assertEqual(strip_guidance_controls('line1\nline2'), 'line1\nline2')
         self.assertEqual(strip_guidance_controls('a\tb\rc'), 'abc')
 
-    def test_sanitize_trims_caps_and_treats_whitespace_as_empty(self):
+    def test_sanitize_trims_and_rejects_over_500_code_points(self):
         self.assertEqual(sanitize_guidance('  sailor hats  '), 'sailor hats')
         self.assertEqual(sanitize_guidance(' \n\t '), '')
         self.assertEqual(sanitize_guidance('\x00\x01'), '')
         self.assertEqual(sanitize_guidance(None), '')
         self.assertEqual(sanitize_guidance(12), '')
-        self.assertEqual(sanitize_guidance('a' * (GUIDANCE_LIMIT + 25)), 'a' * GUIDANCE_LIMIT)
-        self.assertEqual(sanitize_guidance(ACCENT * (GUIDANCE_LIMIT + 1)), ACCENT * GUIDANCE_LIMIT)
-        self.assertEqual(sanitize_guidance(FAMILY * (GUIDANCE_LIMIT + 1)), FAMILY * GUIDANCE_LIMIT)
+        self.assertEqual(sanitize_guidance('a' * GUIDANCE_LIMIT), 'a' * GUIDANCE_LIMIT)
+        with self.assertRaisesRegex(ValueError, '500 characters'):
+            sanitize_guidance('a' * (GUIDANCE_LIMIT + 1))
+        with self.assertRaisesRegex(ValueError, '500 characters'):
+            sanitize_guidance(ACCENT * 251)
         self.assertEqual(sanitize_guidance('keep\nnewlines\x00please'), 'keep\nnewlinesplease')
 
 
@@ -85,6 +90,20 @@ class GuidancePromptTests(unittest.TestCase):
         color = build_edit_prompt('colorize', comments=[correction], batch_context=batch, photo_note=note)
         self.assertTrue(color.startswith(COLORIZATION_PROMPT))
         self.assertEqual(color[len(COLORIZATION_PROMPT):], expected[len(PROMPT):])
+        previous_expected = (
+            PROMPT
+            + f'\nBatch context:\n{batch}'
+            + f'\nPer-photo note:\n{note}\n{OVERRIDE_SENTENCE}'
+            + f'\n{PREVIOUS_IMAGE_PARAGRAPH}'
+            + '\nUser-supplied corrections, in chronological order (later corrections override earlier ones). '
+              'Apply these within the preservation rules above; change only what is necessary:\n'
+              '1. Keep the veil.'
+        )
+        previous_prompt = build_edit_prompt(
+            'restore', comments=[correction], batch_context=batch, photo_note=note, previous=True)
+        self.assertEqual(previous_prompt, previous_expected)
+        self.assertLess(previous_prompt.find(OVERRIDE_SENTENCE), previous_prompt.find(PREVIOUS_IMAGE_PARAGRAPH))
+        self.assertLess(previous_prompt.find(PREVIOUS_IMAGE_PARAGRAPH), previous_prompt.find(correction))
 
     def test_per_photo_note_conflict_sentence_and_rerun_last(self):
         prompt = build_edit_prompt('restore', comments=['Keep the eyes unchanged.'],
@@ -117,6 +136,15 @@ class GuidancePromptTests(unittest.TestCase):
             prompt = client.images.edit.call_args.kwargs['prompt']
             self.assertEqual(prompt, build_edit_prompt('restore', comments=['Keep the veil.'],
                                                        batch_context='navy', photo_note='white hat'))
+            previous = Path(folder) / 'previous.png'
+            previous.write_bytes(png('yellow'))
+            edit_front(source, client, comments=['Keep the veil.'], previous=previous,
+                       batch_context='navy', photo_note='white hat')
+            previous_prompt = client.images.edit.call_args.kwargs['prompt']
+            self.assertEqual(previous_prompt, build_edit_prompt(
+                'restore', comments=['Keep the veil.'], batch_context='navy',
+                photo_note='white hat', previous=True))
+            self.assertLess(previous_prompt.find(PREVIOUS_IMAGE_PARAGRAPH), previous_prompt.find('Keep the veil.'))
 
 
 class GuidancePendingTests(unittest.TestCase):
@@ -276,10 +304,30 @@ class GuidanceServerTests(unittest.TestCase):
             self.assertEqual(edit.call_args.kwargs['batch_context'], '1950s wedding party, navy uniforms')
             self.assertEqual(staged['operation'], 'colorize')
 
+    def test_backend_rejects_guidance_over_500_code_points(self):
+        with patch.object(server, 'edit_front') as edit:
+            with self.assertRaises(HTTPError) as caught:
+                self.post('/api/chatgpt-generate', {
+                    'front_path': str(self.source),
+                    'photo_note': 'a' * (GUIDANCE_LIMIT + 1),
+                })
+        self.assertEqual(caught.exception.code, 400)
+        with caught.exception as response:
+            body = json.load(response)
+        self.assertIn('500 characters', body['error'])
+        self.assertNotIn('a' * 40, body['error'])
+        edit.assert_not_called()
+
     def test_server_logs_omit_guidance_text(self):
         secret = 'private address on the reverse'
         logger = logging.getLogger('cropper.pending')
+        logs = []
+
+        def capturing_log(self, format, *args):
+            logs.append(format % args if args else str(format))
+
         with patch.object(server, 'edit_front', return_value=png('blue')), \
+             patch.object(server.Handler, 'log_message', capturing_log), \
              self.assertLogs(logger, level='DEBUG') as captured:
             logger.debug('pending save started')
             staged = self.post('/api/chatgpt-generate', {
@@ -288,7 +336,32 @@ class GuidanceServerTests(unittest.TestCase):
             pending.list_recovered(self.store)
         text = '\n'.join(captured.output)
         self.assertNotIn(secret, text)
+        self.assertNotIn(secret, '\n'.join(logs))
         self.assertIn(secret, json.loads((self.store / f"{staged['id']}.json").read_text(encoding='utf-8'))['photo_note'])
+
+        stderr = io.StringIO()
+        with patch.object(server, 'edit_front', return_value=png('blue')), \
+             patch.object(server, 'save_pending', side_effect=OSError('write failed')), \
+             patch.object(server.Handler, 'log_message', capturing_log), \
+             patch('sys.stderr', stderr):
+            with self.assertRaises(HTTPError) as caught:
+                self.post('/api/chatgpt-generate', {
+                    'front_path': str(self.source),
+                    'photo_note': secret,
+                    'batch_context': secret,
+                })
+            with caught.exception as response:
+                body = json.load(response)
+            tb = traceback.format_exc()
+        blob = '\n'.join([text, '\n'.join(logs), stderr.getvalue(), json.dumps(body), tb, str(caught.exception)])
+        self.assertNotIn(secret, blob)
+        leak = RuntimeError(secret)
+        leak.status_code = 500
+        leak.body = {'error': {'message': secret, 'type': 'server_error'}}
+        _, payload = image_api_error(leak)
+        self.assertNotIn(secret, json.dumps(payload))
+        self.assertNotIn(secret, payload['error'])
+        self.assertNotIn(secret, str(OSError('write failed')))
 
 
 if __name__ == '__main__':
