@@ -10,6 +10,7 @@ from PIL import Image
 
 from restore import preview_dust_marks, repair_dust, reduce_noise, sharpen_detail, useful_change
 from server import save_restored_image
+import stage_files as stages
 
 
 class RestorationTests(unittest.TestCase):
@@ -129,8 +130,8 @@ class RestorationTests(unittest.TestCase):
                 original = source.read_bytes()
                 destination, size, _, archived = save_restored_image(source, operation)
                 self.assertEqual(size, (90, 70))
-                self.assertEqual(destination, Path(temporary) / output_folder / "family_e.png")
-                self.assertEqual(archived, Path(temporary) / archive_folder / "family.png")
+                self.assertTrue(stages.same_path(destination, Path(temporary) / output_folder / "family_e.png"))
+                self.assertTrue(stages.same_path(archived, Path(temporary) / archive_folder / "family.png"))
                 self.assertTrue(destination.is_file())
                 self.assertEqual(archived.read_bytes(), original)
                 self.assertFalse(source.exists())
@@ -145,7 +146,7 @@ class RestorationTests(unittest.TestCase):
             real_unlink = Path.unlink
 
             def fail_archive(old, *args, **kwargs):
-                if old == source:
+                if stages.same_path(old, source):
                     raise PermissionError("Archive is not writable")
                 return real_unlink(old, *args, **kwargs)
 

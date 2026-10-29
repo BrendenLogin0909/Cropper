@@ -70,7 +70,7 @@ class OutputHandlingTests(unittest.TestCase):
                                                                  'conflict_policy': 'overwrite', 'replace_original': False,
                                                                  'backup_originals': True, 'output_folder': ''}):
                 output = stages.file_results([source], [png('blue')], 'restore')[0]
-                self.assertEqual(output, existing)
+                self.assertTrue(stages.same_path(output, existing))
                 self.assertEqual(output.read_bytes(), png('blue'))
             source = self.source(root, 'other_c.png')
             existing2 = root / stages.AI_QUEUE / 'other_c_ai.png'
@@ -96,7 +96,7 @@ class OutputHandlingTests(unittest.TestCase):
                                                                  'conflict_policy': 'skip', 'replace_original': True,
                                                                  'backup_originals': True, 'output_folder': ''}):
                 output = stages.file_results([source], [png('blue')], 'restore')[0]
-                self.assertEqual(output, source)
+                self.assertTrue(stages.same_path(output, source))
                 self.assertEqual(source.read_bytes(), png('blue'))
                 self.assertEqual((root / stages.BACKUPS / 'photo_c.png').read_bytes(), original)
 
@@ -169,13 +169,13 @@ class OutputHandlingTests(unittest.TestCase):
 
             def unlink_then_fail(self, missing_ok=False):
                 original_unlink(self, missing_ok=missing_ok)
-                if self.resolve() == source_key:
+                if stages.same_path(self, source_key):
                     unlinked['done'] = True
                     raise OSError('fail after unlink')
 
             def fail_source_replace(src, dst, *args, **kwargs):
                 dest = Path(dst)
-                if unlinked['done'] and dest.resolve() == source_key:
+                if unlinked['done'] and stages.same_path(dest, source_key):
                     raise OSError('cannot restore source')
                 return original_replace(src, dst, *args, **kwargs)
 
@@ -203,13 +203,13 @@ class OutputHandlingTests(unittest.TestCase):
 
             def unlink_then_fail(self, missing_ok=False):
                 original_unlink(self, missing_ok=missing_ok)
-                if self.resolve() == source_key:
+                if stages.same_path(self, source_key):
                     unlinked['done'] = True
                     raise OSError('fail after unlink')
 
             def fail_source_replace(src, dst, *args, **kwargs):
                 dest = Path(dst)
-                if unlinked['done'] and dest.resolve() == source_key:
+                if unlinked['done'] and stages.same_path(dest, source_key):
                     raise OSError('cannot restore source')
                 return original_replace(src, dst, *args, **kwargs)
 

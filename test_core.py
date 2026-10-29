@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from server import merge_front_and_back, order_corners, save_image, save_merged_image, warp
+import stage_files as stages
 
 
 class CropperCoreTests(unittest.TestCase):
@@ -41,7 +42,7 @@ class CropperCoreTests(unittest.TestCase):
             Image.new('RGB',(200,150),'red').save(source)
             original=source.read_bytes()
             result,_=save_image(source,[[10,10],[180,10],[180,130],[10,130]],{'mode':'replace','stage_routing':False},0)
-            self.assertEqual(result,root/'1.5. TBP Cropped'/'photo_c.jpg')
+            self.assertTrue(stages.same_path(result, root/'1.5. TBP Cropped'/'photo_c.jpg'))
             self.assertEqual((root/'1. Original'/'photo.jpg').read_bytes(),original)
             self.assertFalse(source.exists())
             with self.assertRaisesRegex(ValueError,'already exists'):

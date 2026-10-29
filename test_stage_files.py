@@ -36,7 +36,7 @@ class StageFilesTests(unittest.TestCase):
             root = Path(tmp)
             source = root/'photo.png'; source.write_bytes(png())
             cropped, _ = save_image(source, [[0,0],[15,0],[15,15],[0,15]], {'stage_routing':True}, 0)
-            self.assertEqual(cropped,root/stages.CROP_QUEUE/'photo_c.png')
+            self.assertTrue(stages.same_path(cropped, root/stages.CROP_QUEUE/'photo_c.png'))
             self.assertFalse(source.exists())
             self.assertEqual((root/stages.ORIGINAL/'photo.png').read_bytes(),png())
             crop_bytes=cropped.read_bytes()

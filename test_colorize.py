@@ -10,6 +10,7 @@ from PIL import Image
 from colorize import classify, candidates, colour_only
 from chatgpt_restore import edit_front, COLORIZATION_PROMPT
 import photo_pairs
+import stage_files as stages
 
 def png(image):
     stream=io.BytesIO();image.save(stream,'PNG');return stream.getvalue()
@@ -61,7 +62,7 @@ class ColorizationTests(unittest.TestCase):
             record={'front_path':str(front),'operation':'colorize','link':{'composite_path':str(composite),'split':50,'layout':'right'}}
             with patch.object(photo_pairs,'ROOT',root/'store'):
                 outputs=photo_pairs.accept_linked(record,png(Image.new('RGB',(20,30),'red')))
-                self.assertEqual(photo_pairs.read_links(outputs[0].parent)[0]['composite_path'],str(outputs[1]))
+                self.assertTrue(stages.same_path(photo_pairs.read_links(outputs[0].parent)[0]['composite_path'], outputs[1]))
             self.assertTrue(all(path.parent.name=='4.1.1. AI Colourised' for path in outputs))
             self.assertTrue((root.parent/'2. Cropped'/'front.png').exists())
             self.assertTrue((root.parent/'2. Cropped'/'combined.png').exists())
