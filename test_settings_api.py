@@ -84,3 +84,29 @@ class SettingsApiTests(unittest.TestCase):
             self.assertEqual(body["message"], message)
             self.assertNotIn("Private", json.dumps(body))
             self.assertNotIn("sk-test-bbbb", json.dumps(body))
+
+    def test_settings_access_log_omits_request_body_and_key(self):
+        secret = "sk-live-secret-log-4242"
+        printed = []
+
+        def capturing(*args, **kwargs):
+            printed.append(" ".join(str(item) for item in args))
+
+        with patch("builtins.print", capturing):
+            self.post("/api/settings", {
+                "api_key": secret,
+                "model": "gpt-image-2.5-sunburst",
+                "quality": "medium",
+            })
+            dummy = type("Dummy", (), {
+                "path": "/api/settings",
+                "command": "POST",
+                "address_string": lambda self: "127.0.0.1",
+            })()
+            server.Handler.log_message(dummy, "%s", json.dumps({"api_key": secret, "photo_note": "secret note"}))
+        blob = "\n".join(printed)
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("api_key", blob)
+        self.assertNotIn("photo_note", blob)
+        self.assertNotIn("secret note", blob)
+        self.assertIn("/api/settings", blob)
