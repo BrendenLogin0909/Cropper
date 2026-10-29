@@ -7,6 +7,7 @@ import io
 import json
 import os
 import secrets
+import sys
 import tempfile
 import threading
 import webbrowser
@@ -722,7 +723,8 @@ def main() -> None:
             if not args.no_browser:
                 webbrowser.open(address)
             return
-        raise
+        print(f"Port {args.port} is already in use by another program.", flush=True)
+        sys.exit(1)
     address = f"http://127.0.0.1:{server.server_port}"
     print(f"Cropper is running at {address}", flush=True)
     if not args.no_browser:
