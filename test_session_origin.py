@@ -41,6 +41,14 @@ class SessionOriginTests(unittest.TestCase):
         with urlopen(local) as response:
             self.assertEqual(json.load(response)["app"], "Cropper")
 
+        other_port = Request(self.base + "/api/session", headers={"Origin": "http://localhost:3000"})
+        with self.assertRaises(HTTPError) as other:
+            urlopen(other_port)
+        self.assertEqual(other.exception.code, 403)
+        with other.exception as response:
+            payload = json.load(response)
+        self.assertNotIn("token", payload)
+
     def test_data_dir_flag_creates_settings_outside_temp_by_choice(self):
         settings = app_settings.public_settings()
         self.assertEqual(settings["model"], "gpt-image-2.5-sunburst")
