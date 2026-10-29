@@ -128,7 +128,7 @@ class ServerPendingTests(unittest.TestCase):
                     self.assertFalse((root.parent / "1.7. TBP AI-Improved" / "b_ai.png").exists())
                     monochrome=root/'mono.png';Image.new('RGB',(8,8),'gray').save(monochrome)
                     detection=post('/api/colorization-candidates',{'path':str(root)})
-                    self.assertTrue(any(item['path']==str(monochrome) and item['suggested'] for item in detection['items']))
+                    self.assertTrue(any(stages.same_path(item['path'], monochrome) and item['suggested'] for item in detection['items']))
                     colored=post('/api/chatgpt-generate',{'front_path':str(monochrome),'operation':'colorize'})
                     self.assertEqual(colored['operation'],'colorize')
                     self.assertEqual(edit.call_args.kwargs,{'operation':'colorize'})

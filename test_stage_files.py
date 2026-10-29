@@ -41,14 +41,14 @@ class StageFilesTests(unittest.TestCase):
             self.assertEqual((root/stages.ORIGINAL/'photo.png').read_bytes(),png())
             crop_bytes=cropped.read_bytes()
             enhanced,_,_,archive=save_enhanced_image(cropped,{'stage_routing':True})
-            self.assertEqual(enhanced,root/stages.ENHANCE_QUEUE/'photo_c_e.png')
+            self.assertTrue(stages.same_path(enhanced, root/stages.ENHANCE_QUEUE/'photo_c_e.png'))
             self.assertEqual(archive.read_bytes(),crop_bytes)
             enhanced_bytes=enhanced.read_bytes()
             ai=file_accepted(enhanced,png('blue'),stage_routing=True)[0]
-            self.assertEqual(ai,root/stages.AI_QUEUE/'photo_c_e_ai.png')
+            self.assertTrue(stages.same_path(ai, root/stages.AI_QUEUE/'photo_c_e_ai.png'))
             self.assertEqual((root/stages.ENHANCED/enhanced.name).read_bytes(),enhanced_bytes)
             colour=file_accepted(ai,png('green'),operation='colorize',stage_routing=True)[0]
-            self.assertEqual(colour,root/stages.COLOR/'photo_c_e_ai_col.png')
+            self.assertTrue(stages.same_path(colour, root/stages.COLOR/'photo_c_e_ai_col.png'))
             self.assertEqual((root/stages.AI/ai.name).read_bytes(),png('blue'))
             for folder in stages.STAGES:
                 self.assertFalse(list((root/folder).iterdir()))
@@ -134,7 +134,7 @@ class StageFilesTests(unittest.TestCase):
             back=self.source(root,stages.CROP_QUEUE,'back_c.png')
             output,_=save_merged_image(front,back,{'stage_routing':True},'front',0)
             self.assertEqual(output.name,'front_front-back_c.png')
-            self.assertEqual(output.parent,front.parent)
+            self.assertTrue(stages.same_path(output.parent, front.parent))
             self.assertTrue(front.exists());self.assertTrue(back.exists())
 
     def test_invalid_stage_refused(self):

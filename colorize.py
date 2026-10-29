@@ -25,15 +25,16 @@ def classify(path):
     return 'already colour / uncertain'
 
 def candidates(folder, links):
-    composites={link['composite_path'] for link in links}
+    from stage_files import same_path
     items=[]
     for path in sorted(folder.iterdir()):
         if not path.is_file() or path.suffix.lower() not in {'.jpg','.jpeg','.png','.tif','.tiff','.bmp','.webp'}: continue
-        combined=str(path) in composites or 'front-back' in path.stem.lower() or 'front and back' in path.stem.lower()
+        combined=any(same_path(path, link['composite_path']) for link in links) or 'front-back' in path.stem.lower() or 'front and back' in path.stem.lower()
+        resolved=str(path.resolve())
         try:
             kind=classify(path)
-            items.append({'path':str(path),'kind':kind,'suggested':not combined and kind!='already colour / uncertain','combined':combined})
-        except (OSError,ValueError): items.append({'path':str(path),'kind':'unreadable','suggested':False,'combined':combined})
+            items.append({'path':resolved,'kind':kind,'suggested':not combined and kind!='already colour / uncertain','combined':combined})
+        except (OSError,ValueError): items.append({'path':resolved,'kind':'unreadable','suggested':False,'combined':combined})
     return items
 
 def colour_only(source, generated):
