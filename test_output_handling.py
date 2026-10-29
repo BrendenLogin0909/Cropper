@@ -1,10 +1,13 @@
 import io
 import os
+import sys
 import threading
+import time
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -44,6 +47,8 @@ class OutputHandlingTests(unittest.TestCase):
                          'photo_20261029_ai.png')
         with self.assertRaisesRegex(ValueError, 'invalid characters'):
             stages.validate_template('{name}/{ext}')
+        with self.assertRaisesRegex(ValueError, 'invalid characters'):
+            stages.windows_safe_filename('photo<>.png')
         with self.assertRaisesRegex(ValueError, 'Filename template supports'):
             stages.validate_template('{name}{unknown}{ext}')
 
@@ -159,7 +164,8 @@ class OutputHandlingTests(unittest.TestCase):
             source_key = source.resolve()
             unlinked = {'done': False}
             original_unlink = Path.unlink
-            original_open = Path.open
+            original_replace = os.replace
+            original = source.read_bytes()
 
             def unlink_then_fail(self, missing_ok=False):
                 original_unlink(self, missing_ok=missing_ok)
@@ -167,19 +173,143 @@ class OutputHandlingTests(unittest.TestCase):
                     unlinked['done'] = True
                     raise OSError('fail after unlink')
 
-            def fail_restore(self, *args, **kwargs):
-                mode = args[0] if args else kwargs.get('mode', 'r')
-                if unlinked['done'] and self.resolve() == source_key and mode == 'xb':
+            def fail_source_replace(src, dst, *args, **kwargs):
+                dest = Path(dst)
+                if unlinked['done'] and dest.resolve() == source_key:
                     raise OSError('cannot restore source')
-                return original_open(self, *args, **kwargs)
+                return original_replace(src, dst, *args, **kwargs)
 
-            with patch.object(Path, 'unlink', unlink_then_fail), patch.object(Path, 'open', fail_restore):
+            with patch.object(Path, 'unlink', unlink_then_fail), patch.object(os, 'replace', fail_source_replace):
                 with self.assertRaises(OSError):
                     stages.file_results([source], [png('blue')], 'restore')
             recovered = source.with_name(source.name + '.cropper-recovered')
             self.assertTrue((root / stages.CROPPED / source.name).is_file())
             self.assertTrue((root / stages.AI_QUEUE / 'photo_c_ai.png').is_file())
-            self.assertTrue(recovered.is_file() or not source.exists())
+            self.assertTrue(recovered.is_file())
+            self.assertEqual(recovered.read_bytes(), original)
+            self.assertFalse(source.exists())
+
+    def test_rollback_does_not_overwrite_existing_recovered_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self.source(root)
+            source_key = source.resolve()
+            original = source.read_bytes()
+            existing = source.with_name(source.name + '.cropper-recovered')
+            existing.write_bytes(b'previous-recovery')
+            unlinked = {'done': False}
+            original_unlink = Path.unlink
+            original_replace = os.replace
+
+            def unlink_then_fail(self, missing_ok=False):
+                original_unlink(self, missing_ok=missing_ok)
+                if self.resolve() == source_key:
+                    unlinked['done'] = True
+                    raise OSError('fail after unlink')
+
+            def fail_source_replace(src, dst, *args, **kwargs):
+                dest = Path(dst)
+                if unlinked['done'] and dest.resolve() == source_key:
+                    raise OSError('cannot restore source')
+                return original_replace(src, dst, *args, **kwargs)
+
+            with patch.object(Path, 'unlink', unlink_then_fail), patch.object(os, 'replace', fail_source_replace):
+                with self.assertRaises(OSError):
+                    stages.file_results([source], [png('blue')], 'restore')
+            self.assertEqual(existing.read_bytes(), b'previous-recovery')
+            unique = source.with_name(source.name + '.cropper-recovered-2')
+            self.assertTrue(unique.is_file())
+            self.assertEqual(unique.read_bytes(), original)
+
+    def test_exclusive_writes_use_temp_and_replace(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'fresh.png'
+            with patch.object(os, 'replace', wraps=os.replace) as replaced:
+                created = stages._atomic_create(target, b'abc', overwrite=False)
+            self.assertTrue(created)
+            self.assertEqual(target.read_bytes(), b'abc')
+            replaced.assert_called()
+            with self.assertRaises(FileExistsError):
+                stages._atomic_create(target, b'other', overwrite=False)
+            self.assertEqual(target.read_bytes(), b'abc')
+            stages._atomic_create(target, b'new', overwrite=True)
+            self.assertEqual(target.read_bytes(), b'new')
+
+    def test_expired_pending_releases_reservations(self):
+        root = Path(self.folder.name)
+        photos = root / stages.CROP_QUEUE
+        photos.mkdir(parents=True)
+        source = photos / 'front.png'
+        source.write_bytes(png())
+        dest = root / stages.AI_QUEUE / 'front_ai.png'
+        dest.parent.mkdir(parents=True)
+        stages.reserve_plan_outputs([{'output': dest}])
+        self.assertIn(dest.resolve(), stages.reserved_paths())
+        record = chatgpt_pending.save_pending(source, png('blue'), output_paths=[dest])
+        meta = chatgpt_pending.default_pending_root() / f"{record['id']}.json"
+        data = json.loads(meta.read_text(encoding='utf-8'))
+        data['created'] = 1
+        meta.write_text(json.dumps(data), encoding='utf-8')
+        removed = chatgpt_pending.cleanup_expired(now=time.time(), ttl=60)
+        self.assertIn(record['id'], removed)
+        self.assertNotIn(dest.resolve(), stages.reserved_paths())
+
+    def test_discard_releases_reservations(self):
+        root = Path(self.folder.name)
+        photos = root / stages.CROP_QUEUE
+        photos.mkdir(parents=True)
+        source = photos / 'front.png'
+        source.write_bytes(png())
+        dest = root / stages.AI_QUEUE / 'front_ai.png'
+        dest.parent.mkdir(parents=True)
+        stages.reserve_plan_outputs([{'output': dest}])
+        record = chatgpt_pending.save_pending(source, png('blue'), output_paths=[dest])
+        self.assertIn(dest.resolve(), stages.reserved_paths())
+        chatgpt_pending.discard_recovered(record['id'])
+        self.assertNotIn(dest.resolve(), stages.reserved_paths())
+
+    def test_windows_reserved_names_and_long_paths(self):
+        self.assertEqual(stages.windows_safe_filename('CON.png'), '_CON.png')
+        self.assertEqual(stages.windows_safe_filename('nul.txt'), '_nul.txt')
+        self.assertEqual(stages.windows_safe_filename('COM1.jpg'), '_COM1.jpg')
+        self.assertEqual(stages.windows_safe_filename('photo.png.'), 'photo.png')
+        self.assertEqual(stages.windows_safe_filename('photo.png '), 'photo.png')
+        self.assertEqual(stages.render_filename(Path('CON.jpg'), 'crop', template='{name}{ext}'), '_CON.jpg')
+        with patch.object(stages, '_is_windows', return_value=True):
+            long = Path('C:/' + ('a' * 300) + '/photo.png')
+            prefixed = stages.windows_long_path(long)
+            self.assertTrue(str(prefixed).startswith('\\\\?\\'))
+            unc = stages.windows_long_path(Path('//server/share/photo.png'))
+            self.assertTrue(str(unc).startswith('\\\\?\\UNC\\') or str(unc).startswith('\\\\?\\'))
+
+    def test_windows_lock_pads_and_times_out(self):
+        fake = types.SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=Mock())
+        with patch.object(stages, 'windows_long_path', side_effect=lambda path: Path(path)), \
+             patch.object(stages, '_is_windows', return_value=True), \
+             patch.dict(sys.modules, {'msvcrt': fake}):
+            with TemporaryDirectory() as tmp:
+                lock = Path(tmp) / 'cropper.lock'
+                with stages.interprocess_lock(lock, timeout=1):
+                    self.assertGreaterEqual(lock.stat().st_size, 1)
+                fake.locking.side_effect = OSError('locked')
+                with self.assertRaises(TimeoutError):
+                    with stages.interprocess_lock(lock, timeout=0.2):
+                        pass
+        self.assertGreaterEqual(fake.locking.call_count, 2)
+
+    def test_permission_error_distinguishes_locked_file(self):
+        folder = PermissionError('denied')
+        folder.filename = str(Path(self.folder.name))
+        status, body = stages.permission_error_response(folder)
+        self.assertEqual(status, 403)
+        self.assertEqual(body['code'], 'permission_denied')
+        self.assertIn('Choose another output folder', body['error'])
+        locked = PermissionError('in use')
+        locked.filename = str(Path(self.folder.name) / 'photo_c_ai.png')
+        status, body = stages.permission_error_response(locked)
+        self.assertEqual(body['code'], 'file_locked')
+        self.assertIn('Close the file', body['error'])
+        self.assertNotIn('Choose another output folder', body['error'])
 
     def test_resolve_port_cli_wins_over_env(self):
         with patch.dict(os.environ, {'CROPPER_PORT': '8767'}):
@@ -196,7 +326,7 @@ class OutputHandlingTests(unittest.TestCase):
             server.LocalServer(('127.0.0.1', first.server_port), server.Handler)
 
     def test_permission_error_offers_another_output_folder(self):
-        self.assertIn('Choose another output folder', Path(server.__file__).read_text(encoding='utf-8'))
+        self.assertIn('Choose another output folder', Path(stages.__file__).read_text(encoding='utf-8'))
         self.assertIn('choose-output-folder', Path(__file__).with_name('index.html').read_text(encoding='utf-8'))
         self.assertIn('offerChooseOutputFolder', Path(__file__).with_name('app.js').read_text(encoding='utf-8'))
 

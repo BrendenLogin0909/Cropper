@@ -159,6 +159,8 @@ def save_pending(source: Path, png: bytes, root: Path | None = None, stage_routi
     try:
         with image.open("xb") as target:
             target.write(png)
+            target.flush()
+            os.fsync(target.fileno())
         _atomic_write_json(metadata, record)
     except Exception:
         metadata.unlink(missing_ok=True)
@@ -166,6 +168,12 @@ def save_pending(source: Path, png: bytes, root: Path | None = None, stage_routi
         if not image.is_file():
             image.unlink(missing_ok=True)
         raise
+    if output_paths:
+        from stage_files import bind_reservation_ids
+        bind_reservation_ids(output_paths, stage_id)
+    elif output_path is not None:
+        from stage_files import bind_reservation_ids
+        bind_reservation_ids([output_path], stage_id)
     return record
 
 
@@ -290,9 +298,20 @@ def discard_recovered(stage_id: str, root: Path | None = None) -> None:
     remove_pending(stage_id, root)
 
 
+def _release_record_reservations(stage_id: str, record: dict | None) -> None:
+    from stage_files import release_pending_reservations
+    extra = reserved_from_record(record) if isinstance(record, dict) else []
+    release_pending_reservations(stage_id, extra)
+
+
 def remove_pending(stage_id: str, root: Path | None = None) -> None:
     root = _resolve_root(root)
     metadata, image = _paths(stage_id, root)
+    salvaged, _ = _salvage_record(metadata) if metadata.is_file() else (None, False)
+    try:
+        _release_record_reservations(stage_id, salvaged)
+    except Exception:
+        LOG.warning("Pending reservation release failed id=%s", stage_id)
     metadata.unlink(missing_ok=True)
     image.unlink(missing_ok=True)
 
@@ -332,4 +351,9 @@ def cleanup_expired(root: Path | None = None, now: float | None = None, ttl: int
             removed.append(ident)
         except (ValueError, OSError, KeyError, json.JSONDecodeError, TypeError):
             continue
+    try:
+        from stage_files import sweep_stale_reservations
+        sweep_stale_reservations()
+    except Exception:
+        LOG.warning("Pending reservation sweep failed")
     return removed

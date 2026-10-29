@@ -106,6 +106,10 @@ function toast(message, error = false) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => element.classList.remove('show'), 4200);
 }
 function offerChooseOutputFolder(error) {
+  if (error?.code === 'file_locked') {
+    toast(error.message || 'Cropper cannot write this file. Close it in other programs and retry.', true);
+    return true;
+  }
   if (error?.code !== 'permission_denied') return false;
   const detail = error.message || 'Cropper cannot write to this location.';
   if ($('save-error-detail')) $('save-error-detail').textContent = detail;

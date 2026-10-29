@@ -696,7 +696,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
-            self.json(403, {"code": "permission_denied", "error": "Cropper cannot write to this location. Choose another output folder or check this folder's permissions.", "path": exc.filename})
+            self.json(*stage_files.permission_error_response(exc))
         except (ValueError, OSError, json.JSONDecodeError, cv2.error) as exc:
             self.json(400, {"error": str(exc)})
 
