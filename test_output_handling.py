@@ -268,6 +268,22 @@ class OutputHandlingTests(unittest.TestCase):
         chatgpt_pending.discard_recovered(record['id'])
         self.assertNotIn(dest.resolve(), stages.reserved_paths())
 
+    def test_unbound_reservations_expire_after_ttl_without_save_pending(self):
+        root = Path(self.folder.name)
+        dest = root / stages.AI_QUEUE / 'front_ai.png'
+        dest.parent.mkdir(parents=True)
+        stages.reserve_plan_outputs([{'output': dest}])
+        self.assertIn(dest.resolve(), stages.reserved_paths())
+        entries = [item for item in stages._load_reservation_entries()
+                   if stages.path_key(Path(item['path'])) == stages.path_key(dest)]
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0].get('id'))
+        created = float(entries[0]['created'])
+        stages.sweep_stale_reservations(now=created + stages.NULL_RESERVATION_TTL_SECONDS - 1)
+        self.assertIn(dest.resolve(), stages.reserved_paths())
+        stages.sweep_stale_reservations(now=created + stages.NULL_RESERVATION_TTL_SECONDS)
+        self.assertNotIn(dest.resolve(), stages.reserved_paths())
+
     def test_windows_reserved_names_and_long_paths(self):
         self.assertEqual(stages.windows_safe_filename('CON.png'), '_CON.png')
         self.assertEqual(stages.windows_safe_filename('nul.txt'), '_nul.txt')
@@ -329,6 +345,123 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertIn('Choose another output folder', Path(stages.__file__).read_text(encoding='utf-8'))
         self.assertIn('choose-output-folder', Path(__file__).with_name('index.html').read_text(encoding='utf-8'))
         self.assertIn('offerChooseOutputFolder', Path(__file__).with_name('app.js').read_text(encoding='utf-8'))
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
+class WindowsIntegrationTests(unittest.TestCase):
+    def test_file_lock_times_out_while_held_and_unlocks_after(self):
+        with TemporaryDirectory() as tmp:
+            lock = Path(tmp) / 'cropper.lock'
+            started = threading.Event()
+            release = threading.Event()
+            errors = []
+
+            def hold():
+                try:
+                    with stages.interprocess_lock(lock, timeout=5):
+                        started.set()
+                        if not release.wait(20):
+                            errors.append('holder wait timed out')
+                except Exception as exc:
+                    errors.append(exc)
+
+            holder = threading.Thread(target=hold)
+            holder.start()
+            self.assertTrue(started.wait(5), 'Windows lock was not acquired')
+            with self.assertRaises(TimeoutError):
+                with stages.interprocess_lock(lock, timeout=0.4):
+                    pass
+            release.set()
+            holder.join(10)
+            self.assertFalse(holder.is_alive())
+            self.assertEqual(errors, [])
+            with stages.interprocess_lock(lock, timeout=2):
+                self.assertGreaterEqual(lock.stat().st_size, 1)
+
+    def test_long_paths(self):
+        with TemporaryDirectory() as tmp:
+            current = Path(tmp).resolve()
+            while len(str(current)) < 260:
+                current = current / ('folder with spaces ' + 'a' * 40)
+            self.assertGreater(len(str(current / 'photo.png')), 260)
+            target = current / 'photo.png'
+            created = stages._atomic_create(target, png(), overwrite=False)
+            self.assertTrue(created)
+            prefixed = stages.windows_long_path(target)
+            self.assertTrue(str(prefixed).startswith('\\\\?\\'))
+            self.assertTrue(prefixed.is_file())
+            self.assertEqual(prefixed.read_bytes(), png())
+
+    def test_reserved_names(self):
+        self.assertEqual(stages.windows_safe_filename('CON.png'), '_CON.png')
+        self.assertEqual(stages.windows_safe_filename('nul.txt'), '_nul.txt')
+        self.assertEqual(stages.windows_safe_filename('COM1.jpg'), '_COM1.jpg')
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / stages.windows_safe_filename('CON.png')
+            path.write_bytes(b'device-safe')
+            self.assertEqual(path.name, '_CON.png')
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes(), b'device-safe')
+
+    def test_paths_with_spaces(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'batch root'
+            source = root / stages.CROP_QUEUE / 'my photo.png'
+            source.parent.mkdir(parents=True)
+            source.write_bytes(png())
+            with patch.object(stages, '_settings', return_value={
+                'filename_template': '{name}{suffix}{ext}',
+                'conflict_policy': 'skip', 'replace_original': False,
+                'backup_originals': True, 'output_folder': '',
+            }):
+                output = stages.file_results([source], [png('blue')], 'restore')[0]
+            self.assertTrue(output.is_file())
+            self.assertIn(' ', str(output))
+            self.assertIn(' ', str(source))
+            self.assertEqual(output.read_bytes(), png('blue'))
+            self.assertFalse(source.exists())
+
+    def test_permission_error(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'photo_c_ai.png'
+            target.write_bytes(b'original')
+            other = Path(tmp) / 'replacement.png'
+            other.write_bytes(b'new')
+            handle = _windows_exclusive_handle(target)
+            try:
+                with self.assertRaises(PermissionError) as caught:
+                    os.replace(other, target)
+                status, body = stages.permission_error_response(caught.exception)
+            finally:
+                _windows_close_handle(handle)
+            self.assertEqual(status, 403)
+            self.assertEqual(body['code'], 'file_locked')
+            self.assertIn('Close the file', body['error'])
+            self.assertEqual(target.read_bytes(), b'original')
+
+
+def _windows_exclusive_handle(path: Path):
+    import ctypes
+    from ctypes import wintypes
+    generic_read_write = 0x80000000 | 0x40000000
+    open_existing = 3
+    file_attribute_normal = 0x80
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(str(path), generic_read_write, 0, None, open_existing, file_attribute_normal, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (0, invalid, None):
+        raise OSError('CreateFileW could not open an exclusive handle')
+    return handle
+
+
+def _windows_close_handle(handle):
+    import ctypes
+    ctypes.windll.kernel32.CloseHandle(handle)
 
 
 class RecoveredServerTests(unittest.TestCase):

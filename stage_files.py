@@ -29,6 +29,7 @@ OPERATION_SUFFIX = {'crop': '_c', 'enhance': '_e', 'restore': '_ai', 'colorize':
 INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 TEMPLATE_FIELDS = {'name', 'date', 'index', 'ext', 'suffix'}
 LOCK_TIMEOUT_SECONDS = 30
+NULL_RESERVATION_TTL_SECONDS = 30 * 60
 WINDOWS_RESERVED_STEMS = frozenset(
     {'CON', 'PRN', 'AUX', 'NUL'}
     | {f'COM{i}' for i in range(10)}
@@ -303,6 +304,7 @@ def reserve_plan_outputs(plans: list[dict], policy: str | None = None) -> list[d
     policy = (policy or _settings().get('conflict_policy') or 'skip').lower()
     lock_path = reservation_file().with_suffix('.lock')
     with interprocess_lock(lock_path), LOCK:
+        _sweep_stale_reservations_locked()
         taken = taken_outputs()
         for item in plans:
             output = item.get('output')
@@ -360,28 +362,40 @@ def release_pending_reservations(stage_id: str, extra_paths: list[Path | str] | 
         _write_reservation_entries(entries)
 
 
-def sweep_stale_reservations() -> None:
-    """Drop reservations whose pending id is gone."""
-    if not reservation_file().is_file():
-        return
+def _sweep_stale_reservations_locked(now: float | None = None) -> None:
+    """Caller must hold the reservation lock. Drops bound ids that are gone and
+    id-less entries whose created stamp is at least 30 minutes old."""
     from chatgpt_pending import default_pending_root
-    lock_path = reservation_file().with_suffix('.lock')
-    with interprocess_lock(lock_path), LOCK:
-        root = default_pending_root()
-        live = set()
-        if root.is_dir():
-            live = {path.stem for path in root.glob('*.json') if not path.name.startswith('.cropper-')}
-            live |= {path.stem for path in root.glob('*.png') if not path.name.startswith('.cropper-')}
-        entries = []
-        changed = False
-        for item in _load_reservation_entries():
-            ident = item.get('id')
-            if ident and ident not in live:
+    stamp = time.time() if now is None else now
+    root = default_pending_root()
+    live = set()
+    if root.is_dir():
+        live = {path.stem for path in root.glob('*.json') if not path.name.startswith('.cropper-')}
+        live |= {path.stem for path in root.glob('*.png') if not path.name.startswith('.cropper-')}
+    entries = []
+    changed = False
+    for item in _load_reservation_entries():
+        ident = item.get('id')
+        created = float(item.get('created') or 0)
+        if ident:
+            if ident not in live:
                 changed = True
                 continue
-            entries.append(item)
-        if changed:
-            _write_reservation_entries(entries)
+        elif stamp - created >= NULL_RESERVATION_TTL_SECONDS:
+            changed = True
+            continue
+        entries.append(item)
+    if changed:
+        _write_reservation_entries(entries)
+
+
+def sweep_stale_reservations(now: float | None = None) -> None:
+    """Drop reservations whose pending id is gone, or id-less names older than 30 minutes."""
+    if not reservation_file().is_file():
+        return
+    lock_path = reservation_file().with_suffix('.lock')
+    with interprocess_lock(lock_path), LOCK:
+        _sweep_stale_reservations_locked(now)
 
 
 def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None) -> list[dict]:
