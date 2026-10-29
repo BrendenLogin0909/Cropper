@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
 const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
-state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false };
+state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false, guidance: { batch: '', photos: {} }, guidanceEdit: false };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
   noise: { title: 'Noise reduction', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Measures fine grain and colour speckles in each photo. It skips clearer photos and uses a limited, detail-preserving correction where noise is present.' },
@@ -821,6 +821,96 @@ function chatgptReadyPaths(selection, includeQueued = false) {
   const compositePaths = new Set(photoLinks.map(link => link.composite_path));
   return state.images.map(image => image.path).filter(path => selection.has(path) && !blocked.has(path) && !compositePaths.has(path) && (colorEligible(path) || (includeQueued && current.queuedPaths.has(path))));
 }
+function graphemeClusters(text) {
+  const chars = Array.from(String(text ?? ''));
+  const clusters = [];
+  const isMark = ch => /^\p{M}$/u.test(ch);
+  const isRI = ch => { const cp = ch.codePointAt(0); return cp >= 0x1F1E6 && cp <= 0x1F1FF; };
+  let i = 0;
+  while (i < chars.length) {
+    let cluster;
+    if (isRI(chars[i]) && i + 1 < chars.length && isRI(chars[i + 1])) {
+      cluster = chars[i] + chars[i + 1];
+      i += 2;
+    } else {
+      cluster = chars[i];
+      i += 1;
+    }
+    while (i < chars.length && isMark(chars[i])) { cluster += chars[i]; i += 1; }
+    while (i < chars.length && chars[i] === '\u200d') {
+      cluster += chars[i];
+      i += 1;
+      if (i < chars.length) {
+        cluster += chars[i];
+        i += 1;
+        while (i < chars.length && isMark(chars[i])) { cluster += chars[i]; i += 1; }
+      }
+    }
+    clusters.push(cluster);
+  }
+  return clusters;
+}
+function stripGuidanceControls(text) {
+  return Array.from(String(text ?? '')).filter(ch => {
+    if (ch === '\n') return true;
+    const cp = ch.codePointAt(0);
+    return !((cp <= 0x1F) || (cp >= 0x7F && cp <= 0x9F));
+  }).join('');
+}
+function sanitizeGuidance(text) {
+  const cleaned = stripGuidanceControls(String(text ?? '')).trim();
+  if (!cleaned) return '';
+  const clusters = graphemeClusters(cleaned);
+  return clusters.length <= 500 ? cleaned : clusters.slice(0, 500).join('');
+}
+function guidanceLength(text) {
+  return graphemeClusters(stripGuidanceControls(String(text ?? '')).trim()).length;
+}
+function guidanceWasTruncated(text) {
+  return guidanceLength(text) > 500;
+}
+function guidanceStore() {
+  const current = state.chatgpt;
+  if (!current.guidance) current.guidance = { batch: '', photos: {} };
+  if (!current.guidance.photos) current.guidance.photos = {};
+  return current.guidance;
+}
+function snapshotGuidance(paths) {
+  const store = (state.chatgpt && state.chatgpt.guidance) || { batch: '', photos: {} };
+  const photos = store.photos || {};
+  const list = [...paths];
+  const batch = list.length >= 2 ? sanitizeGuidance(store.batch || '') : '';
+  const notes = {};
+  for (const path of list) notes[path] = sanitizeGuidance(photos[path] || '');
+  return { batch, notes };
+}
+function photoHasGuidance(path, snapshot) {
+  return Boolean(snapshot && (snapshot.batch || (snapshot.notes && snapshot.notes[path])));
+}
+function applyGuidanceField(field, counter, truncation, notice) {
+  if (!field) return '';
+  const raw = String(field.value || '');
+  const stripped = stripGuidanceControls(raw);
+  const truncated = graphemeClusters(stripped.trim()).length > 500;
+  const next = truncated ? sanitizeGuidance(stripped) : stripped;
+  if (field.value !== next) field.value = next;
+  const sanitized = sanitizeGuidance(next);
+  if (counter) counter.textContent = `${graphemeClusters(sanitized).length}/500`;
+  if (truncation && truncation.classList) truncation.classList.toggle('hidden', !(notice && truncated));
+  return sanitized;
+}
+function bindGuidanceField(field, counter, truncation, onStore) {
+  if (!field || field.dataset && field.dataset.guidanceBound) return;
+  if (field.dataset) field.dataset.guidanceBound = '1';
+  else field.dataset = { guidanceBound: '1' };
+  field.addEventListener('paste', () => { if (field.dataset) field.dataset.guidancePaste = '1'; });
+  field.addEventListener('input', () => {
+    const pasted = field.dataset && field.dataset.guidancePaste === '1';
+    if (field.dataset) delete field.dataset.guidancePaste;
+    const value = applyGuidanceField(field, counter, truncation, pasted);
+    if (onStore) onStore(value, field);
+  });
+}
 function updateChatgptControls() {
   renderChatgptFailures();
   const current = state.chatgpt;
@@ -930,6 +1020,141 @@ function updateChatgptControls() {
     button.title = [item.front_path, ...(item.comments || [])].join('\n'); button.classList.toggle('active', current.review?.id === item.id);
     button.disabled = !!current.reviewBusy; button.addEventListener('click', () => reviewChatgptItem(item)); list.append(button);
   }
+  if (typeof renderGuidancePanel === 'function') renderGuidancePanel();
+}
+function guidancePhotoRow(path, store) {
+  const row = document.createElement('div');
+  row.className = 'guidance-photo-row';
+  const thumb = document.createElement('img');
+  thumb.alt = '';
+  thumb.src = typeof url === 'function' ? url('/api/thumb', path) : '';
+  const fieldWrap = document.createElement('div');
+  const label = document.createElement('label');
+  label.className = 'field';
+  const name = document.createElement('span');
+  name.textContent = String(path).split(/[\\/]/).pop();
+  const textarea = document.createElement('textarea');
+  textarea.rows = 2;
+  textarea.setAttribute('data-testid', 'guidance-photo-field');
+  if (textarea.dataset) textarea.dataset.path = path;
+  textarea.placeholder = "e.g. bride's bouquet is pink roses";
+  textarea.spellcheck = false;
+  textarea.value = store.photos[path] || '';
+  label.append(name, textarea);
+  const meta = document.createElement('div');
+  meta.className = 'guidance-field-meta';
+  const counter = document.createElement('span');
+  counter.setAttribute('data-testid', 'guidance-photo-counter');
+  counter.textContent = '0/500';
+  meta.append(counter);
+  const hint = document.createElement('p');
+  hint.className = 'aspect-note guidance-hint';
+  hint.setAttribute('data-testid', 'guidance-photo-hint');
+  hint.textContent = 'This text is sent to OpenAI with the image. Leave out private details like full names, addresses or dates of birth.';
+  const truncation = document.createElement('p');
+  truncation.className = 'guidance-truncation hidden';
+  truncation.setAttribute('data-testid', 'guidance-photo-truncation');
+  truncation.setAttribute('role', 'status');
+  truncation.textContent = 'Guidance is limited to 500 characters, so we trimmed the extra text.';
+  fieldWrap.append(label, meta, hint, truncation);
+  row.append(thumb, fieldWrap);
+  applyGuidanceField(textarea, counter, truncation, false);
+  bindGuidanceField(textarea, counter, truncation, value => {
+    store.photos[path] = value;
+    expandGuidanceIfFilled();
+    updateNotesCount();
+  });
+  return row;
+}
+function updateNotesCount() {
+  const el = $('guidance-batch-notes-count');
+  if (!el || typeof guidanceStore !== 'function' || typeof sanitizeGuidance !== 'function') return;
+  const store = guidanceStore();
+  const paths = typeof chatgptReadyPaths === 'function' ? chatgptReadyPaths(state.chatgpt.selected || new Set()) : [];
+  const filled = paths.filter(path => sanitizeGuidance(store.photos[path] || '')).length;
+  el.textContent = `${filled} of ${paths.length} photos have notes`;
+}
+function expandGuidanceIfFilled() {
+  const panel = $('chatgpt-guidance');
+  if (!panel || typeof guidanceStore !== 'function' || typeof sanitizeGuidance !== 'function') return;
+  const store = guidanceStore();
+  if (sanitizeGuidance(store.batch) || Object.values(store.photos || {}).some(value => sanitizeGuidance(value))) panel.open = true;
+}
+function renderGuidancePanel() {
+  if (typeof guidanceStore !== 'function' || typeof applyGuidanceField !== 'function') return;
+  const panel = $('chatgpt-guidance');
+  if (!panel) return;
+  const store = guidanceStore();
+  const paths = typeof chatgptReadyPaths === 'function' ? chatgptReadyPaths(state.chatgpt.selected || new Set()) : [];
+  const colorizing = chatgptOperation === 'colorize';
+  const single = $('guidance-single');
+  const batch = $('guidance-batch');
+  if (single?.classList) single.classList.toggle('hidden', paths.length !== 1);
+  if (batch?.classList) batch.classList.toggle('hidden', paths.length < 2);
+  const singleField = $('guidance-single-field');
+  if (singleField) {
+    singleField.placeholder = colorizing
+      ? 'e.g. man in black suit and white shirt, woman in blue dress'
+      : 'e.g. sailor hats, mostly lost to overexposure';
+    if (paths.length === 1 && document.activeElement !== singleField) {
+      const value = store.photos[paths[0]] || '';
+      if (singleField.value !== value) singleField.value = value;
+    }
+    applyGuidanceField(singleField, $('guidance-single-counter'), $('guidance-single-truncation'), false);
+    bindGuidanceField(singleField, $('guidance-single-counter'), $('guidance-single-truncation'), value => {
+      const selected = typeof chatgptReadyPaths === 'function' ? chatgptReadyPaths(state.chatgpt.selected || new Set()) : [];
+      if (selected[0]) store.photos[selected[0]] = value;
+      expandGuidanceIfFilled();
+      updateNotesCount();
+    });
+  }
+  const batchField = $('guidance-batch-field');
+  const batchLabel = $('guidance-batch-label');
+  if (batchLabel) batchLabel.textContent = `Context for all ${paths.length} photos`;
+  if (batchField) {
+    if (document.activeElement !== batchField && batchField.value !== (store.batch || '')) batchField.value = store.batch || '';
+    applyGuidanceField(batchField, $('guidance-batch-counter'), $('guidance-batch-truncation'), false);
+    bindGuidanceField(batchField, $('guidance-batch-counter'), $('guidance-batch-truncation'), value => {
+      store.batch = value;
+      expandGuidanceIfFilled();
+    });
+  }
+  const list = $('guidance-photo-list');
+  if (list && paths.length >= 2) {
+    const dataset = list.dataset || (list.dataset = {});
+    const key = paths.join('\0');
+    if (dataset.paths !== key) {
+      dataset.paths = key;
+      list.replaceChildren();
+      for (const path of paths) list.append(guidancePhotoRow(path, store));
+    }
+  } else if (list && paths.length < 2) {
+    const dataset = list.dataset || (list.dataset = {});
+    dataset.paths = '';
+    list.replaceChildren();
+  }
+  updateNotesCount();
+}
+function fillUsedGuidance(item, keepEdit) {
+  const current = state.chatgpt;
+  const editing = !!(keepEdit && current.guidanceEdit);
+  current.guidanceEdit = editing;
+  const batch = $('guidance-used-batch');
+  const note = $('guidance-used-note');
+  if (batch) {
+    if (!editing) batch.value = item?.batch_context || '';
+    batch.readOnly = !editing;
+  }
+  if (note) {
+    if (!editing) note.value = item?.photo_note || '';
+    note.readOnly = !editing;
+  }
+  if (typeof applyGuidanceField === 'function') {
+    applyGuidanceField(batch, $('guidance-used-batch-counter'), $('guidance-used-batch-truncation'), false);
+    applyGuidanceField(note, $('guidance-used-note-counter'), $('guidance-used-note-truncation'), false);
+  }
+  const edit = $('guidance-rerun-edit');
+  if (edit) edit.textContent = editing ? 'Editing' : 'Edit';
 }
 function clearChatgptPreview() {
   $('chatgpt-original').removeAttribute('src'); $('chatgpt-result').removeAttribute('src');
@@ -969,6 +1194,8 @@ function reviewChatgptItem(item) {
   state.chatgpt.correctionOpen = false;
   $('chatgpt-comment').value = chatgptCommentDrafts.get(item.id) || '';
   $('chatgpt-comment').title = item.comments?.length ? `Previous corrections: ${item.comments.join(' / ')}` : '';
+  state.chatgpt.guidanceEdit = false;
+  if (typeof fillUsedGuidance === 'function') fillUsedGuidance(item, false);
   $('chatgpt-resubmit-status').textContent = item.resubmitNotice || `Reviewing attempt ${item.attempt || 1}. No corrected request is currently being sent.`;
   combinedReview = false;
   $('chatgpt-slider').value = 50; $('chatgpt-preview').style.setProperty('--split', '50%');
@@ -1046,11 +1273,14 @@ async function generateChatgpt(selection = state.chatgpt.selected) {
   while (paths.length) {
     for (const path of paths) current.selected.delete(path);
     current.total = paths.length; current.completed = 0; current.batchPaths = paths;
+    const guidance = typeof snapshotGuidance === 'function' ? snapshotGuidance(paths) : { batch: '', notes: {} };
+    current.batchGuidance = guidance;
     const savedPaths = new Set();
     renderImages(); updateChatgptControls();
     const operation = chatgptOperation;
     const failure = await runChatgptQueue(paths, current,
-      path => api('/api/chatgpt-generate', { front_path: path, operation, stage_routing:stageRouting }),
+      path => api('/api/chatgpt-generate', { front_path: path, operation, stage_routing:stageRouting,
+        batch_context: guidance.batch, photo_note: (guidance.notes && guidance.notes[path]) || '' }),
       (item, path) => { current.pending.push(item); savedPaths.add(path); current.completed++; updateChatgptControls(); },
       (active, path, cooling) => {
         if (!current.preview) { current.preview = path; showChatgptPreview(); renderImages(); }
@@ -1157,7 +1387,8 @@ async function resubmitChatgpt() {
     status.textContent = job.status;
     updateChatgptControls();
     if (!current.busy) $('chatgpt-progress').textContent = status.textContent;
-    const item = await api('/api/chatgpt-resubmit', {id:reviewed.id, comment, include_previous:includePrevious});
+    const item = await api('/api/chatgpt-resubmit', {id:reviewed.id, comment, include_previous:includePrevious,
+      batch_context: ($('guidance-used-batch') || {}).value || '', photo_note: ($('guidance-used-note') || {}).value || ''});
     if (!item?.id || !item.attempt) throw new Error('The server did not return a saved attempt. Refresh Pending Review before trying again.');
     if (!current.pending.some(pending => pending.id === item.id)) current.pending.push(item);
     chatgptCommentDrafts.delete(reviewed.id);
@@ -1402,6 +1633,15 @@ function wire() {
     }
   });
   $('chatgpt-resubmit').addEventListener('click', resubmitChatgpt);
+  $('guidance-rerun-edit').addEventListener('click', () => {
+    const current = state.chatgpt;
+    if (!current.review || current.reviewBusy || current.resubmissions?.has(current.review.front_path)) return;
+    current.guidanceEdit = true;
+    if (typeof fillUsedGuidance === 'function') fillUsedGuidance(current.review, true);
+    $('guidance-used-note')?.focus?.({preventScroll:true});
+  });
+  bindGuidanceField($('guidance-used-batch'), $('guidance-used-batch-counter'), $('guidance-used-batch-truncation'));
+  bindGuidanceField($('guidance-used-note'), $('guidance-used-note-counter'), $('guidance-used-note-truncation'));
   $('chatgpt-comment').addEventListener('input', () => {
     if (state.chatgpt.review) chatgptCommentDrafts.set(state.chatgpt.review.id, $('chatgpt-comment').value);
     $('chatgpt-resubmit').disabled = !state.chatgpt.review || !!state.chatgpt.reviewBusy || state.chatgpt.resubmissions?.has(state.chatgpt.review.front_path) || !$('chatgpt-comment').value.trim();

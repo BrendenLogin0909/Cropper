@@ -72,7 +72,7 @@ def _guidance(record: dict | None) -> list[str]:
     comments = record.get("comments")
     if isinstance(comments, list):
         notes.extend(str(item).strip() for item in comments if str(item).strip())
-    for key in ("notes", "guidance", "guidance_notes", "comment"):
+    for key in ("notes", "guidance", "guidance_notes", "comment", "batch_context", "photo_note"):
         value = record.get(key)
         if isinstance(value, str) and value.strip():
             notes.append(value.strip())
@@ -278,7 +278,8 @@ def keep_recovered(stage_id: str, root: Path | None = None) -> dict:
         "recovered": True,
     }
     for key in ("stage_routing", "link", "parent_id", "attempt", "comments", "included_previous",
-                "output_path", "output_paths", "notes", "guidance", "guidance_notes", "comment"):
+                "output_path", "output_paths", "notes", "guidance", "guidance_notes", "comment",
+                "batch_context", "photo_note"):
         if key in salvaged:
             record[key] = salvaged[key]
     _atomic_write_json(metadata, record)

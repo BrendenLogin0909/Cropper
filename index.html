@@ -190,6 +190,29 @@
         <p id="chatgpt-key-hint" class="aspect-note hidden">Add your OpenAI API key in Settings to enable AI restore. Crop and other tools still work offline.</p>
         <div class="settings-group"><div class="section-label">PENDING REVIEW <span id="chatgpt-pending-count">0</span></div><div id="chatgpt-pending-list" class="chatgpt-pending-list"></div><button id="chatgpt-review-combined" class="button button-quiet hidden">View rebuilt front + back</button></div>
         <div class="settings-spacer"></div>
+        <details id="chatgpt-guidance" class="chatgpt-guidance" data-testid="guidance-panel">
+          <summary id="guidance-heading" data-testid="guidance-heading">Guidance (optional)</summary>
+          <p id="guidance-explainer" class="aspect-note" data-testid="guidance-explainer">Tell the AI what the photo can't show: true colours, details that are hidden or washed out, or who's who.</p>
+          <div id="guidance-single" class="guidance-single hidden">
+            <label class="field"><span id="guidance-single-label">Guidance for this photo</span>
+              <textarea id="guidance-single-field" data-testid="guidance-single-field" rows="3" spellcheck="false"></textarea>
+            </label>
+            <div class="guidance-field-meta"><span id="guidance-single-counter" data-testid="guidance-single-counter">0/500</span></div>
+            <p class="aspect-note guidance-hint" data-testid="guidance-single-hint">This text is sent to OpenAI with the image. Leave out private details like full names, addresses or dates of birth.</p>
+            <p id="guidance-single-truncation" class="guidance-truncation hidden" data-testid="guidance-single-truncation" role="status">Guidance is limited to 500 characters, so we trimmed the extra text.</p>
+          </div>
+          <div id="guidance-batch" class="guidance-batch hidden">
+            <label class="field"><span id="guidance-batch-label">Context for all 0 photos</span>
+              <textarea id="guidance-batch-field" data-testid="guidance-batch-field" rows="3" spellcheck="false" placeholder="e.g. 1950s wedding party, navy uniforms"></textarea>
+            </label>
+            <div class="guidance-field-meta"><span id="guidance-batch-counter" data-testid="guidance-batch-counter">0/500</span></div>
+            <p class="aspect-note guidance-hint" data-testid="guidance-batch-hint">This text is sent to OpenAI with the image. Leave out private details like full names, addresses or dates of birth.</p>
+            <p id="guidance-batch-truncation" class="guidance-truncation hidden" data-testid="guidance-batch-truncation" role="status">Guidance is limited to 500 characters, so we trimmed the extra text.</p>
+            <div class="section-label">Note for this photo (overrides the batch context)</div>
+            <div id="guidance-photo-list" class="guidance-photo-list" data-testid="guidance-photo-list"></div>
+            <p id="guidance-batch-notes-count" class="guidance-notes-count" data-testid="guidance-batch-notes-count">0 of 0 photos have notes</p>
+          </div>
+        </details>
         <button class="button button-primary save-button" id="chatgpt-generate" disabled><span>Generate selected photos (paid)</span><span>✦</span></button>
         <button class="button button-quiet stage-finish-button" id="chatgpt-finish" disabled>Finish selected — no further changes</button>
         <section id="chatgpt-recovered" class="settings-group hidden" aria-label="Recovered results">
@@ -205,6 +228,23 @@
           </div>
         </div>
         <div id="chatgpt-correction" class="settings-fields hidden">
+          <div id="guidance-used" class="guidance-used">
+            <div class="guidance-used-head">
+              <span>Guidance used</span>
+              <button type="button" class="button button-quiet" id="guidance-rerun-edit" data-testid="guidance-rerun-edit">Edit</button>
+            </div>
+            <label class="field"><span>Context for all photos</span>
+              <textarea id="guidance-used-batch" data-testid="guidance-used-batch" rows="2" readonly spellcheck="false"></textarea>
+            </label>
+            <div class="guidance-field-meta"><span id="guidance-used-batch-counter" data-testid="guidance-used-batch-counter">0/500</span></div>
+            <p id="guidance-used-batch-truncation" class="guidance-truncation hidden" data-testid="guidance-used-batch-truncation" role="status">Guidance is limited to 500 characters, so we trimmed the extra text.</p>
+            <label class="field"><span>Note for this photo (overrides the batch context)</span>
+              <textarea id="guidance-used-note" data-testid="guidance-used-note" rows="2" readonly spellcheck="false"></textarea>
+            </label>
+            <div class="guidance-field-meta"><span id="guidance-used-note-counter" data-testid="guidance-used-note-counter">0/500</span></div>
+            <p id="guidance-used-note-truncation" class="guidance-truncation hidden" data-testid="guidance-used-note-truncation" role="status">Guidance is limited to 500 characters, so we trimmed the extra text.</p>
+            <p class="aspect-note guidance-hint" data-testid="guidance-used-hint">This text is sent to OpenAI with the image. Leave out private details like full names, addresses or dates of birth.</p>
+          </div>
           <label class="field"><span>Correction for this photo</span><textarea id="chatgpt-comment" rows="4" maxlength="2000" placeholder="e.g. The man has a white moustache, not a shiny upper lip. Keep his expression and everything else unchanged."></textarea></label>
           <label class="field"><span>Images to resend</span><select id="chatgpt-resubmit-input"><option value="original">Original + comment (recommended)</option><option value="both">Original + current AI attempt + comment</option></select></label>
           <p class="aspect-note">One new paid request. Previous comments carry forward. Earlier attempts stay available until you accept one; acceptance discards the other pending attempts for this photo. Describe the location if needed (e.g. “man on the left”).</p>
