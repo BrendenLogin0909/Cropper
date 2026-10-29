@@ -15,6 +15,7 @@ from PIL import Image
 import app_settings
 import chatgpt_pending as pending
 import server
+import stage_files as stages
 from chatgpt_restore import (
     COLORIZATION_PROMPT, GUIDANCE_LIMIT, OVERRIDE_SENTENCE, PREVIOUS_IMAGE_PARAGRAPH, PROMPT,
     build_edit_prompt, edit_front, guidance_length, sanitize_guidance, strip_guidance_controls,
@@ -243,7 +244,7 @@ class GuidanceServerTests(unittest.TestCase):
                 'batch_context': 'navy uniforms', 'photo_note': 'white hat',
             })
             self.assertEqual(filled['has_guidance'], True)
-            self.assertEqual(filled['front_path'], str(self.source))
+            self.assertTrue(stages.same_path(filled['front_path'], self.source))
             edit.assert_not_called()
             self.assertEqual(pending.list_pending(self.root, self.store), [])
 
