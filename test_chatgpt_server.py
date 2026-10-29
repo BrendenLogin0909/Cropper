@@ -59,8 +59,12 @@ class ServerPendingTests(unittest.TestCase):
                             self.assertEqual(body['type'], kind)
                             self.assertNotIn('Private upstream', body['error'])
                             self.assertEqual(body['request_id'], 'req_example')
-                            self.assertIn('request req_example', body['error'])
-                            if status == 429:
+                            if kind == 'insufficient_quota':
+                                self.assertEqual(body['error'], 'your OpenAI account is out of credit')
+                                self.assertNotIn('retry_after', body)
+                            else:
+                                self.assertIn('request req_example', body['error'])
+                            if status == 429 and kind != 'insufficient_quota':
                                 self.assertEqual(body['retry_after'], '300')
                             save.assert_not_called()
                             self.assertTrue(source.exists())

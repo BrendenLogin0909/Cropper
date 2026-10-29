@@ -18,14 +18,15 @@ class ImageApiErrorTests(unittest.TestCase):
         self.assertEqual(status, 429)
         self.assertEqual(body['code'], 'billing_not_active')
         self.assertEqual(body['type'], 'insufficient_quota')
-        self.assertIn('billing and limits', body['error'])
+        self.assertEqual(body['error'], 'your OpenAI account is out of credit')
         self.assertNotIn('pause', body['error'])
-        self.assertEqual(body['retry_after'], '30')
+        self.assertNotIn('retry_after', body)
         self.assertEqual(body['request_id'], 'req_example')
 
     def test_real_throttling_preserves_retry_guidance(self):
         error = self.api_error(RateLimitError, 429, {'code': 'rate_limit_exceeded', 'type': 'rate_limit_error'})
-        self.assertIn('pause before retrying', image_api_error(error)[1]['error'])
+        self.assertIn('retried once', image_api_error(error)[1]['error'])
+        self.assertIn('retry', image_api_error(error)[1]['error'].lower())
 
     def test_photo_rejection_is_visible_without_exposing_raw_response(self):
         error = self.api_error(BadRequestError, 400, {'code': 'content_policy_violation',

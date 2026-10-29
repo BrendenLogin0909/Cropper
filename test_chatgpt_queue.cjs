@@ -250,12 +250,20 @@ test('quota error is not automatically retried', async () => {
   }, () => {}, () => {});
   assert.equal(calls, 1);
 });
-test('rate limit pauses then retries the same photo', async () => {
-  let clock = 0, calls = 0; const saved = [];
-  const simulated = vm.runInNewContext(source.slice(source.indexOf('async function runChatgptQueue('), source.indexOf('async function generateChatgpt(')) + '\nrunChatgptQueue', { setTimeout, Date: {now: () => clock} });
-  const failure = await simulated([1], {stop:false}, async path => {
-    if (++calls === 1) throw Object.assign(new Error('rate limited'), {status:429, retryAfter:5});
-    return path;
-  }, item => saved.push(item), () => {}, async ms => {clock += ms;});
-  assert.equal(calls, 2); assert.ok(clock >= 5000); assert.equal(saved.length, 1); assert.equal(failure, '');
+test('rate limit is not retried by the browser queue after the server responded', async () => {
+  let calls = 0; const saved = []; const failed = [];
+  const failure = await queue([1], {stop:false}, async () => {
+    calls++; throw Object.assign(new Error('rate limited'), {status:429, retryAfter:5});
+  }, item => saved.push(item), () => {}, undefined, 3, (path, error) => failed.push(error.message));
+  assert.equal(calls, 1); assert.equal(saved.length, 0); assert.equal(failed.length, 1); assert.equal(failure, '');
+});
+test('500 and 401 are not retried by the browser queue', async () => {
+  for (const status of [500, 401]) {
+    let calls = 0;
+    const failure = await queue([1], {stop:false}, async () => {
+      calls++; throw Object.assign(new Error('fail'), {status, code: status === 401 ? 'invalid_api_key' : 'server_error'});
+    }, () => {}, () => {});
+    assert.equal(calls, 1);
+    if (status === 401) assert.match(failure, /fail/);
+  }
 });

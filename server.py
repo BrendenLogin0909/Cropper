@@ -7,10 +7,12 @@ import io
 import json
 import os
 import secrets
+import sys
 import tempfile
 import threading
 import webbrowser
 import warnings
+import app_settings
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +40,56 @@ TOKEN = secrets.token_urlsafe(32)
 RESTORE_LOCK = threading.Lock()
 REVIEW_LOCKS = {}
 REVIEW_LOCKS_GUARD = threading.Lock()
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def hostname_of(host_header: str) -> str:
+    host, _port = host_and_port(host_header)
+    return host
+
+
+def host_and_port(host_header: str) -> tuple[str, int | None]:
+    value = (host_header or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        host = value[1:end] if end > 0 else ""
+        rest = value[end + 1:] if end > 0 else ""
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError:
+                return host, None
+        return host, None
+    if value.count(":") == 1:
+        host, raw = value.split(":", 1)
+        try:
+            return host, int(raw)
+        except ValueError:
+            return host, None
+    return value, None
+
+
+def origin_matches_server(handler: BaseHTTPRequestHandler, origin: str) -> bool:
+    """Allow only this process's http://localhost|127.0.0.1|::1:<bound-port>."""
+    parsed = urlparse(origin)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "http" or host not in LOCAL_HOSTS:
+        return False
+    port = parsed.port if parsed.port is not None else 80
+    return port == int(handler.server.server_port)
+
+
+def request_is_local(handler: BaseHTTPRequestHandler) -> bool:
+    hostname, port = host_and_port(handler.headers.get("Host", ""))
+    if hostname not in LOCAL_HOSTS:
+        return False
+    bound = int(handler.server.server_port)
+    if port is not None and port != bound:
+        return False
+    origin = handler.headers.get("Origin")
+    if origin:
+        return origin_matches_server(handler, origin)
+    return True
 
 
 @contextmanager
@@ -286,7 +338,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "Cropper/1.0"
 
     def log_message(self, format: str, *args) -> None:
-        print("%s - %s" % (self.address_string(), format % args))
+        # Never log query strings or request bodies (keys, notes, settings).
+        path = urlparse(getattr(self, "path", "") or "").path or "-"
+        command = getattr(self, "command", None) or "-"
+        print("%s - \"%s %s\"" % (self.address_string(), command, path))
 
     def reply(self, status: int, body: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         self.send_response(status)
@@ -305,16 +360,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def authorized(self, query: dict | None = None) -> bool:
         given = self.headers.get("X-Cropper-Token", "") or (query or {}).get("token", [""])[0]
-        origin = self.headers.get("Origin")
-        host = self.headers.get("Host", "")
-        return secrets.compare_digest(given, TOKEN) and (not origin or origin == f"http://{host}")
+        return secrets.compare_digest(given, TOKEN) and request_is_local(self)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         try:
             if parsed.path == "/api/session":
-                self.json(200, {"app": "Cropper", "token": TOKEN, "home": str(Path.home()), "stage_routing_version": 2})
+                if not request_is_local(self):
+                    self.json(403, {"error": "Session is only available on localhost."})
+                    return
+                info = app_settings.public_settings()
+                self.json(200, {
+                    "app": "Cropper",
+                    "token": TOKEN,
+                    "home": str(Path.home()),
+                    "stage_routing_version": 2,
+                    "has_key": info["has_key"],
+                    "key_source": info["key_source"],
+                    "keyring_error": info.get("keyring_error") or "",
+                    "model": info["model"],
+                    "quality": info["quality"],
+                })
                 return
             if parsed.path in {"/", "/index.html", "/app.css", "/chatgpt.css", "/stage-routing.css", "/app.js"}:
                 name = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
@@ -323,6 +390,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not self.authorized(query):
                 self.json(403, {"error": "Unauthorized request."})
+                return
+            if parsed.path == "/api/settings":
+                self.json(200, app_settings.public_settings())
                 return
             if parsed.path == "/api/locations":
                 home = Path.home()
@@ -412,6 +482,28 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > 1_000_000:
                 raise ValueError("Invalid request size.")
             data = json.loads(self.rfile.read(length))
+            if self.path == "/api/settings":
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid settings.")
+                key = data.pop("api_key", None)
+                if key is not None and str(key).strip():
+                    app_settings.set_stored_api_key(str(key))
+                key = None
+                app_settings.save_settings(data)
+                self.json(200, app_settings.public_settings())
+                return
+            if self.path == "/api/settings/clear-key":
+                app_settings.clear_stored_api_key()
+                self.json(200, app_settings.public_settings())
+                return
+            if self.path == "/api/settings/test-key":
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid settings.")
+                key = str(data.get("api_key") or app_settings.resolved_api_key())
+                from chatgpt_restore import test_key
+                result = test_key(key)
+                self.json(200, result)
+                return
             if self.path == '/api/crop-corners':
                 path = image_path(data.get('path', ''))
                 image, _ = load_image(path)
@@ -614,7 +706,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Cropper locally")
     parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--data-dir", default=None, help="Per-user data folder (default: %%APPDATA%%/Cropper)")
     args = parser.parse_args()
+    app_settings.configure_runtime(args.data_dir)
     try:
         server = LocalServer(("127.0.0.1", args.port), Handler)
     except OSError:
@@ -629,7 +723,8 @@ def main() -> None:
             if not args.no_browser:
                 webbrowser.open(address)
             return
-        raise
+        print(f"Port {args.port} is already in use by another program.", flush=True)
+        sys.exit(1)
     address = f"http://127.0.0.1:{server.server_port}"
     print(f"Cropper is running at {address}", flush=True)
     if not args.no_browser:

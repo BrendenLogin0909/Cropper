@@ -20,6 +20,7 @@
           <button class="tool-tab" id="colorize-tab" role="tab" aria-selected="false">ChatGPT Image Colorization</button>
         </div>
         <span class="local-pill"><i></i> Runs on this computer</span>
+        <button class="button button-quiet" id="open-settings" title="Settings">Settings</button>
         <button class="button button-quiet" id="open-folder-top"><span class="icon">▣</span> Open folder</button>
       </div>
     </header>
@@ -176,15 +177,17 @@
       </aside>
       <aside class="settings panel hidden" id="chatgpt-settings">
         <div class="panel-head"><div><div class="eyebrow">CHATGPT IMAGE RESTORATION</div><h2>Faithful photo edit</h2></div></div>
-        <p class="settings-intro">Uses the OpenAI API (Sunburst, high quality). API charges are separate from ChatGPT. Accepted PNGs go into sibling <strong>1.7. TBP AI-Improved</strong> with _ai; incoming and skipped versions are archived in the corresponding stage folders. Rejected results leave files untouched.</p>
+        <p class="settings-intro">Uses the OpenAI API. Quality defaults to medium; high is an opt-in in Settings (about 20c per photo). API charges are separate from ChatGPT. Accepted PNGs go into sibling <strong>1.7. TBP AI-Improved</strong> with _ai; incoming and skipped versions are archived in the corresponding stage folders. Rejected results leave files untouched.</p>
         <p class="settings-intro">Results save locally for review while processing continues. Zoom with +/− or the mouse wheel; drag a zoomed image to pan. Drag the divider or bottom slider to compare.</p>
         <div class="settings-fields"><label class="field"><span>Parallel requests</span><select id="chatgpt-concurrency"><option value="1">1 — sequential</option><option value="3" selected>3 — recommended</option><option value="5">5</option><option value="10">10</option></select></label><p class="aspect-note">Applies to the next batch. Higher values may reach API rate limits; per-image charges still apply.</p></div>
         <div class="settings-group"><div class="section-label">LINKED FRONT / BACK</div><button id="chatgpt-pairs-open" class="button button-quiet">Find and approve pairs (free)</button><p class="aspect-note">Confirm links before generating. One paid front restoration produces two saved versions.</p><div id="chatgpt-pair-list" class="chatgpt-pending-list"></div><button id="chatgpt-pairs-generate" class="button button-primary" disabled>Generate selected pairs (paid)</button></div>
         <section id="chatgpt-failures" class="settings-group hidden" aria-label="Failed photos">
           <div class="section-label">FAILED PHOTOS <span id="chatgpt-failure-count">0</span></div>
-          <p class="aspect-note">Originals are preserved. Review the reason before manually retrying a paid request.</p>
+          <p class="aspect-note">Originals are preserved. Review the reason before retrying a paid request. Cropper retries a rate-limit once automatically; other failures need this button.</p>
           <div id="chatgpt-failure-list" class="chatgpt-failure-list" role="status" aria-live="polite"></div>
+          <button id="chatgpt-retry-failed" class="button button-quiet hidden">Retry failed photos</button>
         </section>
+        <p id="chatgpt-key-hint" class="aspect-note hidden">Add your OpenAI API key in Settings to enable AI restore. Crop and other tools still work offline.</p>
         <div class="settings-group"><div class="section-label">PENDING REVIEW <span id="chatgpt-pending-count">0</span></div><div id="chatgpt-pending-list" class="chatgpt-pending-list"></div><button id="chatgpt-review-combined" class="button button-quiet hidden">View rebuilt front + back</button></div>
         <div class="settings-spacer"></div>
         <button class="button button-primary save-button" id="chatgpt-generate" disabled><span>Generate selected photos (paid)</span><span>✦</span></button>
@@ -223,6 +226,37 @@
       <div class="folder-dialog-foot"><span id="folder-modal-current"></span><div><button id="folder-modal-cancel" class="button button-quiet">Cancel</button><button id="folder-modal-select" class="button button-primary">Use this folder</button></div></div>
     </div>
   </div>
+  <dialog id="app-settings-dialog" class="app-settings-dialog" aria-labelledby="app-settings-title">
+    <div class="chatgpt-preview-head"><h2 id="app-settings-title">Settings</h2><button id="app-settings-close" class="button button-quiet">Close</button></div>
+    <p class="aspect-note">Saved on this computer. The API key is stored in Windows Credential Manager, not in the project folder. Other options go in your Cropper app data folder.</p>
+    <p id="settings-keyring-warning" class="settings-keyring-warning hidden" role="alert"></p>
+    <div class="settings-fields">
+      <label class="field"><span>OpenAI API key</span><input id="settings-api-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste key — it is never shown in full"></label>
+      <p id="settings-key-masked" class="aspect-note">No key saved. AI restore is disabled until you add one, or set OPENAI_API_KEY.</p>
+      <p id="settings-key-source" class="aspect-note"></p>
+      <div class="chatgpt-zoom-tools" style="margin-bottom:12px">
+        <button id="settings-test-key" class="button button-quiet">Test key</button>
+        <button id="settings-clear-key" class="button button-quiet">Clear key</button>
+      </div>
+      <p id="settings-key-status" class="aspect-note" role="status"></p>
+      <label class="field"><span>Image model</span><input id="settings-model" spellcheck="false" value="gpt-image-2.5-sunburst"></label>
+      <label class="field"><span>Quality</span>
+        <select id="settings-quality">
+          <option value="low">Low — used for previews</option>
+          <option value="medium" selected>Medium — default</option>
+          <option value="high">High — about 20c per photo</option>
+        </select>
+      </label>
+    </div>
+    <div class="chatgpt-zoom-tools"><button id="settings-save" class="button button-primary">Save settings</button></div>
+  </dialog>
+  <dialog id="first-run-dialog" aria-labelledby="first-run-title">
+    <h2 id="first-run-title">Welcome to Cropper</h2>
+    <p>1. Open a batch folder of photos.</p>
+    <p>2. Optionally add your own OpenAI API key in Settings for paid restore and colourisation. Crop and local tools work without a key.</p>
+    <p>3. Saves use the flat stage folders next to your batch.</p>
+    <form method="dialog"><button class="button button-quiet" value="skip">Skip</button><button class="button button-primary" id="first-run-settings" value="settings">Open Settings</button></form>
+  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>

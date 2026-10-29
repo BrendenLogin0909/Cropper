@@ -24,4 +24,19 @@ test('failed filenames and reasons remain visible as text, including unsafe-look
   current.failures.clear();render();
   assert.equal(controls['chatgpt-failures'].hidden,true);
   assert.equal(controls['chatgpt-failure-list'].textContent,'');
+  assert.equal(controls['chatgpt-retry-failed'].hidden,true);
+});
+
+test('retry failed photos requeues the failed set', async () => {
+  const current = {failures:new Map([['a.png','rate limited']]), busy:false, selected:new Set()};
+  const generated = [];
+  const context = {state:{chatgpt:current}, generateChatgpt: selection => generated.push([...selection])};
+  const retry = vm.runInNewContext(
+    source.slice(source.indexOf('function retryFailedChatgpt()'), source.indexOf('async function finishChatgpt(')) + '\nretryFailedChatgpt',
+    context
+  );
+  retry();
+  assert.equal(current.failures.size, 0);
+  assert.equal(current.selected.has('a.png'), true);
+  assert.deepEqual(generated, [['a.png']]);
 });

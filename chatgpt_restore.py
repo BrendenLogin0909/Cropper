@@ -3,11 +3,14 @@
 import base64
 import io
 import os
+import time
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
-MODEL = "gpt-image-2.5-sunburst"
+from app_settings import image_model, image_quality, resolved_api_key
+from image_api_errors import is_retryable_rate_limit, retry_after_seconds
+
 PROMPT = (
     "Conservatively restore this old family photograph. Preserve the exact people, facial features, "
     "expressions, poses, clothing, veils and occlusions, objects, text, composition and period character. "
@@ -28,28 +31,74 @@ COLORIZATION_PROMPT = (
     "Preserve any already-coloured areas. Return precisely the same framing and aspect ratio."
 )
 
+# Kept as an alias for older imports; the live model name comes from Settings.
+MODEL = "gpt-image-2.5-sunburst"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+def openai_base_url() -> str:
+    return os.environ.get("OPENAI_BASE_URL", "").strip() or DEFAULT_OPENAI_BASE_URL
+
 
 def api_key() -> str:
-    value = os.environ.get("OPENAI_API_KEY", "").strip()
+    value = resolved_api_key()
     if value:
         return value
-    for file in (Path(__file__).parent / ".env.local",):
-        if file.is_file():
-            for line in file.read_text(encoding="utf-8-sig").splitlines():
-                if line.lstrip().startswith("OPENAI_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"\'')
-    raise ValueError("OPENAI_API_KEY was not found. Check the local .env.local file.")
+    raise ValueError("Add your OpenAI API key in Settings, or set the OPENAI_API_KEY environment variable.")
 
 
-def edit_front(source: Path, client=None, operation="restore", comments=None, previous: Path | None = None) -> bytes:
+def test_key(key: str) -> dict:
+    """One cheap models.list call. Never returns or logs provider text or the key."""
+    from image_api_errors import QUOTA_MESSAGE, is_quota_error
+    secret = (key or "").strip()
+    if not secret:
+        raise ValueError("Paste an API key first.")
+    client = openai_client(api_key_value=secret, timeout=30)
+    try:
+        client.models.list()
+        return {"status": "valid", "message": "This API key is valid."}
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        name = type(exc).__name__
+        if is_quota_error(exc):
+            return {"status": "no_quota", "message": QUOTA_MESSAGE}
+        if status == 401 or getattr(exc, "code", None) == "invalid_api_key":
+            return {"status": "invalid", "message": "This API key is invalid."}
+        if name in {"APIConnectionError", "APITimeoutError"} or status in {408, 502, 503, 504}:
+            return {"status": "network", "message": "Network error: Cropper could not reach OpenAI."}
+        return {"status": "error", "message": "The test call failed. Check API access and try again."}
+
+
+def openai_client(api_key_value=None, timeout=180):
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise ValueError("Install the openai package from requirements.txt first.") from exc
+    return OpenAI(
+        api_key=api_key_value if api_key_value is not None else api_key(),
+        timeout=timeout,
+        max_retries=0,
+        base_url=openai_base_url(),
+    )
+
+
+def call_images_edit(client, **kwargs):
+    """One provider call, plus exactly one retry with backoff on rate-limit 429 only."""
+    try:
+        return client.images.edit(**kwargs)
+    except Exception as exc:
+        if not is_retryable_rate_limit(exc):
+            raise
+        time.sleep(retry_after_seconds(exc))
+        return client.images.edit(**kwargs)
+
+
+def edit_front(source: Path, client=None, operation="restore", comments=None, previous: Path | None = None,
+               quality=None, model=None, preview=False) -> bytes:
     if operation not in {"restore", "colorize"}:
         raise ValueError("Choose restoration or colorization.")
     if client is None:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise ValueError("Install the openai package from requirements.txt first.") from exc
-        client = OpenAI(api_key=api_key(), timeout=180)
+        client = openai_client()
     with Image.open(source) as original:
         image = ImageOps.exif_transpose(original).convert("RGB")
         upload = io.BytesIO()
@@ -69,8 +118,10 @@ def edit_front(source: Path, client=None, operation="restore", comments=None, pr
         prompt += ("\nImage 1 is the ORIGINAL and authoritative photographic evidence. Image 2 is a previous "
                    "AI attempt provided only to explain the correction. Do not copy its mistakes or use it "
                    "to override the original's identity, expression, pose, framing or occlusions.")
-    response = client.images.edit(model=MODEL, image=inputs, prompt=prompt,
-                                  quality="high", size="auto", output_format="png")
+    chosen_quality = quality or image_quality(preview=preview)
+    chosen_model = model or image_model()
+    response = call_images_edit(client, model=chosen_model, image=inputs, prompt=prompt,
+                                quality=chosen_quality, size="auto", output_format="png")
     if not response.data or not response.data[0].b64_json:
         raise ValueError("The image API returned no result.")
     result = base64.b64decode(response.data[0].b64_json)
