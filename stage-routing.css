@@ -1,0 +1,9 @@
+.stage-routing-option{display:flex;align-items:center;gap:8px;color:#a7e5d7;font-size:12px;cursor:pointer}
+.stage-routing-note{font-size:11px;line-height:1.45;color:#96aeb7;margin:8px 0 14px}
+.stage-finish-button{margin:8px 18px;width:calc(100% - 36px);white-space:normal;font-size:11px}
+.flat-stage-routing #crop-settings .settings-group:has(input[name="mode"]),
+.flat-stage-routing #crop-settings #subfolder-field,
+.flat-stage-routing #crop-settings #folder-field,
+.flat-stage-routing #crop-settings #naming-fields,
+.flat-stage-routing #enhance-settings .settings-group:has(input[name="enhance-mode"]),
+.flat-stage-routing #enhance-settings .settings-fields{display:none}
