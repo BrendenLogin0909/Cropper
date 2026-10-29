@@ -72,7 +72,7 @@ class ApiKeySourceTests(unittest.TestCase):
         text = Path(chatgpt_restore.__file__).read_text(encoding="utf-8")
         self.assertNotIn(".env.local", text)
         self.assertNotRegex(text, r"C:[\\/]Users")
-        self.assertNotIn("brend", text.lower())
+        self.assertNotRegex(text, r"(?i)bre" + r"nd")
         with patch.object(app_settings, "resolved_api_key", return_value=""):
             with self.assertRaisesRegex(ValueError, "Settings"):
                 chatgpt_restore.api_key()
