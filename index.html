@@ -304,11 +304,23 @@
       </label>
       <label class="toggle-line"><input type="checkbox" id="settings-backup-originals" checked><span class="switch"></span><span>Backup originals before Replace original</span></label>
       <label class="toggle-line"><input type="checkbox" id="settings-replace-original"><span class="switch"></span><span>Replace original (requires backups)</span></label>
+      <label class="toggle-line"><input type="checkbox" id="settings-keep-gps"><span class="switch"></span><span>Keep GPS location in saved photos</span></label>
+      <p class="aspect-note">GPS is stripped by default. Turn this on only if you need location metadata in the output.</p>
       <label class="field"><span>Output folder override</span>
         <span class="browse-field"><input id="settings-output-folder" spellcheck="false" placeholder="Leave blank to use the batch stage folders"><button type="button" id="settings-output-browse" class="button button-quiet">Browse…</button></span>
       </label>
     </div>
     <div class="chatgpt-zoom-tools"><button id="settings-save" class="button button-primary">Save settings</button></div>
+  </dialog>
+  <dialog id="overwrite-dialog" class="app-settings-dialog" aria-labelledby="overwrite-dialog-title">
+    <div class="chatgpt-preview-head"><h2 id="overwrite-dialog-title">Overwrite existing files?</h2></div>
+    <p>This batch would overwrite <strong id="overwrite-dialog-count">0</strong> existing file(s).</p>
+    <p id="overwrite-dialog-names" class="aspect-note"></p>
+    <label class="toggle-line"><input type="checkbox" id="overwrite-skip-session"><span class="switch"></span><span>Don't ask again this session</span></label>
+    <form method="dialog" class="chatgpt-zoom-tools" style="margin-top:12px">
+      <button class="button button-quiet" value="cancel">Cancel</button>
+      <button class="button button-primary" value="overwrite" data-testid="overwrite-confirm">Overwrite</button>
+    </form>
   </dialog>
   <dialog id="first-run-dialog" aria-labelledby="first-run-title">
     <h2 id="first-run-title">Welcome to Cropper</h2>

@@ -1,7 +1,10 @@
+import io
 import json
+import socket
 import threading
 import unittest
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -54,3 +57,21 @@ class SessionOriginTests(unittest.TestCase):
         self.assertEqual(settings["model"], "gpt-image-2.5-sunburst")
         self.assertEqual(settings["quality"], "medium")
         self.assertFalse(settings["has_key"])
+
+    def test_port_in_use_by_other_program_prints_plain_error(self):
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        self.addCleanup(occupied.close)
+        port = occupied.getsockname()[1]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = ["server.py", "--port", str(port), "--no-browser", "--data-dir", self.data.name]
+        with patch("sys.argv", argv), patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit) as caught:
+                server.main()
+        self.assertEqual(caught.exception.code, 1)
+        blob = stdout.getvalue() + stderr.getvalue()
+        self.assertIn(f"Port {port} is already in use by another program.", blob)
+        self.assertNotIn("Traceback", blob)

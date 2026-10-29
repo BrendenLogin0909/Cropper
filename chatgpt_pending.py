@@ -18,6 +18,10 @@ PENDING_ROOT = None
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,80}$")
 PENDING_TTL_SECONDS = 7 * 24 * 60 * 60
 FRONT_PATH_PATTERN = re.compile(r'"front_path"\s*:\s*"((?:\\.|[^"\\])*)"')
+STRING_FIELD_PATTERN = re.compile(
+    r'"(front_path|photo_note|batch_context|notes|guidance|guidance_notes|comment|operation)"\s*:\s*"((?:\\.|[^"\\])*)"'
+)
+LIST_FIELD_PATTERN = re.compile(r'"(comments|output_paths)"\s*:\s*(\[[^\]]*\])')
 LOG = logging.getLogger("cropper.pending")
 
 
@@ -72,7 +76,7 @@ def _guidance(record: dict | None) -> list[str]:
     comments = record.get("comments")
     if isinstance(comments, list):
         notes.extend(str(item).strip() for item in comments if str(item).strip())
-    for key in ("notes", "guidance", "guidance_notes", "comment", "batch_context", "photo_note"):
+    for key in ("notes", "guidance", "guidance_notes", "comment", "photo_note", "batch_context"):
         value = record.get(key)
         if isinstance(value, str) and value.strip():
             notes.append(value.strip())
@@ -109,13 +113,27 @@ def _salvage_record(metadata: Path) -> tuple[dict | None, bool]:
     record, complete = _parse_json_text(text)
     if record is not None:
         return record, complete
-    match = FRONT_PATH_PATTERN.search(text)
-    if match:
+    salvaged: dict = {}
+    for match in STRING_FIELD_PATTERN.finditer(text):
         try:
-            front = json.loads(f'"{match.group(1)}"')
+            salvaged[match.group(1)] = json.loads(f'"{match.group(2)}"')
         except json.JSONDecodeError:
-            front = match.group(1)
-        return {"front_path": front}, False
+            salvaged[match.group(1)] = match.group(2)
+    for match in LIST_FIELD_PATTERN.finditer(text):
+        try:
+            loaded = json.loads(match.group(2))
+        except json.JSONDecodeError:
+            continue
+        salvaged[match.group(1)] = loaded
+    if not salvaged.get("front_path"):
+        match = FRONT_PATH_PATTERN.search(text)
+        if match:
+            try:
+                salvaged["front_path"] = json.loads(f'"{match.group(1)}"')
+            except json.JSONDecodeError:
+                salvaged["front_path"] = match.group(1)
+    if salvaged:
+        return salvaged, False
     return None, False
 
 
@@ -218,6 +236,8 @@ def list_pending(folder: Path, root: Path | None = None) -> list[dict]:
             continue
         try:
             record, image = get_pending(metadata.stem, root)
+            if record.get("expired"):
+                continue
             if not image_is_readable(image):
                 continue
             from stage_files import same_path
@@ -244,11 +264,14 @@ def list_recovered(root: Path | None = None) -> list[dict]:
         metadata, image = root / f"{stem}.json", root / f"{stem}.png"
         salvaged, json_complete = _salvage_record(metadata) if metadata.is_file() else (None, False)
         readable = image_is_readable(image)
-        if json_complete and salvaged and _complete_record(salvaged, image):
+        expired = bool(salvaged and salvaged.get("expired"))
+        if json_complete and salvaged and _complete_record(salvaged, image) and not expired:
             continue
-        if readable and json_complete and salvaged and salvaged.get("id") == stem and salvaged.get("front_path"):
+        if readable and json_complete and salvaged and salvaged.get("id") == stem and salvaged.get("front_path") and not expired:
             continue
-        if readable:
+        if expired and readable:
+            reason = "expired"
+        elif readable:
             reason = "orphaned image" if not metadata.is_file() else (
                 "truncated metadata" if not json_complete else "incomplete metadata")
         elif image.is_file():
@@ -288,7 +311,7 @@ def keep_recovered(stage_id: str, root: Path | None = None) -> dict:
     }
     for key in ("stage_routing", "link", "parent_id", "attempt", "comments", "included_previous",
                 "output_path", "output_paths", "notes", "guidance", "guidance_notes", "comment",
-                "batch_context", "photo_note"):
+                "photo_note", "batch_context"):
         if key in salvaged:
             record[key] = salvaged[key]
     _atomic_write_json(metadata, record)
@@ -328,15 +351,16 @@ def reserved_from_record(record: dict) -> list[Path]:
 
 
 def cleanup_expired(root: Path | None = None, now: float | None = None, ttl: int = PENDING_TTL_SECONDS) -> list[str]:
-    """Delete pending AI images older than ttl. Never stores them in system temp.
+    """Move pending AI images older than ttl into Recovered. Never delete them.
 
+    Entries with no created stamp get a timestamp instead of being removed.
     Incomplete or unreadable recovered files are left for Keep/Discard.
     """
     root = _resolve_root(root)
     if not root.is_dir():
         return []
     stamp = time.time() if now is None else now
-    removed = []
+    moved = []
     for metadata in list(root.glob("*.json")):
         if metadata.name.startswith(".cropper-"):
             continue
@@ -345,12 +369,23 @@ def cleanup_expired(root: Path | None = None, now: float | None = None, ttl: int
             image = metadata.with_suffix(".png")
             if not _complete_record(record, image):
                 continue
-            created = float(record.get("created") or 0)
-            if created and stamp - created < ttl:
+            created = record.get("created")
+            if not created:
+                record["created"] = stamp
+                _atomic_write_json(metadata, record)
+                continue
+            if stamp - float(created) < ttl:
+                continue
+            if record.get("expired"):
                 continue
             ident = record.get("id") or metadata.stem
-            remove_pending(ident, root)
-            removed.append(ident)
+            record["expired"] = True
+            _atomic_write_json(metadata, record)
+            try:
+                _release_record_reservations(ident, record)
+            except Exception:
+                LOG.warning("Pending reservation release failed id=%s", ident)
+            moved.append(ident)
         except (ValueError, OSError, KeyError, json.JSONDecodeError, TypeError):
             continue
     try:
@@ -358,4 +393,4 @@ def cleanup_expired(root: Path | None = None, now: float | None = None, ttl: int
         sweep_stale_reservations()
     except Exception:
         LOG.warning("Pending reservation sweep failed")
-    return removed
+    return moved

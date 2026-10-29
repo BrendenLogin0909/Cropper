@@ -129,12 +129,60 @@ async function setOutputFolder(path) {
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function url(path, filePath) { return `${path}?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(state.token)}`; }
+const overwriteSession = { skip: false };
+function askOverwrite(count, names) {
+  const dialog = $('overwrite-dialog');
+  if (!dialog || typeof dialog.showModal !== 'function') {
+    return Promise.resolve({ ok: false, skip: false });
+  }
+  $('overwrite-dialog-count').textContent = String(count || 0);
+  $('overwrite-dialog-names').textContent = (names || []).join(', ');
+  $('overwrite-skip-session').checked = false;
+  return new Promise(resolve => {
+    const onClose = () => {
+      dialog.removeEventListener('close', onClose);
+      resolve({ ok: dialog.returnValue === 'overwrite', skip: !!$('overwrite-skip-session')?.checked });
+    };
+    dialog.addEventListener('close', onClose);
+    try { dialog.showModal(); } catch (_) { dialog.setAttribute('open', ''); }
+  });
+}
+async function ensureOverwriteConfirmed(paths, operation) {
+  if (!paths || !paths.length) return {};
+  if (overwriteSession.skip) return { confirm_overwrite: true, skip_overwrite_prompt: true };
+  const preview = await api('/api/overwrite-preview', { paths, operation });
+  if (!preview.count) return {};
+  const decision = await askOverwrite(preview.count, preview.names);
+  if (!decision.ok) throw new Error('Overwrite cancelled.');
+  if (decision.skip) overwriteSession.skip = true;
+  return { confirm_overwrite: true, skip_overwrite_prompt: !!decision.skip };
+}
 async function api(path, body) {
   if ((body?.stage_routing || body?.settings?.stage_routing || path === '/api/stage-finish') && !state.stageRoutingAvailable) {
     throw new Error('Flat stage routing needs the updated server. Finish active batches, restart Cropper on 8767, then refresh. No request was sent.');
   }
-  const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: { 'X-Cropper-Token': state.token, ...(body === null ? {} : body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined || body === null ? {} : { body: JSON.stringify(body) }) });
-  const data = await response.json(); if (!response.ok) { const error = new Error(data.error || 'Something went wrong.'); error.status = response.status; error.retryAfter = data.retry_after; error.code = data.code; error.type = data.type; error.requestId = data.request_id; error.path = data.path; throw error; } return data;
+  let payload = body;
+  for (;;) {
+    const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: { 'X-Cropper-Token': state.token, ...(payload === null ? {} : payload === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }) });
+    const data = await response.json();
+    if (response.status === 409 && data.code === 'overwrite_confirmation_required' && payload && typeof payload === 'object') {
+      if (overwriteSession.skip) {
+        payload = { ...payload, confirm_overwrite: true, skip_overwrite_prompt: true };
+        continue;
+      }
+      const decision = await askOverwrite(data.count, data.names);
+      if (!decision.ok) {
+        const error = new Error('Overwrite cancelled.');
+        error.status = 409; error.code = data.code;
+        throw error;
+      }
+      if (decision.skip) overwriteSession.skip = true;
+      payload = { ...payload, confirm_overwrite: true, skip_overwrite_prompt: !!decision.skip };
+      continue;
+    }
+    if (!response.ok) { const error = new Error(data.error || 'Something went wrong.'); error.status = response.status; error.retryAfter = data.retry_after; error.code = data.code; error.type = data.type; error.requestId = data.request_id; error.path = data.path; error.count = data.count; error.names = data.names; throw error; }
+    return data;
+  }
 }
 function saveSettings() {
   settings.autoNext = $('auto-next').checked;
@@ -318,11 +366,14 @@ async function saveEnhancedBatch() {
   const batchSettings = { ...enhanceSettings, stage_routing:stageRoutingEnabled() };
   state.enhance.busy = true; state.enhance.stop = false; renderEnhanceControls();
   let saved = 0; const failed = []; const archived = new Set();
+  let extra = {};
+  try { extra = await ensureOverwriteConfirmed(paths, 'enhance'); }
+  catch (error) { state.enhance.busy = false; renderEnhanceControls(); toast(error.message, true); return; }
   for (const [index, path] of paths.entries()) {
     if (archived.has(path)) continue;
     if (state.enhance.stop) break;
     $('enhance-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
-    try { const result=await api('/api/enhance', { path, settings: batchSettings }); for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved);archived.add(moved);} saved++; }
+    try { const result=await api('/api/enhance', { path, settings: batchSettings, ...extra }); for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved);archived.add(moved);} saved++; }
     catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (offerChooseOutputFolder(error)) state.enhance.stop = true; }
     refreshEnhanceTiles(); renderEnhanceControls();
   }
@@ -444,11 +495,14 @@ async function saveRestorationBatch() {
   const paths = state.images.map(image => image.path).filter(path => state.restore.selected.has(path));
   state.restore.busy = true; state.restore.stop = false; renderRestorationControls();
   let saved = 0, skipped = 0; const failed = []; const archived = new Set();
+  let extra = {};
+  try { extra = await ensureOverwriteConfirmed(paths, 'enhance'); }
+  catch (error) { state.restore.busy = false; renderRestorationControls(); toast(error.message, true); return; }
   for (const [index, path] of paths.entries()) {
     if (state.restore.stop) break;
     $('restore-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
     try {
-      const result = await api('/api/restore', { path, operation, strokes: state.restore.marks.get(path) || [] });
+      const result = await api('/api/restore', { path, operation, strokes: state.restore.marks.get(path) || [], ...extra });
       state.restore.selected.delete(path);
       if (result.skipped) { state.restore.notNeeded.add(path); skipped++; }
       else {
@@ -722,7 +776,8 @@ async function cropSave() {
   state.busy = true; updateControls();
   const sourceIndex = state.index;
   try {
-    const result = await api('/api/crop', { path: state.images[sourceIndex].path, points: state.points.map(p=>[p.x,p.y]), rotation: state.rotation, aspect_ratio: cropAspectRatio(), settings:{...settings,stage_routing:stageRoutingEnabled()} });
+    const extra = await ensureOverwriteConfirmed([state.images[sourceIndex].path], 'crop');
+    const result = await api('/api/crop', { path: state.images[sourceIndex].path, points: state.points.map(p=>[p.x,p.y]), rotation: state.rotation, aspect_ratio: cropAspectRatio(), settings:{...settings,stage_routing:stageRoutingEnabled()}, ...extra });
     $('save-error').classList.add('hidden');
     toast(`Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
@@ -1704,7 +1759,7 @@ function updateFilenamePreview() {
   const preview = $('settings-filename-preview');
   if (!preview) return;
   try {
-    const sample = template.replaceAll('{name}', 'photo').replaceAll('{date}', '20261029').replaceAll('{index}', '1').replaceAll('{ext}', '.png').replaceAll('{suffix}', '_c');
+    const sample = template.replaceAll('{name}', 'photo').replaceAll('{date}', '20261029').replaceAll('{index}', '001').replaceAll('{ext}', '.png').replaceAll('{suffix}', '_c');
     if (!sample || /[<>:"/\\|?*\x00-\x1f]/.test(sample) || sample.includes('/') || sample.includes('\\')) {
       preview.textContent = 'Filename template produces invalid characters.';
       return;
@@ -1721,6 +1776,7 @@ function applyServerSettings(data) {
   if ($('settings-conflict-policy')) $('settings-conflict-policy').value = data.conflict_policy || 'skip';
   if ($('settings-replace-original')) $('settings-replace-original').checked = !!data.replace_original;
   if ($('settings-backup-originals')) $('settings-backup-originals').checked = data.backup_originals !== false;
+  if ($('settings-keep-gps')) $('settings-keep-gps').checked = !!data.keep_gps;
   if ($('settings-output-folder')) $('settings-output-folder').value = data.output_folder || '';
   updateFilenamePreview();
   const env = data.key_source === 'env';
@@ -1766,6 +1822,7 @@ async function saveAppSettings() {
     conflict_policy: $('settings-conflict-policy')?.value || 'skip',
     replace_original: !!$('settings-replace-original')?.checked,
     backup_originals: $('settings-backup-originals') ? $('settings-backup-originals').checked : true,
+    keep_gps: !!$('settings-keep-gps')?.checked,
     output_folder: $('settings-output-folder')?.value.trim() || '',
   };
   const input = $('settings-api-key');

@@ -55,6 +55,7 @@ def _defaults() -> dict:
         "conflict_policy": "skip",
         "replace_original": False,
         "backup_originals": True,
+        "keep_gps": False,
         "output_folder": "",
     }
 
@@ -78,6 +79,7 @@ def load_settings() -> dict:
     data["conflict_policy"] = policy if policy in {"skip", "overwrite", "auto-suffix"} else "skip"
     data["replace_original"] = bool(data.get("replace_original"))
     data["backup_originals"] = bool(data.get("backup_originals", True))
+    data["keep_gps"] = bool(data.get("keep_gps"))
     if data["replace_original"] and not data["backup_originals"]:
         data["replace_original"] = False
     data["output_folder"] = str(data.get("output_folder") or "")
@@ -112,6 +114,8 @@ def save_settings(updates: dict) -> dict:
         data["backup_originals"] = bool(updates["backup_originals"])
     if data.get("replace_original") and not data.get("backup_originals", True):
         raise ValueError("Replace original needs backups on. Cropper will not modify the original.")
+    if "keep_gps" in updates:
+        data["keep_gps"] = bool(updates["keep_gps"])
     if "output_folder" in updates:
         data["output_folder"] = str(updates["output_folder"] or "").strip()
     path = settings_path()
@@ -248,6 +252,7 @@ def public_settings() -> dict:
         "conflict_policy": data.get("conflict_policy", "skip"),
         "replace_original": bool(data.get("replace_original")),
         "backup_originals": bool(data.get("backup_originals", True)),
+        "keep_gps": bool(data.get("keep_gps")),
         "output_folder": data.get("output_folder") or "",
         "has_key": bool(key),
         "key_masked": mask_key(key),
