@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from types import SimpleNamespace
 
 from PIL import Image
+import app_settings
 import server
 import chatgpt_pending
 import photo_pairs
@@ -21,6 +22,7 @@ class ServerPendingTests(unittest.TestCase):
             queue=Path(folder)/'1.5. TBP Cropped';queue.mkdir()
             source = queue / 'front.png'
             Image.new('RGB', (8, 8), 'gray').save(source)
+            app_settings.configure_runtime(folder)
             local_server = server.LocalServer(('127.0.0.1', 0), server.Handler)
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
@@ -38,6 +40,7 @@ class ServerPendingTests(unittest.TestCase):
             try:
                 with patch.object(server, 'read_links', return_value=[]), \
                      patch.object(server, 'list_pending', return_value=[]), \
+                     patch.object(server, 'list_recovered', return_value=[]), \
                      patch.object(server, 'save_pending') as save:
                     for status, code, kind, expected in cases:
                         with self.subTest(status=status, code=code):
@@ -83,6 +86,7 @@ class ServerPendingTests(unittest.TestCase):
                 source.write_bytes(image.getvalue())
             composite = root / 'combined.png'
             Image.new('RGB', (16, 8), 'ivory').save(composite)
+            app_settings.configure_runtime(folder)
             local_server = server.LocalServer(("127.0.0.1", 0), server.Handler)
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
@@ -102,6 +106,7 @@ class ServerPendingTests(unittest.TestCase):
                      patch.object(server, "save_pending", side_effect=lambda source, png, **kw: chatgpt_pending.save_pending(source, png, pending, **kw)), \
                      patch.object(server, "get_pending", side_effect=lambda ident: chatgpt_pending.get_pending(ident, pending)), \
                      patch.object(server, "list_pending", side_effect=lambda location: chatgpt_pending.list_pending(location, pending)), \
+                     patch.object(server, "list_recovered", side_effect=lambda: chatgpt_pending.list_recovered(pending)), \
                      patch.object(server, "remove_pending", side_effect=lambda ident: chatgpt_pending.remove_pending(ident, pending)):
                     post('/api/photo-link', {'front_path':str(sources[0]), 'composite_path':str(composite), 'split':50, 'layout':'right'})
                     first = post("/api/chatgpt-generate", {"front_path": str(sources[0])})

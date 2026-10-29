@@ -72,10 +72,14 @@ def suggestions(folder):
 def accept_linked(record, png):
     link = record.get('link')
     operation=record.get('operation','restore')
-    if not link: return file_accepted(Path(record['front_path']), png, operation=operation)
+    reserved = record.get('output_paths') or ([record['output_path']] if record.get('output_path') else None)
+    if reserved:
+        reserved = [Path(path) for path in reserved]
+    if not link: return file_accepted(Path(record['front_path']), png, operation=operation, output_paths=reserved)
     composite = Path(link['composite_path'])
     combined = reassemble(png, composite, link['split'], link['layout'])
-    outputs = file_accepted(Path(record['front_path']), png, composite, combined, operation=operation)
+    outputs = file_accepted(Path(record['front_path']), png, composite, combined, operation=operation,
+                            output_paths=reserved)
     try:
         approve_link(outputs[0], outputs[1], link['split'], link['layout'])
     except (OSError, ValueError) as error:

@@ -94,6 +94,8 @@
 .chatgpt-pending-list{display:grid;gap:5px;max-height:260px;overflow-y:auto}
 .chatgpt-pending-list button{width:100%;border:1px solid #34454b;border-radius:7px;background:#19272e;color:#dceae9;text-align:left;padding:8px;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chatgpt-pending-list button:hover,.chatgpt-pending-list button.active{border-color:#73dec9;background:#214039}
+.recovered-item{border:1px solid #34454b;border-radius:7px;background:#19272e;color:#dceae9;padding:8px;font-size:11px;display:grid;gap:6px}
+.recovered-item .recovered-notes{margin:0;color:#c9d6db;line-height:1.4}
 #chatgpt-workspace{min-width:0;overflow:hidden}#chatgpt-workspace .enhance-preview-shell{min-width:0;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
 .app-settings-dialog,#first-run-dialog{background:#121a20;color:#ebf0f3;border:1px solid #41535e;border-radius:14px;width:min(520px,94vw);max-height:88vh;overflow:auto;padding:22px}
 .app-settings-dialog::backdrop,#first-run-dialog::backdrop{background:#000a}

@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
 const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
-state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], review: null, busy: false, total: 0, completed: 0, stop: false };
+state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
   noise: { title: 'Noise reduction', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Measures fine grain and colour speckles in each photo. It skips clearer photos and uses a limited, detail-preserving correction where noise is present.' },
@@ -104,6 +104,24 @@ let cropPreviewRequest = 0;
 function toast(message, error = false) {
   const element = $('toast'); element.textContent = message; element.classList.toggle('error', error); element.classList.add('show');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => element.classList.remove('show'), 4200);
+}
+function offerChooseOutputFolder(error) {
+  if (error?.code !== 'permission_denied') return false;
+  const detail = error.message || 'Cropper cannot write to this location.';
+  if ($('save-error-detail')) $('save-error-detail').textContent = detail;
+  $('save-error')?.classList.remove('hidden');
+  if ($('output-permission-detail')) $('output-permission-detail').textContent = detail;
+  $('output-permission')?.classList.remove('hidden');
+  return true;
+}
+async function setOutputFolder(path) {
+  try {
+    applyServerSettings(await api('/api/settings', { output_folder: path, guide_seen: true }));
+    if ($('settings-output-folder')) $('settings-output-folder').value = path;
+    $('output-permission')?.classList.add('hidden');
+    $('save-error')?.classList.add('hidden');
+    toast(`Output folder set to ${path}. Try saving again.`);
+  } catch (error) { toast(error.message, true); }
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function url(path, filePath) { return `${path}?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(state.token)}`; }
@@ -228,7 +246,7 @@ async function mergeSave() {
     const result = await api('/api/merge', { front_path: state.images[front].path, back_path: state.images[back].path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
     toast(`Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
-  } catch (error) { toast(error.message, true); }
+  } catch (error) { if (!offerChooseOutputFolder(error)) toast(error.message, true); }
   finally { state.merge.busy = false; renderMerge(); }
 }
 function renderEnhanceControls() {
@@ -301,7 +319,7 @@ async function saveEnhancedBatch() {
     if (state.enhance.stop) break;
     $('enhance-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
     try { const result=await api('/api/enhance', { path, settings: batchSettings }); for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved);archived.add(moved);} saved++; }
-    catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (error.code === 'permission_denied') state.enhance.stop = true; }
+    catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (offerChooseOutputFolder(error)) state.enhance.stop = true; }
     refreshEnhanceTiles(); renderEnhanceControls();
   }
   const stopped = state.enhance.stop;
@@ -436,7 +454,7 @@ async function saveRestorationBatch() {
       }
     } catch (error) {
       failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`);
-      if (error.code === 'permission_denied') state.restore.stop = true;
+      if (offerChooseOutputFolder(error)) state.restore.stop = true;
     }
     refreshRestorationTiles(); renderRestorationControls();
   }
@@ -457,8 +475,8 @@ async function saveRestorationBatch() {
   if (failed.length) toast(failed[0], true); else toast(saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`);
 }
 async function pickFolder(forOutput = false) {
-  state.picker = { path: state.folder || state.home, parent: null };
-  $('folder-modal-title').textContent = 'Choose image folder';
+  state.picker = { path: ($('settings-output-folder')?.value || state.folder || state.home), parent: null, forOutput };
+  $('folder-modal-title').textContent = forOutput ? 'Choose another output folder' : 'Choose image folder';
   $('folder-modal').classList.remove('hidden');
   $('folder-modal-list').replaceChildren();
   $('folder-modal-message').textContent = 'Loading folders…';
@@ -495,7 +513,8 @@ async function loadPickerFolder(path) {
 function closePicker() { state.picker = null; ++state.pickerRequest; $('folder-modal').classList.add('hidden'); }
 async function selectPickerFolder() {
   if (!state.picker) return;
-  const { path } = state.picker; closePicker();
+  const { path, forOutput } = state.picker; closePicker();
+  if (forOutput) { await setOutputFolder(path); return; }
   await loadFolder(path);
 }
 async function loadFolder(path, preserve = false) {
@@ -712,10 +731,7 @@ async function cropSave() {
     else if (settings.autoNext) toast(`Batch complete. Saved ${result.name}.`);
     else { state.points = []; state.rotation = 0; renderOverlay(); }
   } catch (error) {
-    if (error.code === 'permission_denied') {
-      $('save-error-detail').textContent = error.message;
-      $('save-error').classList.remove('hidden');
-    } else toast(error.message,true);
+    if (!offerChooseOutputFolder(error)) toast(error.message,true);
   }
   finally { state.busy = false; updateControls(); }
 }
@@ -847,6 +863,49 @@ function updateChatgptControls() {
   $('chatgpt-reject').classList.toggle('hidden', !current.review);
   $('chatgpt-accept').disabled = reviewLocked;
   $('chatgpt-reject').disabled = reviewLocked;
+  const otherAttempts = current.review ? current.pending.filter(item => item.front_path === current.review.front_path && item.id !== current.review.id).length : 0;
+  $('chatgpt-accept').textContent = otherAttempts === 1 ? 'Accept this version and discard the other 1 attempt'
+    : otherAttempts > 1 ? `Accept this version and discard the other ${otherAttempts} attempts`
+    : 'Accept and file result';
+  const recovered = current.recovered || [];
+  $('chatgpt-recovered')?.classList.toggle('hidden', !recovered.length);
+  if ($('chatgpt-recovered-count')) $('chatgpt-recovered-count').textContent = recovered.length;
+  const recoveredList = $('chatgpt-recovered-list');
+  if (recoveredList?.replaceChildren) {
+    recoveredList.replaceChildren();
+    for (const item of recovered) {
+      const row = document.createElement('div');
+      row.className = 'recovered-item';
+      const title = document.createElement('div');
+      const name = (item.front_path || item.id).split(/[\\/]/).pop();
+      title.textContent = item.image_readable
+        ? `${name} · ${item.reason}`
+        : `${name} · damaged · ${item.reason}`;
+      row.append(title);
+      if (item.notes?.length) {
+        const notes = document.createElement('p');
+        notes.className = 'recovered-notes';
+        notes.textContent = item.notes.join(' / ');
+        row.append(notes);
+      }
+      const actions = document.createElement('div');
+      actions.className = 'chatgpt-zoom-tools';
+      if (item.can_keep) {
+        const keep = document.createElement('button');
+        keep.className = 'button button-quiet';
+        keep.textContent = 'Keep';
+        keep.addEventListener('click', () => resolveRecovered(item, true));
+        actions.append(keep);
+      }
+      const discard = document.createElement('button');
+      discard.className = 'button button-quiet';
+      discard.textContent = 'Discard';
+      discard.addEventListener('click', () => resolveRecovered(item, false));
+      actions.append(discard);
+      row.append(actions);
+      recoveredList.append(row);
+    }
+  }
   $('chatgpt-review-actions').classList.toggle('hidden', !current.review);
   $('chatgpt-modify').disabled = reviewLocked;
   $('chatgpt-modify').setAttribute('aria-expanded', String(!!current.review && !!current.correctionOpen));
@@ -897,6 +956,7 @@ async function refreshChatgptPending() {
   try {
     const response = await api(`/api/chatgpt-pending?path=${encodeURIComponent(state.folder)}`);
     state.chatgpt.pending = response.items.filter(item=>(item.operation || 'restore')===chatgptOperation);
+    state.chatgpt.recovered = response.recovered || [];
     try { photoLinks = (await api(`/api/photo-links?path=${encodeURIComponent(state.folder)}`)).links; renderPhotoLinks(); }
     catch (_) { photoLinks = []; renderPhotoLinks(); }
     if(chatgptOperation==='colorize' && colorScanFolder!==state.folder && !colorScanning) scanColorCandidates();
@@ -995,7 +1055,7 @@ async function generateChatgpt(selection = state.chatgpt.selected) {
       (active, path, cooling) => {
         if (!current.preview) { current.preview = path; showChatgptPreview(); renderImages(); }
         $('chatgpt-progress').textContent = `${current.completed} of ${current.total} saved locally · ${current.failures.size} failed · ${active} active · ${current.stop ? 'Stopping; active requests will finish' : cooling ? 'Rate limited; waiting before retry' : `Up to ${concurrency} parallel requests`}`;
-      }, undefined, concurrency, (path, error) => { current.failures.set(path, error.message); updateChatgptControls(); });
+      }, undefined, concurrency, (path, error) => { current.failures.set(path, error.message); if (typeof offerChooseOutputFolder === 'function') offerChooseOutputFolder(error); updateChatgptControls(); });
     const generated = current.completed, planned = current.total, stopped = current.stop;
     allGenerated += generated; allPlanned += planned;
     current.batchPaths = null;
@@ -1031,6 +1091,14 @@ function retryFailedChatgpt() {
   for (const path of paths) current.selected.add(path);
   generateChatgpt(paths);
 }
+async function resolveRecovered(item, keep) {
+  try {
+    await api(keep ? '/api/chatgpt-recovered-keep' : '/api/chatgpt-recovered-discard', { id: item.id });
+    toast(keep ? 'Recovered result kept for review.' : 'Recovered result discarded.');
+    await refreshChatgptPending();
+    showChatgptPreview();
+  } catch (error) { toast(error.message, true); }
+}
 async function finishChatgpt(accept) {
   const current = state.chatgpt;
   if (!current.review || current.reviewBusy || current.resubmissions?.has(current.review.front_path)) return;
@@ -1054,7 +1122,7 @@ async function finishChatgpt(accept) {
     else { current.preview = [...current.selected][0] || null; showChatgptPreview(); }
     renderImages(); updateChatgptControls();
     if (!current.busy) $('chatgpt-progress').textContent = accept ? 'Accepted: PNG filed and original archived. Review the next pending image when ready.' : 'Rejected: original untouched. Review the next pending image when ready.';
-  } catch (error) { toast(error.message, true); if (!current.busy) $('chatgpt-progress').textContent = error.message; }
+  } catch (error) { if (typeof offerChooseOutputFolder !== 'function' || !offerChooseOutputFolder(error)) toast(error.message, true); if (!current.busy) $('chatgpt-progress').textContent = error.message; }
   finally { current.reviewBusy = false; updateChatgptControls(); }
 }
 function confirmChatgptResubmit(reviewed, comment, includePrevious) {
@@ -1267,6 +1335,16 @@ function wire() {
   $('settings-save').addEventListener('click', saveAppSettings);
   $('settings-test-key').addEventListener('click', testAppKey);
   $('settings-clear-key').addEventListener('click', clearAppKey);
+  $('settings-output-browse')?.addEventListener('click', () => pickFolder(true));
+  $('choose-output-folder')?.addEventListener('click', () => pickFolder(true));
+  $('save-choose-output')?.addEventListener('click', () => pickFolder(true));
+  $('settings-filename-template')?.addEventListener('input', updateFilenamePreview);
+  $('settings-backup-originals')?.addEventListener('change', () => {
+    if (!$('settings-backup-originals').checked) $('settings-replace-original').checked = false;
+  });
+  $('settings-replace-original')?.addEventListener('change', () => {
+    if ($('settings-replace-original').checked) $('settings-backup-originals').checked = true;
+  });
   $('first-run-dialog').addEventListener('close', () => {
     api('/api/settings', {guide_seen: true}).catch(() => {});
     if ($('first-run-dialog').returnValue === 'settings') openAppSettings();
@@ -1406,11 +1484,30 @@ function wire() {
   new ResizeObserver(drawBrushCanvas).observe($('restore-before-wrap'));
   updateStageRoutingDisplay();updateControls();
 }
+function updateFilenamePreview() {
+  const template = $('settings-filename-template')?.value.trim() || '{name}{suffix}{ext}';
+  const preview = $('settings-filename-preview');
+  if (!preview) return;
+  try {
+    const sample = template.replaceAll('{name}', 'photo').replaceAll('{date}', '20261029').replaceAll('{index}', '1').replaceAll('{ext}', '.png').replaceAll('{suffix}', '_c');
+    if (!sample || /[<>:"/\\|?*\x00-\x1f]/.test(sample) || sample.includes('/') || sample.includes('\\')) {
+      preview.textContent = 'Filename template produces invalid characters.';
+      return;
+    }
+    preview.textContent = `Preview: ${sample}`;
+  } catch (_) { preview.textContent = 'Filename template supports {name}, {date}, {index} and {ext}.'; }
+}
 function applyServerSettings(data) {
   state.hasKey = data.has_key !== false;
   state.keySource = data.key_source;
   if ($('settings-model')) $('settings-model').value = data.model || 'gpt-image-2.5-sunburst';
   if ($('settings-quality')) $('settings-quality').value = data.quality || 'medium';
+  if ($('settings-filename-template')) $('settings-filename-template').value = data.filename_template || '{name}{suffix}{ext}';
+  if ($('settings-conflict-policy')) $('settings-conflict-policy').value = data.conflict_policy || 'skip';
+  if ($('settings-replace-original')) $('settings-replace-original').checked = !!data.replace_original;
+  if ($('settings-backup-originals')) $('settings-backup-originals').checked = data.backup_originals !== false;
+  if ($('settings-output-folder')) $('settings-output-folder').value = data.output_folder || '';
+  updateFilenamePreview();
   const env = data.key_source === 'env';
   if ($('settings-api-key')) {
     $('settings-api-key').value = '';
@@ -1436,7 +1533,16 @@ async function openAppSettings() {
   catch (_) { $('app-settings-dialog').setAttribute('open', ''); }
 }
 async function saveAppSettings() {
-  const payload = { model: $('settings-model').value.trim(), quality: $('settings-quality').value, guide_seen: true };
+  const payload = {
+    model: $('settings-model').value.trim(),
+    quality: $('settings-quality').value,
+    guide_seen: true,
+    filename_template: $('settings-filename-template')?.value.trim() || '{name}{suffix}{ext}',
+    conflict_policy: $('settings-conflict-policy')?.value || 'skip',
+    replace_original: !!$('settings-replace-original')?.checked,
+    backup_originals: $('settings-backup-originals') ? $('settings-backup-originals').checked : true,
+    output_folder: $('settings-output-folder')?.value.trim() || '',
+  };
   const typed = $('settings-api-key').value.trim();
   if (typed) payload.api_key = typed;
   try {

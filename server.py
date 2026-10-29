@@ -25,7 +25,10 @@ from PIL import Image, ImageOps
 from enhance import auto_enhance
 from chatgpt_restore import edit_front, file_accepted
 from image_api_errors import image_api_error
-from chatgpt_pending import get_pending, list_pending, remove_pending, save_pending, attach_link, set_operation
+from chatgpt_pending import (
+    attach_link, discard_recovered, get_pending, keep_recovered, list_pending,
+    list_recovered, remove_pending, reserved_from_record, save_pending, set_operation,
+)
 from colorize import candidates
 from photo_pairs import read_links, approve_link, suggestions, accept_linked
 from restore import OPERATIONS, preview_dust_marks, restore, useful_change
@@ -398,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                 folder = clean_path(query.get("path", [""])[0])
                 if not folder.is_dir():
                     raise ValueError("Folder not found.")
-                self.json(200, {"items": list_pending(folder)})
+                self.json(200, {"items": list_pending(folder), "recovered": list_recovered()})
                 return
             if parsed.path == "/api/folders":
                 self.json(200, folder_listing(query.get("path", [""])[0]))
@@ -602,20 +605,27 @@ class Handler(BaseHTTPRequestHandler):
                 if any(item['composite_path'] == str(front) for item in links):
                     raise ValueError('This is a linked combined image. Select its standalone front or use Generate selected pairs.')
                 link = next((item for item in links if item['front_path'] == str(front)), None)
-                if link:
-                    composite = image_path(link['composite_path'])
+                composite = image_path(link['composite_path']) if link else None
+                if composite is not None:
                     stage_files.plan(composite, operation)
                 if any(item["front_path"] == str(front) for item in list_pending(front.parent)):
                     raise ValueError("This photo already has a pending AI result. Review it before generating another.")
+                plans = stage_files.prepare_ai_plans(front, operation, composite)
+                reserved = [item['output'] for item in plans if item.get('output') is not None]
                 try:
-                    front_png = edit_front(front,operation=operation) if operation=='colorize' else edit_front(front)
+                    front_png = edit_front(front, operation=operation)
                 except Exception as exc:
+                    stage_files.release_outputs(reserved)
                     self.json(*image_api_error(exc))
                     return
-                staged = save_pending(front, front_png, stage_routing=True)
-                if operation=='colorize': staged=set_operation(staged['id'],operation)
-                link = next((item for item in read_links(front.parent) if item['front_path'] == str(front)), None)
-                if link: staged = attach_link(staged['id'], link)
+                try:
+                    staged = save_pending(front, front_png, stage_routing=True, operation=operation,
+                                          output_paths=reserved)
+                    if link:
+                        staged = attach_link(staged['id'], link)
+                except Exception:
+                    stage_files.release_outputs(reserved)
+                    raise
                 self.json(200, staged)
                 return
             if self.path == '/api/chatgpt-resubmit':
@@ -649,7 +659,9 @@ class Handler(BaseHTTPRequestHandler):
                                 'attempt': record.get('attempt', 1) + 1, 'comments': comments,
                                 'included_previous': include_previous}
                     if record.get('link'): revision['link'] = record['link']
-                    staged = save_pending(front, result, stage_routing=True, revision=revision)
+                    if record.get('output_path'): revision['output_path'] = record['output_path']
+                    if record.get('output_paths'): revision['output_paths'] = record['output_paths']
+                    staged = save_pending(front, result, stage_routing=True, operation=operation, revision=revision)
                     self.json(200, staged)
                 return
             if self.path in {"/api/chatgpt-accept", "/api/chatgpt-reject"}:
@@ -663,8 +675,22 @@ class Handler(BaseHTTPRequestHandler):
                         # Only one attempt can be filed for a source; discard unchosen variants after success.
                         removed = [item['id'] for item in list_pending(Path(record['front_path']).parent)
                                    if item['front_path'] == record['front_path']]
-                    for ident in removed: remove_pending(ident)
+                    held = []
+                    for ident in removed:
+                        try:
+                            held.extend(reserved_from_record(get_pending(ident)[0]))
+                        except (ValueError, OSError, json.JSONDecodeError):
+                            pass
+                        remove_pending(ident)
+                    stage_files.release_outputs(held)
                     self.json(200, {"paths": [str(path) for path in outputs], 'removed_ids': removed})
+                return
+            if self.path == "/api/chatgpt-recovered-keep":
+                self.json(200, keep_recovered(data.get("id", "")))
+                return
+            if self.path == "/api/chatgpt-recovered-discard":
+                discard_recovered(data.get("id", ""))
+                self.json(200, {"removed": True})
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
@@ -678,17 +704,31 @@ class LocalServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
+def resolve_port(cli_port: int | None) -> int:
+    """CLI --port wins; otherwise CROPPER_PORT; otherwise 8765."""
+    if cli_port is not None:
+        return int(cli_port)
+    raw = os.environ.get("CROPPER_PORT", "").strip()
+    if not raw:
+        return 8765
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError("CROPPER_PORT must be an integer port.") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Cropper locally")
-    parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+    parser.add_argument("--port", type=int, default=None, help="Port (default: CROPPER_PORT or 8765)")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--data-dir", default=None, help="Per-user data folder (default: %%APPDATA%%/Cropper)")
     args = parser.parse_args()
     app_settings.configure_runtime(args.data_dir)
+    port = resolve_port(args.port)
     try:
-        server = LocalServer(("127.0.0.1", args.port), Handler)
+        server = LocalServer(("127.0.0.1", port), Handler)
     except OSError:
-        address = f"http://127.0.0.1:{args.port}"
+        address = f"http://127.0.0.1:{port}"
         try:
             with urlopen(address + "/api/session", timeout=1) as response:
                 active = json.load(response).get("app") == "Cropper"

@@ -17,6 +17,13 @@ def png(colour='red'):
 
 
 class StageFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.data = TemporaryDirectory()
+        self.addCleanup(self.data.cleanup)
+        import app_settings
+        app_settings.configure_runtime(self.data.name)
+        self.addCleanup(lambda: setattr(app_settings, '_data_dir', None))
+
     def source(self, root, folder, name='photo_c.png'):
         source = root / folder / name
         source.parent.mkdir(parents=True, exist_ok=True)

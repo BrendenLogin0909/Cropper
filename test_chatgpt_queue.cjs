@@ -64,7 +64,7 @@ test('accept during generation leaves generation running and keeps newly saved r
   const finish = vm.runInNewContext(source.slice(source.indexOf('async function finishChatgpt('), source.indexOf('function renderPhotoLinks()')) + '\nfinishChatgpt', {
     state, api:async () => {current.pending.push({id:'second', front_path:'second.png'});},
     $:() => ({}), selectedPairs:new Set(), renderPhotoLinks:() => {}, updateChatgptControls:() => {}, renderImages:() => {}, showChatgptPreview:() => {},
-    reviewChatgptItem:item => {current.review=item;}, toast:() => {}
+    reviewChatgptItem:item => {current.review=item;}, toast:() => {}, offerChooseOutputFolder:() => false
   });
   await finish(true);
   assert.equal(current.busy, true); assert.equal(current.reviewBusy, false);
@@ -167,6 +167,7 @@ test('photos selected during generation wait for the next paid batch', async () 
   const started=new Promise(resolve=>{firstStarted=resolve;});
   const context={state,photoLinks:[],colorEligible:()=>true,colorScanning:false,chatgptOperation:'restore',colorScanFolder:'photos',chatgptConcurrency:1,stageRoutingEnabled:()=>true,
     $:()=>({textContent:''}),renderImages:()=>{},updateChatgptControls:()=>{},showChatgptPreview:()=>{},toast:()=>{},
+    offerChooseOutputFolder:()=>false,
     reviewChatgptItem:item=>{current.review=item;},
     api:async (endpoint,body)=>{calls.push(body.front_path);if(body.front_path==='a'){firstStarted();await firstGate;}return {id:body.front_path,front_path:body.front_path};},
     runChatgptQueue:async (paths,batch,request,saved)=>{for(const path of paths)saved(await request(path),path);return '';}};

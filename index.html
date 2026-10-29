@@ -135,7 +135,7 @@
         <div class="settings-spacer"></div>
         <label class="toggle-line"><input type="checkbox" id="auto-next" checked><span class="switch"></span><span>Move to next image after saving</span></label>
         <button class="button button-primary save-button" id="save" disabled><span>Crop &amp; save</span><span>↗</span></button>
-        <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p></div>
+        <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p><button id="save-choose-output" class="button button-quiet">Choose another output folder</button></div>
         <div class="save-hint" id="save-hint">Select four corners to enable saving</div>
       </aside>
       <aside class="settings panel hidden" id="enhance-settings">
@@ -192,6 +192,11 @@
         <div class="settings-spacer"></div>
         <button class="button button-primary save-button" id="chatgpt-generate" disabled><span>Generate selected photos (paid)</span><span>✦</span></button>
         <button class="button button-quiet stage-finish-button" id="chatgpt-finish" disabled>Finish selected — no further changes</button>
+        <section id="chatgpt-recovered" class="settings-group hidden" aria-label="Recovered results">
+          <div class="section-label">RECOVERED RESULTS <span id="chatgpt-recovered-count">0</span></div>
+          <p class="aspect-note">These files were found on disk and were not deleted. Readable images can be kept or discarded. Damaged images can only be discarded. Guidance notes stay with Keep and are deleted with Discard.</p>
+          <div id="chatgpt-recovered-list" class="chatgpt-pending-list"></div>
+        </section>
         <div id="chatgpt-review-actions" class="hidden">
           <button class="button button-primary hidden" id="chatgpt-accept">Accept and file result</button>
           <div class="chatgpt-secondary-actions">
@@ -246,6 +251,21 @@
           <option value="high">High — about 20c per photo</option>
         </select>
       </label>
+      <label class="field"><span>Filename template</span><input id="settings-filename-template" spellcheck="false" value="{name}{suffix}{ext}"></label>
+      <p id="settings-filename-preview" class="aspect-note">Preview: photo_c.png</p>
+      <p class="aspect-note">Tokens: {name}, {date}, {index}, {ext}. Suffixes stay _c, _e, _ai, _col. Invalid characters are rejected.</p>
+      <label class="field"><span>If the output name already exists</span>
+        <select id="settings-conflict-policy">
+          <option value="skip" selected>Skip — keep the existing file</option>
+          <option value="overwrite">Overwrite</option>
+          <option value="auto-suffix">Auto-suffix</option>
+        </select>
+      </label>
+      <label class="toggle-line"><input type="checkbox" id="settings-backup-originals" checked><span class="switch"></span><span>Backup originals before Replace original</span></label>
+      <label class="toggle-line"><input type="checkbox" id="settings-replace-original"><span class="switch"></span><span>Replace original (requires backups)</span></label>
+      <label class="field"><span>Output folder override</span>
+        <span class="browse-field"><input id="settings-output-folder" spellcheck="false" placeholder="Leave blank to use the batch stage folders"><button type="button" id="settings-output-browse" class="button button-quiet">Browse…</button></span>
+      </label>
     </div>
     <div class="chatgpt-zoom-tools"><button id="settings-save" class="button button-primary">Save settings</button></div>
   </dialog>
@@ -256,6 +276,11 @@
     <p>3. Saves use the flat stage folders next to your batch.</p>
     <form method="dialog"><button class="button button-quiet" value="skip">Skip</button><button class="button button-primary" id="first-run-settings" value="settings">Open Settings</button></form>
   </dialog>
+  <div id="output-permission" class="save-error hidden" role="alert" style="position:fixed;right:18px;bottom:18px;z-index:25;max-width:360px">
+    <strong>Could not write files</strong>
+    <p id="output-permission-detail"></p>
+    <button id="choose-output-folder" class="button button-quiet">Choose another output folder</button>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>

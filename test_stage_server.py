@@ -9,6 +9,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from PIL import Image
+import app_settings
 import server
 import chatgpt_pending
 import photo_pairs
@@ -20,14 +21,19 @@ class StageServerTests(unittest.TestCase):
         self.stack=ExitStack(); self.addCleanup(self.stack.close)
         self.root=Path(self.stack.enter_context(TemporaryDirectory()))
         self.pending=self.root/'pending'
+        app_settings.configure_runtime(self.root)
+        self.addCleanup(lambda: setattr(app_settings, '_data_dir', None))
         stream=io.BytesIO();Image.new('RGB',(8,8),'blue').save(stream,'PNG');self.png=stream.getvalue()
         self.stack.enter_context(patch.object(photo_pairs,'ROOT',self.root/'links'))
         self.edit=self.stack.enter_context(patch.object(server,'edit_front',return_value=self.png))
         self.stack.enter_context(patch.object(server,'save_pending',side_effect=lambda source,png,**kwargs:chatgpt_pending.save_pending(source,png,self.pending,**kwargs)))
         self.stack.enter_context(patch.object(server,'get_pending',side_effect=lambda ident:chatgpt_pending.get_pending(ident,self.pending)))
         self.stack.enter_context(patch.object(server,'list_pending',side_effect=lambda folder:chatgpt_pending.list_pending(folder,self.pending)))
+        self.stack.enter_context(patch.object(server,'list_recovered',side_effect=lambda:chatgpt_pending.list_recovered(self.pending)))
         self.stack.enter_context(patch.object(server,'remove_pending',side_effect=lambda ident:chatgpt_pending.remove_pending(ident,self.pending)))
         self.stack.enter_context(patch.object(server,'attach_link',side_effect=lambda ident,link:chatgpt_pending.attach_link(ident,link,self.pending)))
+        self.stack.enter_context(patch.object(server,'keep_recovered',side_effect=lambda ident:chatgpt_pending.keep_recovered(ident,self.pending)))
+        self.stack.enter_context(patch.object(server,'discard_recovered',side_effect=lambda ident:chatgpt_pending.discard_recovered(ident,self.pending)))
         self.http=server.LocalServer(('127.0.0.1',0),server.Handler)
         threading.Thread(target=self.http.serve_forever,daemon=True).start()
         self.addCleanup(self.stop_server)
