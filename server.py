@@ -10,6 +10,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 import warnings
 import app_settings
@@ -45,6 +46,9 @@ REVIEW_LOCKS = {}
 REVIEW_LOCKS_GUARD = threading.Lock()
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 GPS_IFD = 0x8825
+CONFIRMATION_TTL_SECONDS = 15 * 60
+CONFIRMATIONS: dict[str, dict] = {}
+CONFIRMATIONS_LOCK = threading.Lock()
 
 
 def hostname_of(host_header: str) -> str:
@@ -358,60 +362,138 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
     return destination, restored.size, changes, planned['snapshots'][0]
 
 
-def _matching_batch_ack(payload: dict, plans: list[dict], *flags: str) -> bool:
-    """True only when a client flag is bound to this batch's id. Unknown/mismatch fail."""
-    given = str(payload.get("batch_id") or "")
-    if not given:
-        return False
-    if given != stage_files.batch_id_for(plans):
-        return False
-    return any(payload.get(flag) for flag in flags)
+def reset_confirmations() -> None:
+    """Drop in-memory overwrite/replace tokens. Restarts empty this store."""
+    with CONFIRMATIONS_LOCK:
+        CONFIRMATIONS.clear()
 
 
-def overwrite_response(plans: list[dict], data: dict | None) -> dict | None:
+def _purge_confirmations_locked(now: float | None = None) -> None:
+    stamp = time.time() if now is None else now
+    expired = [token for token, record in CONFIRMATIONS.items() if record["expires"] <= stamp]
+    for token in expired:
+        CONFIRMATIONS.pop(token, None)
+
+
+def _target_keys(paths: list[Path]) -> frozenset[str]:
+    return frozenset(stage_files.path_key(path) for path in paths)
+
+
+def _batch_key(plans: list[dict]) -> str:
+    return "\n".join(sorted({stage_files.path_key(stage_files.plan_root(item)) for item in plans}))
+
+
+def _session_matches(stored: str, session: str) -> bool:
+    if not stored or not session or len(stored) != len(session):
+        return False
+    return secrets.compare_digest(stored, session)
+
+
+def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
+                      now: float | None = None) -> dict | None:
+    """Return a live same-session record, or None. Does not check target coverage."""
+    if not token:
+        return None
+    stamp = time.time() if now is None else now
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked(stamp)
+        record = CONFIRMATIONS.get(token)
+        if record is None:
+            return None
+        if record["kind"] != kind or not _session_matches(record["session"], session):
+            return None
+        if record["expires"] <= stamp:
+            CONFIRMATIONS.pop(token, None)
+            return None
+        if record["batch"] != _batch_key(plans):
+            return None
+        return record
+
+
+def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
+                       session: str | None = None, payload: dict | None = None) -> str:
+    """Mint a random in-memory token bound to this session, batch, and targets."""
+    session = session or TOKEN
+    covered = set(_target_keys(targets))
+    previous = str((payload or {}).get("confirmation_token") or "")
+    inherited = _record_for_token(previous, kind, plans, session)
+    if inherited:
+        covered |= set(inherited["targets"])
+    token = secrets.token_urlsafe(32)
+    record = {
+        "kind": kind,
+        "session": session,
+        "batch": _batch_key(plans),
+        "targets": frozenset(covered),
+        "expires": time.time() + CONFIRMATION_TTL_SECONDS,
+    }
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        CONFIRMATIONS[token] = record
+    return token
+
+
+def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: list[Path],
+                        session: str | None = None) -> bool:
+    """True only for a live token from this session that covers every current target."""
+    flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
+    if not any(payload.get(flag) for flag in flags):
+        return False
+    token = str(payload.get("confirmation_token") or "")
+    session = session or TOKEN
+    record = _record_for_token(token, kind, plans, session)
+    if record is None:
+        return False
+    return _target_keys(targets) <= record["targets"]
+
+
+def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
     """Return a 409 payload when this batch would overwrite and has not been confirmed."""
     payload = data if isinstance(data, dict) else {}
     targets = stage_files.planned_overwrites(plans)
     if not targets:
         return None
-    if _matching_batch_ack(payload, plans, "confirm_overwrite", "skip_overwrite_prompt"):
+    session = session or TOKEN
+    if confirmation_allows("overwrite", payload, plans, targets, session):
         return None
     return {
         "code": "overwrite_confirmation_required",
         "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "batch_id": stage_files.batch_id_for(plans),
+        "confirmation_token": issue_confirmation("overwrite", plans, targets, session, payload),
     }
 
 
-def replace_response(plans: list[dict], data: dict | None) -> dict | None:
+def replace_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
     """Return a 409 payload when Replace original has not been confirmed for this batch."""
     payload = data if isinstance(data, dict) else {}
     targets = stage_files.planned_replaces(plans)
     if not targets:
         return None
-    if _matching_batch_ack(payload, plans, "confirm_replace"):
+    session = session or TOKEN
+    if confirmation_allows("replace", payload, plans, targets, session):
         return None
     return {
         "code": "replace_confirmation_required",
         "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "batch_id": stage_files.batch_id_for(plans),
+        "confirmation_token": issue_confirmation("replace", plans, targets, session, payload),
     }
 
 
-def confirmation_response(plans: list[dict], data: dict | None) -> dict | None:
+def confirmation_response(plans: list[dict], data: dict | None, session: str | None = None) -> dict | None:
     """Replace original is independent of Skip/Overwrite/Auto-suffix."""
-    return replace_response(plans, data) or overwrite_response(plans, data)
+    session = session or TOKEN
+    return replace_response(plans, data, session) or overwrite_response(plans, data, session)
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Cropper/1.0"
 
     def log_message(self, format: str, *args) -> None:
-        # Never log query strings or request bodies (keys, notes, settings).
+        # Never log query strings, request bodies, or confirmation tokens.
         path = urlparse(getattr(self, "path", "") or "").path or "-"
         command = getattr(self, "command", None) or "-"
         print("%s - \"%s %s\"" % (self.address_string(), command, path))
@@ -597,15 +679,19 @@ class Handler(BaseHTTPRequestHandler):
                 plans = stage_files.plan_many(paths, operation)
                 targets = stage_files.planned_overwrites(plans)
                 replaces = stage_files.planned_replaces(plans)
-                self.json(200, {
+                body = {
                     "count": len(targets),
                     "names": [path.name for path in targets],
                     "paths": [str(path) for path in targets],
-                    "batch_id": stage_files.batch_id_for(plans),
                     "replace_count": len(replaces),
                     "replace_names": [path.name for path in replaces],
                     "replace_paths": [str(path) for path in replaces],
-                })
+                }
+                if targets:
+                    body["confirmation_token"] = issue_confirmation("overwrite", plans, targets)
+                if replaces:
+                    body["replace_confirmation_token"] = issue_confirmation("replace", plans, replaces)
+                self.json(200, body)
                 return
             if self.path == "/api/crop":
                 path = image_path(data.get("path", ""))
