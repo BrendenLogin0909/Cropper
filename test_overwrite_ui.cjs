@@ -98,13 +98,26 @@ function startServer(python, dataDir) {
   });
 }
 
-function loadCropClient({ base, token, els, skipChecked }) {
-  const start = app.indexOf('const batchPromptState');
+function loadCropClient({ base, token, els, skipChecked, overwriteReturn = 'overwrite', tab }) {
+  const start = app.indexOf('function tabId()');
   const end = app.indexOf('\nfunction saveSettings()');
   const exported = {};
-  const dialogOpens = { overwrite: 0 };
+  const dialogOpens = { overwrite: 0, replace: 0 };
+  const storage = tab ? { 'cropper-tab-id': tab } : {};
   const context = {
     Promise,
+    Uint8Array,
+    Array,
+    sessionStorage: {
+      getItem(key) { return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : null; },
+      setItem(key, value) { storage[key] = String(value); },
+    },
+    crypto: {
+      getRandomValues(bytes) {
+        for (let i = 0; i < bytes.length; i += 1) bytes[i] = (i * 17 + 11) % 256;
+        return bytes;
+      },
+    },
     fetch: (resource, opts) => globalThis.fetch(base + resource, opts),
     state: { token, stageRoutingAvailable: true },
     exported,
@@ -116,8 +129,14 @@ function loadCropClient({ base, token, els, skipChecked }) {
         showModal() {
           if (id === 'overwrite-dialog') {
             dialogOpens.overwrite += 1;
-            this.returnValue = 'overwrite';
-            if (skipChecked && els['overwrite-skip-batch']) els['overwrite-skip-batch'].checked = true;
+            this.returnValue = overwriteReturn;
+            if (overwriteReturn === 'overwrite' && skipChecked && els['overwrite-skip-batch']) {
+              els['overwrite-skip-batch'].checked = true;
+            }
+          }
+          if (id === 'replace-dialog') {
+            dialogOpens.replace += 1;
+            this.returnValue = 'replace';
           }
           queueMicrotask(() => { if (this._close) this._close(); });
         },
@@ -131,7 +150,8 @@ function loadCropClient({ base, token, els, skipChecked }) {
     `${app.slice(start, end)}
 exported.api = api;
 exported.ensureOverwriteConfirmed = ensureOverwriteConfirmed;
-exported.batchPromptState = batchPromptState;`,
+exported.batchPromptState = batchPromptState;
+exported.tabId = tabId;`,
     context,
   );
   exported.dialogOpens = dialogOpens;
@@ -154,6 +174,10 @@ test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(app, /overwrite_confirmation_required/);
   assert.match(app, /replace_confirmation_required/);
   assert.match(app, /confirm_replace/);
+  assert.match(app, /crypto\.getRandomValues/);
+  assert.match(app, /sessionStorage/);
+  assert.match(app, /X-Cropper-Tab/);
+  assert.match(app, /\/api\/tab-register/);
   assert.doesNotMatch(app, /overwriteSession/);
   assert.doesNotMatch(app, /skip_overwrite_prompt: true \}/);
 });
@@ -208,41 +232,144 @@ test('replace original is remembered once per issued token', async () => {
   assert.equal(helpers.hasReplaceAck('other-token'), false);
 });
 
-test('crop through the overwrite dialog overwrites the existing file', async () => {
-  const python = pythonBin();
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-'));
-  const batch = path.join(dataDir, 'batch');
+function writeBatchPhotos(python, batch, names) {
   execFileSync(python, ['-c', `
 from pathlib import Path
 from PIL import Image
 root = Path(${JSON.stringify(batch)})
 root.mkdir(parents=True, exist_ok=True)
-Image.new('RGB', (16, 16), 'red').save(root / 'photo.png')
 out = root / '1.5. TBP Cropped'
 out.mkdir(parents=True, exist_ok=True)
-Image.new('RGB', (16, 16), 'gray').save(out / 'photo_c.png')
+for name in ${JSON.stringify(names)}:
+    Image.new('RGB', (16, 16), 'red').save(root / f'{name}.png')
+    Image.new('RGB', (16, 16), 'gray').save(out / f'{name}_c.png')
 `]);
-  const before = fs.readFileSync(path.join(batch, '1.5. TBP Cropped', 'photo_c.png'));
+}
+
+async function startCropSession(python, dataDir, { skipChecked, overwriteReturn, tab }) {
   const { child, base } = await startServer(python, dataDir);
+  const session = await (await fetch(`${base}/api/session`, {
+    headers: { 'X-Cropper-Tab': tab },
+  })).json();
+  const els = {};
+  const client = loadCropClient({
+    base, token: session.token, els, skipChecked, overwriteReturn, tab,
+  });
+  await client.api('/api/settings', {
+    conflict_policy: 'overwrite',
+    replace_original: false,
+    filename_template: '{name}{suffix}{ext}',
+  });
+  return { child, base, client, els };
+}
+
+function cropPayload(batch, name) {
+  return {
+    path: path.join(batch, `${name}.png`),
+    points: [[0, 0], [15, 0], [15, 15], [0, 15]],
+    rotation: 0,
+  };
+}
+
+test('crop through the overwrite dialog overwrites the existing file', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo']);
+  const before = fs.readFileSync(path.join(batch, '1.5. TBP Cropped', 'photo_c.png'));
+  const { child, client, els } = await startCropSession(python, dataDir, {
+    skipChecked: true, tab: 'e2e-tab-overwrite-01',
+  });
   try {
-    const session = await (await fetch(`${base}/api/session`)).json();
-    const els = {};
-    const client = loadCropClient({ base, token: session.token, els, skipChecked: true });
-    await client.api('/api/settings', {
-      conflict_policy: 'overwrite',
-      replace_original: false,
-      filename_template: '{name}{suffix}{ext}',
-    });
-    const result = await client.api('/api/crop', {
-      path: path.join(batch, 'photo.png'),
-      points: [[0, 0], [15, 0], [15, 15], [0, 15]],
-      rotation: 0,
-    });
+    const result = await client.api('/api/crop', cropPayload(batch, 'photo'));
     assert.equal(result.name, 'photo_c.png');
     assert.equal(client.dialogOpens.overwrite, 1);
     assert.equal(els['overwrite-dialog-count'].textContent, '1');
     const after = fs.readFileSync(path.join(batch, '1.5. TBP Cropped', 'photo_c.png'));
     assert.notEqual(Buffer.compare(before, after), 0);
+  } finally {
+    child.kill();
+  }
+});
+
+test('overwrite dialog cancel leaves the existing file unchanged', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-cancel-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo']);
+  const before = fs.readFileSync(path.join(batch, '1.5. TBP Cropped', 'photo_c.png'));
+  const { child, client } = await startCropSession(python, dataDir, {
+    skipChecked: false, overwriteReturn: 'cancel', tab: 'e2e-tab-overwrite-02',
+  });
+  try {
+    await assert.rejects(
+      () => client.api('/api/crop', cropPayload(batch, 'photo')),
+      /Overwrite cancelled/,
+    );
+    assert.equal(client.dialogOpens.overwrite, 1);
+    const after = fs.readFileSync(path.join(batch, '1.5. TBP Cropped', 'photo_c.png'));
+    assert.equal(Buffer.compare(before, after), 0);
+  } finally {
+    child.kill();
+  }
+});
+
+test('ticked skip covers a second photo in the same tab and batch', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-skip-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo', 'photo2']);
+  const { child, client } = await startCropSession(python, dataDir, {
+    skipChecked: true, tab: 'e2e-tab-overwrite-03',
+  });
+  try {
+    const first = await client.api('/api/crop', cropPayload(batch, 'photo'));
+    const second = await client.api('/api/crop', cropPayload(batch, 'photo2'));
+    assert.equal(first.name, 'photo_c.png');
+    assert.equal(second.name, 'photo2_c.png');
+    assert.equal(client.dialogOpens.overwrite, 1);
+  } finally {
+    child.kill();
+  }
+});
+
+test('without skip the second photo in the same batch asks again', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-noskip-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo', 'photo2']);
+  const { child, client } = await startCropSession(python, dataDir, {
+    skipChecked: false, tab: 'e2e-tab-overwrite-04',
+  });
+  try {
+    await client.api('/api/crop', cropPayload(batch, 'photo'));
+    await client.api('/api/crop', cropPayload(batch, 'photo2'));
+    assert.equal(client.dialogOpens.overwrite, 2);
+  } finally {
+    child.kill();
+  }
+});
+
+test('another tab cannot reuse a skip grant', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-tab-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo', 'photo2']);
+  const { child, base, client } = await startCropSession(python, dataDir, {
+    skipChecked: true, tab: 'e2e-tab-overwrite-05',
+  });
+  try {
+    await client.api('/api/crop', cropPayload(batch, 'photo'));
+    assert.equal(client.dialogOpens.overwrite, 1);
+    const otherTab = 'e2e-tab-overwrite-06';
+    const session = await (await fetch(`${base}/api/session`, {
+      headers: { 'X-Cropper-Tab': otherTab },
+    })).json();
+    const otherClient = loadCropClient({
+      base, token: session.token, els: {}, skipChecked: true, tab: otherTab,
+    });
+    await otherClient.api('/api/crop', cropPayload(batch, 'photo2'));
+    assert.equal(otherClient.dialogOpens.overwrite, 1);
   } finally {
     child.kill();
   }
