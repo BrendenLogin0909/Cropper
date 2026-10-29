@@ -3,4 +3,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.local
 *.log
+output/
+outputs/
+Output/
+dist/
+build/

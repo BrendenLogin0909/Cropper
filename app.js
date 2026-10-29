@@ -837,7 +837,9 @@ function updateChatgptControls() {
   const eligible = chatgptReadyPaths(current.selected).length;
   const queued = chatgptReadyPaths(current.queuedPaths, true).length;
   $('chatgpt-selection').textContent = `${current.busy ? `${current.completed} of ${current.total} generated · ` : ''}${eligible} selected · ${queued} queued · ${current.pending.length} pending review${current.resubmissions?.size ? ` · ${current.resubmissions.size} modifications running` : ''}`;
-  $('chatgpt-generate').disabled = !(eligible || (!current.busy && queued)) || current.reviewBusy || colorScanning || (colorizing && colorScanFolder!==state.folder);
+  const keyHint = $('chatgpt-key-hint');
+  if (keyHint?.classList) keyHint.classList.toggle('hidden', state.hasKey !== false);
+  $('chatgpt-generate').disabled = !(eligible || (!current.busy && queued)) || current.reviewBusy || colorScanning || (colorizing && colorScanFolder!==state.folder) || state.hasKey === false;
   $('chatgpt-generate').firstElementChild.textContent = current.busy
     ? `Queue ${eligible} for next batch (paid)`
     : `Generate ${eligible + queued} ${eligible + queued === 1 ? 'photo' : 'photos'} (paid)`;
@@ -938,37 +940,26 @@ function renderChatgptFailures() {
   $('chatgpt-failure-count').textContent = failures.size;
   $('chatgpt-failure-list').textContent = [...failures].map(([path, message]) =>
     `${path.split(/[\\/]/).pop()}: ${message}`).join('\n\n');
+  const retry = $('chatgpt-retry-failed');
+  if (retry?.classList) retry.classList.toggle('hidden', !failures.size);
 }
 async function runChatgptQueue(paths, current, request, saved, progress, wait = ms => new Promise(resolve => setTimeout(resolve, ms)), concurrency = 3, failed = () => {}) {
-  let next = 0, active = 0, cooldown = 0, failure = '';
+  let next = 0, active = 0, failure = '';
   async function worker() {
     while (!current.stop && !failure && next < paths.length) {
       const path = paths[next++];
-      for (let attempt = 0; ; attempt++) {
-        while (!current.stop && !failure && Date.now() < cooldown) await wait(Math.min(250, cooldown - Date.now()));
-        if (current.stop || failure) return;
-        active++; progress(active, path);
-        try {
-          const item = await request(path);
-          saved(item, path);
-          break;
-        } catch (error) {
-          const accountError = [401, 403].includes(error.status) ||
-            [error.code, error.type].some(code => ['insufficient_quota', 'billing_hard_limit_reached', 'billing_not_active', 'usage_limit_reached', 'invalid_api_key', 'model_not_found'].includes(code));
-          if (error.status === 429 && !accountError && !current.stop) {
-            // Throttling pauses this paid selection until it can continue or the user stops it.
-            const retryAfter = Number(error.retryAfter) || Math.max(0, (Date.parse(error.retryAfter) - Date.now()) / 1000) || 0;
-            const seconds = Math.max(retryAfter, Math.min(120, 5 * 2 ** Math.min(attempt, 5)) + Math.random());
-            cooldown = Math.max(cooldown, Date.now() + seconds * 1000);
-          } else {
-            failed(path, error);
-            // An individual photo failure must not abandon the rest of the selection.
-            // Account/access problems affect every photo and need user action.
-            if (accountError) failure = error.message;
-            break;
-          }
-        } finally { active--; progress(active, path, Date.now() < cooldown); }
-      }
+      if (current.stop || failure) return;
+      active++; progress(active, path);
+      try {
+        const item = await request(path);
+        saved(item, path);
+      } catch (error) {
+        const accountError = [401, 403].includes(error.status) ||
+          [error.code, error.type].some(code => ['insufficient_quota', 'billing_hard_limit_reached', 'billing_not_active', 'usage_limit_reached', 'invalid_api_key', 'model_not_found'].includes(code));
+        failed(path, error);
+        // Server already retried a rate-limit 429 once. Offer a visible retry; do not loop here.
+        if (accountError) failure = error.message;
+      } finally { active--; progress(active, path, false); }
     }
   }
   await Promise.all(Array.from({ length: Math.min(Math.max(1, Math.min(10, Math.floor(concurrency) || 3)), paths.length) }, worker));
@@ -1028,8 +1019,17 @@ async function generateChatgpt(selection = state.chatgpt.selected) {
   $('chatgpt-progress').title = [...current.failures].map(([path, message]) => `${path}: ${message}`).join('\n');
   if (current.failures.size && !summary.startsWith('Stopped')) {
     const [path, message] = current.failures.entries().next().value;
-    toast(`${path.split(/[\\/]/).pop()}: ${message} See Failed photos for details.`, true);
+    toast(`${path.split(/[\\/]/).pop()}: ${message} See Failed photos to retry.`, true);
   }
+}
+function retryFailedChatgpt() {
+  const current = state.chatgpt;
+  const failures = current.failures;
+  if (!failures?.size || current.busy || current.reviewBusy || state.hasKey === false) return;
+  const paths = new Set(failures.keys());
+  current.failures = new Map();
+  for (const path of paths) current.selected.add(path);
+  generateChatgpt(paths);
 }
 async function finishChatgpt(accept) {
   const current = state.chatgpt;
@@ -1261,6 +1261,16 @@ function wire() {
   $('chatgpt-clear-queued').addEventListener('click', () => { state.chatgpt.queuedPaths.clear(); renderImages(); updateChatgptControls(); });
   $('chatgpt-stop').addEventListener('click', () => { state.chatgpt.stop = true; state.chatgpt.queuedPaths.clear(); renderImages(); updateChatgptControls(); });
   $('chatgpt-generate').addEventListener('click', () => generateChatgpt());
+  $('chatgpt-retry-failed').addEventListener('click', retryFailedChatgpt);
+  $('open-settings').addEventListener('click', () => openAppSettings());
+  $('app-settings-close').addEventListener('click', () => $('app-settings-dialog').close());
+  $('settings-save').addEventListener('click', saveAppSettings);
+  $('settings-test-key').addEventListener('click', testAppKey);
+  $('settings-clear-key').addEventListener('click', clearAppKey);
+  $('first-run-dialog').addEventListener('close', () => {
+    api('/api/settings', {guide_seen: true}).catch(() => {});
+    if ($('first-run-dialog').returnValue === 'settings') openAppSettings();
+  });
   $('chatgpt-slider').addEventListener('input', () => $('chatgpt-preview').style.setProperty('--split', `${$('chatgpt-slider').value}%`));
   const comparisonStage = document.querySelector('#chatgpt-preview .chatgpt-image-stage');
   $('chatgpt-concurrency').value = chatgptConcurrency;
@@ -1396,8 +1406,83 @@ function wire() {
   new ResizeObserver(drawBrushCanvas).observe($('restore-before-wrap'));
   updateStageRoutingDisplay();updateControls();
 }
+function applyServerSettings(data) {
+  state.hasKey = data.has_key !== false;
+  state.keySource = data.key_source;
+  if ($('settings-model')) $('settings-model').value = data.model || 'gpt-image-2.5-sunburst';
+  if ($('settings-quality')) $('settings-quality').value = data.quality || 'medium';
+  const env = data.key_source === 'env';
+  if ($('settings-api-key')) {
+    $('settings-api-key').value = '';
+    $('settings-api-key').disabled = env;
+    $('settings-api-key').placeholder = data.key_masked ? `Saved key ${data.key_masked}` : 'Paste key — it is never shown in full';
+  }
+  if ($('settings-clear-key')) $('settings-clear-key').disabled = env || !data.has_key;
+  if ($('settings-key-masked')) {
+    $('settings-key-masked').textContent = data.has_key
+      ? (env ? 'Using OPENAI_API_KEY from the environment. Only the last four characters are shown.' : `Saved key: ${data.key_masked}. Only the last four characters are shown.`)
+      : 'No key saved. AI restore is disabled until you add one, or set OPENAI_API_KEY.';
+  }
+  if ($('settings-key-source')) $('settings-key-source').textContent = env
+    ? 'OPENAI_API_KEY is set in the environment and takes precedence over a saved key.'
+    : '';
+  if (typeof updateChatgptControls === 'function') try { updateChatgptControls(); } catch (_) {}
+}
+async function openAppSettings() {
+  try { applyServerSettings(await api('/api/settings')); }
+  catch (error) { toast(error.message, true); }
+  $('settings-key-status').textContent = '';
+  try { $('app-settings-dialog').showModal(); }
+  catch (_) { $('app-settings-dialog').setAttribute('open', ''); }
+}
+async function saveAppSettings() {
+  const payload = { model: $('settings-model').value.trim(), quality: $('settings-quality').value, guide_seen: true };
+  const typed = $('settings-api-key').value.trim();
+  if (typed) payload.api_key = typed;
+  try {
+    applyServerSettings(await api('/api/settings', payload));
+    $('settings-api-key').value = '';
+    $('settings-key-status').textContent = 'Settings saved.';
+    toast('Settings saved.');
+  } catch (error) { $('settings-key-status').textContent = error.message; toast(error.message, true); }
+}
+async function testAppKey() {
+  const payload = { api_key: $('settings-api-key').value.trim() };
+  $('settings-key-status').textContent = 'Testing key…';
+  try {
+    const result = await api('/api/settings/test-key', payload);
+    $('settings-key-status').textContent = result.message;
+  } catch (error) { $('settings-key-status').textContent = error.message; }
+}
+async function clearAppKey() {
+  try {
+    applyServerSettings(await api('/api/settings/clear-key', {}));
+    $('settings-key-status').textContent = 'Saved key removed.';
+    toast('Saved API key cleared.');
+  } catch (error) { $('settings-key-status').textContent = error.message; toast(error.message, true); }
+}
 async function init() {
-  try { const session = await fetch('/api/session').then(response=>response.json()); state.token=session.token; state.home=session.home; state.stageRoutingAvailable=session.stage_routing_version>=2; wire(); const last=localStorage.getItem('cropper-last-folder'); if(last) await loadFolder(last); if(!state.stageRoutingAvailable && stageRoutingEnabled()) toast('Flat stage routing is installed but needs an idle Cropper server restart on 8767 before new saves.',true); }
+  try {
+    const session = await fetch('/api/session').then(response => {
+      if (!response.ok) throw new Error('Session is only available on localhost.');
+      return response.json();
+    });
+    state.token = session.token; state.home = session.home;
+    state.stageRoutingAvailable = session.stage_routing_version >= 2;
+    state.hasKey = session.has_key !== false;
+    wire();
+    const last = localStorage.getItem('cropper-last-folder');
+    if (last) await loadFolder(last);
+    if (!state.stageRoutingAvailable && stageRoutingEnabled()) toast('Flat stage routing is installed but needs an idle Cropper server restart on 8767 before new saves.', true);
+    try {
+      const settings = await api('/api/settings');
+      applyServerSettings(settings);
+      if (!settings.guide_seen) {
+        try { $('first-run-dialog').showModal(); }
+        catch (_) {}
+      }
+    } catch (_) {}
+  }
   catch(error){toast(`Could not start Cropper: ${error.message}`,true);}
 }
 init();

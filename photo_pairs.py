@@ -1,16 +1,15 @@
 """Local visual pair suggestions and durable, explicitly approved links."""
 import json
-import os
 from pathlib import Path
-import tempfile
 import threading
 import io
 import warnings
 import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
+from app_settings import default_data_dir
 
-ROOT = Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()) / 'Cropper'
+ROOT = default_data_dir()
 LOCK = threading.Lock()
 
 def read_links(folder):

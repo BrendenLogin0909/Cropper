@@ -2,13 +2,16 @@
 
 Local photo cropping, front/back pairing and auto-improvement, with optional paid
 OpenAI API restoration and colourisation. Local steps require no API calls.
-The existing image model, prompts, credentials and API behaviour are unchanged.
+Add your own OpenAI API key in Settings. Local crop, merge and auto-improve
+steps require no API calls.
 
 ## Start
 
 Run `python server.py` in this folder. Default address: http://127.0.0.1:8765/.
-Use `--port 8767` if desired. Restart the backend after Python updates; refresh
-the browser after UI updates. Dependencies are in `requirements.txt`.
+Use `--port 8767` if desired. Use `--data-dir` to choose Cropper's per-user
+folder (default `%APPDATA%\Cropper` on Windows). Restart the backend after
+Python updates; refresh the browser after UI updates. Dependencies are pinned
+in `requirements.txt`.
 
 ## One mandatory flat batch workflow
 
@@ -75,8 +78,14 @@ Colourisation appends _col universally, including after _ai. It preserves source
 brightness/detail locally; colours are plausible estimates, not historical facts.
 The free local B&W/sepia scan helps select appropriate fronts.
 
-Credentials remain private in the existing environment/.env.local configuration.
-Do not paste keys into the browser or logs. API billing is separate from ChatGPT.
+Open Settings to paste an OpenAI API key. Cropper stores it in Windows Credential
+Manager, never in a plaintext file. Other settings are saved in
+`%APPDATA%\Cropper\settings.json`. If `OPENAI_API_KEY` is set in the environment,
+it takes precedence. The UI shows only the last four characters of a key.
+The default image model is `gpt-image-2.5-sunburst`. Quality defaults to medium;
+low is used for previews; high is an opt-in labelled about 20c per photo.
+Without a key, AI restore is disabled and every other tool still works offline.
+Do not paste keys into logs. API billing is separate from ChatGPT.
 
 ## Local repairs
 
@@ -109,6 +118,7 @@ responses are not shown.
 
 Unsuccessful photos remain selected for manual retry, and originals stay in
 place. Other photos continue unless an account/access error stops dispatch.
-Temporary throttling still pauses and retries; other errors need manual review.
+A rate-limit 429 is retried once with backoff; out-of-credit 429s are not retried.
+Other errors need the Retry failed photos button. Raw provider errors are not shown.
 Restart the idle Cropper server and refresh the browser after updating Python
 files. No paid image requests are made by the automated tests.

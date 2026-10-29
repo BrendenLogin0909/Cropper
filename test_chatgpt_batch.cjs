@@ -75,25 +75,24 @@ test('account errors halt dispatch, drain active requests and preserve the rest 
   }
 });
 
-test('sustained throttling recovers beyond three retries and respects a long Retry-After', async () => {
-  let clock=0, calls=0;
-  const queue=vm.runInNewContext(queueSource+'\nrunChatgptQueue',{setTimeout, Date:{now:()=>clock,parse:Date.parse}});
-  const saved=[];
+test('rate-limit 429 is left for a visible retry after the server already retried once', async () => {
+  let calls=0;
+  const queue=vm.runInNewContext(queueSource+'\nrunChatgptQueue',{setTimeout, Date:{now:()=>0,parse:Date.parse}});
+  const saved=[], failed=[];
   const result=await queue(['first','second'],{stop:false},async path=>{
     calls++;
-    if(calls<=5) throw Object.assign(Error('Slow down'),{status:429,retryAfter:300});
-    return path;
-  },item=>saved.push(item),()=>{},async ms=>{clock+=ms;},1);
-  assert.equal(result,''); assert.equal(calls,7);
-  assert.ok(clock>=5*300000); assert.deepEqual(saved,['first','second']);
+    throw Object.assign(Error('Slow down'),{status:429,retryAfter:300});
+  },item=>saved.push(item),()=>{},async ms=>{},1,(path,error)=>failed.push(path));
+  assert.equal(result,''); assert.equal(calls,2);
+  assert.deepEqual(saved,[]); assert.deepEqual(failed,['first','second']);
 });
 
-test('Stop during rate-limit cooldown prevents retrying or starting remaining photos', async () => {
-  let clock=0,calls=0; const current={stop:false};
-  const queue=vm.runInNewContext(queueSource+'\nrunChatgptQueue',{setTimeout,Date:{now:()=>clock,parse:Date.parse}});
+test('Stop during a rate-limit failure prevents starting remaining photos', async () => {
+  let calls=0; const current={stop:false};
+  const queue=vm.runInNewContext(queueSource+'\nrunChatgptQueue',{setTimeout,Date});
   await queue(['first','second'],current,async()=>{
-    calls++;throw Object.assign(Error('Slow down'),{status:429});
-  },()=>{},()=>{},async ms=>{clock+=ms;current.stop=true;},1);
+    calls++; current.stop=true; throw Object.assign(Error('Slow down'),{status:429});
+  },()=>{},()=>{},undefined,1);
   assert.equal(calls,1);
 });
 
