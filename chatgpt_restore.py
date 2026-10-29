@@ -2,6 +2,7 @@
 
 import base64
 import io
+import os
 import time
 from pathlib import Path
 
@@ -32,6 +33,11 @@ COLORIZATION_PROMPT = (
 
 # Kept as an alias for older imports; the live model name comes from Settings.
 MODEL = "gpt-image-2.5-sunburst"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+
+def openai_base_url() -> str:
+    return os.environ.get("OPENAI_BASE_URL", "").strip() or DEFAULT_OPENAI_BASE_URL
 
 
 def api_key() -> str:
@@ -68,7 +74,12 @@ def openai_client(api_key_value=None, timeout=180):
         from openai import OpenAI
     except ImportError as exc:
         raise ValueError("Install the openai package from requirements.txt first.") from exc
-    return OpenAI(api_key=api_key_value if api_key_value is not None else api_key(), timeout=timeout, max_retries=0)
+    return OpenAI(
+        api_key=api_key_value if api_key_value is not None else api_key(),
+        timeout=timeout,
+        max_retries=0,
+        base_url=openai_base_url(),
+    )
 
 
 def call_images_edit(client, **kwargs):

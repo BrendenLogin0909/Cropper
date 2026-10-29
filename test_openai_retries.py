@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -85,8 +86,27 @@ class OpenAIRetryTests(unittest.TestCase):
 
         with patch("openai.OpenAI") as ctor:
             ctor.return_value = Mock()
-            openai_client(api_key_value="sk-test", timeout=180)
-            ctor.assert_called_with(api_key="sk-test", timeout=180, max_retries=0)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("OPENAI_BASE_URL", None)
+                openai_client(api_key_value="sk-test", timeout=180)
+            ctor.assert_called_with(
+                api_key="sk-test",
+                timeout=180,
+                max_retries=0,
+                base_url="https://api.openai.com/v1",
+            )
+
+    def test_openai_client_honors_openai_base_url(self):
+        with patch("openai.OpenAI") as ctor:
+            ctor.return_value = Mock()
+            with patch.dict(os.environ, {"OPENAI_BASE_URL": "http://127.0.0.1:9/v1"}):
+                openai_client(api_key_value="sk-test", timeout=30)
+            ctor.assert_called_with(
+                api_key="sk-test",
+                timeout=30,
+                max_retries=0,
+                base_url="http://127.0.0.1:9/v1",
+            )
 
     def test_default_quality_is_medium_and_preview_is_low(self):
         with TemporaryDirectory() as folder:

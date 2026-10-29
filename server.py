@@ -359,6 +359,7 @@ class Handler(BaseHTTPRequestHandler):
                     "stage_routing_version": 2,
                     "has_key": info["has_key"],
                     "key_source": info["key_source"],
+                    "keyring_error": info.get("keyring_error") or "",
                     "model": info["model"],
                     "quality": info["quality"],
                 })
@@ -468,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = data.pop("api_key", None)
                 if key is not None and str(key).strip():
                     app_settings.set_stored_api_key(str(key))
+                key = None
                 app_settings.save_settings(data)
                 self.json(200, app_settings.public_settings())
                 return

@@ -102,3 +102,4 @@
 #first-run-dialog form{display:flex;flex-wrap:wrap;gap:12px;margin-top:20px}
 #chatgpt-retry-failed{margin:8px 0 0;width:100%}
 #chatgpt-key-hint{margin:0 18px 12px;color:#e9c18e}
+.settings-keyring-warning{margin:0 0 15px;color:#f3c27a;font-size:12px;line-height:1.5}
