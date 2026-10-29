@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -85,14 +86,53 @@ def windows_long_path(path: Path) -> Path:
 
 
 def windows_safe_filename(name: str) -> str:
-    """Reject invalid characters and rewrite Windows reserved device names."""
-    name = (name or '').strip().rstrip(' .')
+    """Reject invalid characters, reserved Windows names, trailing dots, and missing extensions."""
+    name = name or ''
+    if name.endswith('.') or name.endswith(' '):
+        raise ValueError('Filename template produces a trailing dot or space.')
+    name = name.strip()
     if not name or name in {'.', '..'} or INVALID_NAME.search(name) or '/' in name or '\\' in name:
         raise ValueError('Filename template produces invalid characters.')
     stem, suffix = Path(name).stem, Path(name).suffix
+    if not suffix:
+        raise ValueError('Filename template must produce a file extension.')
     if stem.upper() in WINDOWS_RESERVED_STEMS:
-        name = f'_{stem}{suffix}'
+        raise ValueError('Filename template produces a reserved Windows name.')
     return name
+
+
+def format_index(index: int, batch_size: int = 1) -> str:
+    """Zero-pad {index} to at least 3 digits, or more when the batch is larger."""
+    try:
+        value = int(index)
+    except (TypeError, ValueError):
+        value = 1
+    try:
+        size = int(batch_size)
+    except (TypeError, ValueError):
+        size = 1
+    width = max(3, len(str(max(abs(size), abs(value), 1))))
+    return str(max(value, 0)).zfill(width)
+
+
+def is_backup_path(path: Path | str) -> bool:
+    return any(part == BACKUPS for part in Path(path).parts)
+
+
+def data_lock_path(root: Path) -> Path:
+    from app_settings import data_dir
+    digest = hashlib.sha256(path_key(root).encode('utf-8', 'replace')).hexdigest()[:32]
+    return data_dir() / 'locks' / f'{digest}.lock'
+
+
+def remove_stale_batch_lock(root: Path | None) -> None:
+    if root is None:
+        return
+    leftover = Path(root) / '.cropper.lock'
+    try:
+        leftover.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def recovered_path(source: Path) -> Path:
@@ -145,14 +185,14 @@ def validate_template(template: str) -> str:
 
 
 def render_filename(source: Path, operation: str, index: int = 1, template: str | None = None,
-                    date: str | None = None) -> str:
+                    date: str | None = None, batch_size: int = 1) -> str:
     settings = _settings()
     template = template or settings.get('filename_template') or '{name}{suffix}{ext}'
     suffix = OPERATION_SUFFIX.get(operation, '')
     ext = source.suffix if operation in {'crop', 'enhance'} else (source.suffix if operation == 'finish' else '.png')
     try:
         name = template.format(name=source.stem, date=date or time.strftime('%Y%m%d'),
-                               index=str(index), ext=ext, suffix=suffix)
+                               index=format_index(index, batch_size), ext=ext, suffix=suffix)
     except (KeyError, ValueError, IndexError) as exc:
         raise ValueError('Filename template supports {name}, {date}, {index} and {ext}.') from exc
     return windows_safe_filename(name)
@@ -419,7 +459,8 @@ def sweep_stale_reservations(now: float | None = None) -> None:
 def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None) -> list[dict]:
     """Reserve saveable output names before a paid AI call."""
     sources = [front] + ([composite] if composite is not None else [])
-    plans = [plan(source, operation) for source in sources]
+    batch_size = len(sources)
+    plans = [plan(source, operation, index=i + 1, batch_size=batch_size) for i, source in enumerate(sources)]
     if len({item['root'] for item in plans}) != 1:
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:
@@ -437,7 +478,7 @@ def plan_root(item: dict) -> Path:
     return parent.parent if parent.name in FOLDERS else parent
 
 
-def plan(source: Path, operation: str) -> dict:
+def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1) -> dict:
     source = source.resolve()
     parent = source.parent
     if any(ancestor.name in FOLDERS for ancestor in parent.parents):
@@ -448,11 +489,12 @@ def plan(source: Path, operation: str) -> dict:
         parent.parent if parent.name in FOLDERS else parent)
     stage = STAGES.get(parent.name)
     replace = bool(settings.get('replace_original')) and operation != 'finish'
+    rendered = lambda op: render_filename(source, op, index=index, batch_size=batch_size)
     if operation == 'crop':
         if parent.name in FOLDERS and parent.name != ORIGINAL:
             raise ValueError('Crop from the batch root or 1. Original, not a later stage folder.')
         snapshots = [root / ORIGINAL / source.name]
-        output = root / CROP_QUEUE / render_filename(source, 'crop')
+        output = root / CROP_QUEUE / rendered('crop')
     else:
         if stage is None:
             raise ValueError('Open a 1.5, 1.6 or 1.7 TBP stage folder for flat batch routing.')
@@ -460,7 +502,7 @@ def plan(source: Path, operation: str) -> dict:
         if operation == 'enhance':
             if stage != 1:
                 raise ValueError('Auto-improve must start from 1.5. TBP Cropped.')
-            output = root / ENHANCE_QUEUE / render_filename(source, 'enhance')
+            output = root / ENHANCE_QUEUE / rendered('enhance')
         elif operation in {'restore', 'colorize', 'finish'}:
             if operation == 'restore' and stage == 3:
                 raise ValueError('This photo already completed AI enhancement. Colourise or finish it instead.')
@@ -470,7 +512,7 @@ def plan(source: Path, operation: str) -> dict:
                 snapshots.append(root / SKIP_AI / source.name)
             output = None if operation == 'finish' else root / (
                 COLOR if operation == 'colorize' else AI_QUEUE
-            ) / render_filename(source, operation)
+            ) / rendered(operation)
         else:
             raise ValueError('Invalid batch stage operation.')
     if replace:
@@ -483,6 +525,30 @@ def plan(source: Path, operation: str) -> dict:
         output = source
         return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output, 'overwrite': True}
     return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output, 'overwrite': False}
+
+
+def planned_overwrites(plans: list[dict]) -> list[Path]:
+    """Existing files this batch would replace under Overwrite or Replace original."""
+    policy = (_settings().get('conflict_policy') or 'skip').lower()
+    taken = taken_outputs()
+    taken_keys = {path_key(path) for path in taken}
+    targets = []
+    seen = set()
+    for item in plans:
+        output = item.get('output')
+        if output is None:
+            continue
+        path = Path(output)
+        overwrite = bool(item.get('overwrite'))
+        exists = path.exists() or path_key(path) in taken_keys
+        if not overwrite and exists and policy == 'overwrite':
+            overwrite = True
+        if overwrite and path.exists():
+            key = path_key(path)
+            if key not in seen:
+                seen.add(key)
+                targets.append(path)
+    return targets
 
 
 def _atomic_create(target: Path, data: bytes, overwrite: bool = False) -> bool:
@@ -517,90 +583,112 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
     if len(plans) != len(payloads):
         raise ValueError('Missing output data.')
     roots = {plan_root(item) for item in plans}
-    lock_path = next(iter(roots)) / '.cropper.lock'
-    with interprocess_lock(lock_path), LOCK:
-        sources = [item['source'] for item in plans]
-        if len(set(sources)) != len(sources):
-            raise ValueError('The same source was selected more than once.')
-        for item in plans:
-            for target in item['snapshots']:
-                if target.name != item['source'].name and BACKUPS not in Path(target).parts:
-                    raise ValueError('Archive filename must match the original source filename. Nothing was moved.')
-        originals = {source: source.read_bytes() for source in sources}
-        writes = {}
-        overwrites = {}
-        outputs = []
-        policy = _settings().get('conflict_policy') or 'skip'
-        for item, payload in zip(plans, payloads):
-            source = item['source']
-            for target in item['snapshots']:
-                data = originals[source]
-                if target in writes and writes[target] != data:
-                    raise ValueError(f'Conflicting snapshot names: {target.name}')
-                if target.exists():
-                    if target.read_bytes() != data:
-                        raise ValueError(f'A different snapshot already exists: {target}. Nothing was overwritten.')
-                else:
-                    writes[target] = data
-            output = item['output']
-            if output is not None:
-                if payload is None:
-                    raise ValueError('Missing processed image.')
-                overwrite = bool(item.get('overwrite'))
-                if not overwrite and (output in writes or output.exists() or output in sources):
-                    chosen, overwrite = apply_conflict(output, set(writes) | set(sources) | taken_outputs(), policy)
-                    output = chosen
-                    item['output'] = output
-                    item['overwrite'] = overwrite
-                    if not overwrite and (output in writes or output.exists() or output in sources):
-                        raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
-                if overwrite and output.exists():
-                    overwrites[output] = output.read_bytes()
-                writes[output] = payload
-                outputs.append(output)
-        created, removed = [], []
-        try:
-            for target, data in writes.items():
-                overwrite = target in overwrites
-                new_file = _atomic_create(target, data, overwrite=overwrite)
-                if new_file:
-                    created.append(target)
-            for target, data in writes.items():
-                if target.read_bytes() != data:
-                    raise ValueError(f'Saved image verification failed: {target.name}')
+    root = next(iter(roots))
+    remove_stale_batch_lock(root)
+    lock_path = data_lock_path(root)
+    try:
+        with interprocess_lock(lock_path), LOCK:
+            sources = [item['source'] for item in plans]
+            if len(set(sources)) != len(sources):
+                raise ValueError('The same source was selected more than once.')
             for item in plans:
+                for target in item['snapshots']:
+                    if target.name != item['source'].name and BACKUPS not in Path(target).parts:
+                        raise ValueError('Archive filename must match the original source filename. Nothing was moved.')
+            originals = {source: source.read_bytes() for source in sources}
+            writes = {}
+            overwrites = {}
+            outputs = []
+            policy = _settings().get('conflict_policy') or 'skip'
+            for item, payload in zip(plans, payloads):
                 source = item['source']
-                if source not in item['snapshots'] and source != item.get('output'):
-                    if source.read_bytes() != originals[source]:
-                        raise ValueError(f'Source changed while saving: {source.name}')
-                    removed.append(source)
-                    windows_long_path(source).unlink()
-        except Exception:
-            restored_all = True
-            for source in removed:
-                try:
-                    if source.exists() and source.read_bytes() == originals[source]:
-                        continue
-                    _atomic_create(source, originals[source], overwrite=False)
-                except Exception:
-                    restored_all = False
-                    recovered = recovered_path(source)
+                for target in item['snapshots']:
+                    data = originals[source]
+                    if target in writes and writes[target] != data:
+                        raise ValueError(f'Conflicting snapshot names: {target.name}')
+                    if target.exists():
+                        if target.read_bytes() != data:
+                            raise ValueError(f'A different snapshot already exists: {target}. Nothing was overwritten.')
+                    else:
+                        writes[target] = data
+                output = item['output']
+                if output is not None:
+                    if payload is None:
+                        raise ValueError('Missing processed image.')
+                    overwrite = bool(item.get('overwrite'))
+                    if not overwrite and (output in writes or output.exists() or output in sources):
+                        chosen, overwrite = apply_conflict(output, set(writes) | set(sources) | taken_outputs(), policy)
+                        output = chosen
+                        item['output'] = output
+                        item['overwrite'] = overwrite
+                        if not overwrite and (output in writes or output.exists() or output in sources):
+                            raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
+                    if overwrite and output.exists():
+                        overwrites[output] = output.read_bytes()
+                    writes[output] = payload
+                    outputs.append(output)
+            created, removed = [], []
+            try:
+                for target, data in writes.items():
+                    overwrite = target in overwrites
+                    new_file = _atomic_create(target, data, overwrite=overwrite)
+                    if new_file:
+                        created.append(target)
+                for target, data in writes.items():
+                    if target.read_bytes() != data:
+                        raise ValueError(f'Saved image verification failed: {target.name}')
+                for item in plans:
+                    source = item['source']
+                    if source not in item['snapshots'] and source != item.get('output'):
+                        if source.read_bytes() != originals[source]:
+                            raise ValueError(f'Source changed while saving: {source.name}')
+                        removed.append(source)
+                        windows_long_path(source).unlink()
+            except Exception:
+                restore_ok = True
+                # Restore overwritten originals first. Never delete a backup until that restore is verified.
+                for target, previous in list(overwrites.items()):
                     try:
-                        _atomic_create(recovered, originals[source], overwrite=False)
+                        _atomic_create(target, previous, overwrite=True)
+                        if windows_long_path(target).read_bytes() != previous:
+                            raise ValueError(f'Restore verification failed: {Path(target).name}')
                     except Exception:
-                        pass
-            if restored_all:
-                for target in reversed(created):
-                    windows_long_path(target).unlink(missing_ok=True)
-                for target, previous in overwrites.items():
-                    _atomic_create(target, previous, overwrite=True)
-            raise
-        return outputs
+                        restore_ok = False
+                        recovered = recovered_path(Path(target))
+                        try:
+                            _atomic_create(recovered, previous, overwrite=False)
+                        except Exception:
+                            pass
+                for source in removed:
+                    try:
+                        if source.exists() and source.read_bytes() == originals[source]:
+                            continue
+                        _atomic_create(source, originals[source], overwrite=False)
+                        if source.read_bytes() != originals[source]:
+                            raise ValueError(f'Restore verification failed: {source.name}')
+                    except Exception:
+                        restore_ok = False
+                        recovered = recovered_path(source)
+                        try:
+                            _atomic_create(recovered, originals[source], overwrite=False)
+                        except Exception:
+                            pass
+                if restore_ok:
+                    for target in reversed(created):
+                        try:
+                            windows_long_path(target).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                raise
+            return outputs
+    finally:
+        remove_stale_batch_lock(root)
 
 
 def file_results(sources: list[Path], payloads: list[bytes], operation: str,
                  output_paths: list[Path] | None = None) -> list[Path]:
-    plans = [plan(source, operation) for source in sources]
+    batch_size = len(sources)
+    plans = [plan(source, operation, index=i + 1, batch_size=batch_size) for i, source in enumerate(sources)]
     if len({item['root'] for item in plans}) != 1:
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:

@@ -150,7 +150,47 @@ class PendingTests(unittest.TestCase):
             self.assertNotIn(fresh['id'], removed)
             self.assertNotIn(damaged['id'], removed)
             self.assertTrue((pending / f"{damaged['id']}.png").is_file())
+            self.assertTrue((pending / f"{stale['id']}.png").is_file())
+            self.assertTrue((pending / f"{stale['id']}.json").is_file())
+            recovered_ids = [item['id'] for item in list_recovered(pending)]
+            self.assertIn(stale['id'], recovered_ids)
             self.assertEqual(len(list_pending(photos, pending)), 1)
+
+    def test_missing_created_gets_timestamp_not_removal(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            photos = root / "photos"; photos.mkdir()
+            pending = root / "pending"
+            record = save_pending(photos / "fresh.png", png('red'), pending)
+            metadata = pending / f"{record['id']}.json"
+            data = json.loads(metadata.read_text(encoding='utf-8'))
+            data.pop('created', None)
+            metadata.write_text(json.dumps(data), encoding='utf-8')
+            moved = cleanup_expired(pending, now=time.time(), ttl=60)
+            self.assertNotIn(record['id'], moved)
+            saved = json.loads(metadata.read_text(encoding='utf-8'))
+            self.assertTrue(saved.get('created'))
+            self.assertEqual(len(list_pending(photos, pending)), 1)
+            self.assertNotIn(record['id'], [item['id'] for item in list_recovered(pending)])
+
+    def test_truncated_json_keep_preserves_notes_without_raw_decode(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            photos = root / "photos"; photos.mkdir()
+            pending = root / "pending"
+            record = save_pending(
+                photos / "front.png", png('green'), pending, operation='restore',
+                revision={'comments': ['Keep the white moustache.'], 'photo_note': 'sky stays blue'},
+            )
+            metadata = pending / f"{record['id']}.json"
+            text = metadata.read_text(encoding='utf-8')
+            marker = '"photo_note": "sky stays blue"'
+            cut = text.find(marker) + len(marker)
+            self.assertGreater(text.find(marker), 0)
+            metadata.write_text(text[:cut] + ',,,not-json', encoding='utf-8')
+            kept = keep_recovered(record['id'], pending)
+            self.assertEqual(kept['comments'], ['Keep the white moustache.'])
+            self.assertEqual(kept['photo_note'], 'sky stays blue')
 
     def test_pending_root_is_not_system_temp(self):
         with TemporaryDirectory() as folder:

@@ -44,6 +44,8 @@ RESTORE_LOCK = threading.Lock()
 REVIEW_LOCKS = {}
 REVIEW_LOCKS_GUARD = threading.Lock()
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+GPS_IFD = 0x8825
+OVERWRITE_SKIP_SESSION: set[str] = set()
 
 
 def hostname_of(host_header: str) -> str:
@@ -208,6 +210,30 @@ def rendered_bytes(image: Image.Image, extension: str, info: dict) -> bytes:
         return rendered.read_bytes()
 
 
+def _keep_gps_enabled() -> bool:
+    try:
+        return bool(app_settings.load_settings().get("keep_gps"))
+    except Exception:
+        return False
+
+
+def exif_bytes_for_save(info: dict, keep_gps: bool | None = None) -> bytes | None:
+    """Keep non-GPS EXIF; strip GPS unless keep_gps is on."""
+    if not info.get("exif"):
+        return None
+    if keep_gps is None:
+        keep_gps = _keep_gps_enabled()
+    try:
+        exif = Image.Exif()
+        exif.load(info["exif"])
+        exif[274] = 1
+        if not keep_gps:
+            exif.pop(GPS_IFD, None)
+        return exif.tobytes()
+    except (ValueError, TypeError, OSError, KeyError):
+        return None
+
+
 def save_rendered(image: Image.Image, destination: Path, info: dict) -> None:
     extension = destination.suffix.lower()
     format_name = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP", ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP"}[extension]
@@ -218,15 +244,10 @@ def save_rendered(image: Image.Image, destination: Path, info: dict) -> None:
         options.update(quality=95, method=6)
     if info.get("icc_profile"):
         options["icc_profile"] = info["icc_profile"]
-    # EXIF orientation is reset after the pixels are transposed; keep other metadata.
-    if info.get("exif"):
-        try:
-            exif = Image.Exif()
-            exif.load(info["exif"])
-            exif[274] = 1
-            options["exif"] = exif.tobytes()
-        except (ValueError, TypeError, OSError):
-            pass
+    # EXIF orientation is reset after the pixels are transposed; GPS is stripped unless opted in.
+    exif = exif_bytes_for_save(info)
+    if exif:
+        options["exif"] = exif
     handle, temp_name = tempfile.mkstemp(prefix=".cropper-", suffix=destination.suffix, dir=destination.parent)
     os.close(handle)
     temp = Path(temp_name)
@@ -336,6 +357,24 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
             return None, restored.size, changes, None
         destination = stage_files.file_results([source], [rendered_bytes(restored, source.suffix, info)], 'enhance')[0]
     return destination, restored.size, changes, planned['snapshots'][0]
+
+
+def overwrite_response(plans: list[dict], data: dict | None) -> dict | None:
+    """Return a 409 payload when this batch would overwrite and has not been confirmed."""
+    payload = data if isinstance(data, dict) else {}
+    targets = stage_files.planned_overwrites(plans)
+    if not targets:
+        return None
+    if payload.get("skip_overwrite_prompt"):
+        OVERWRITE_SKIP_SESSION.add(TOKEN)
+    if payload.get("confirm_overwrite") or TOKEN in OVERWRITE_SKIP_SESSION:
+        return None
+    return {
+        "code": "overwrite_confirmation_required",
+        "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
+        "count": len(targets),
+        "names": [path.name for path in targets],
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -517,8 +556,29 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Invalid photo selection point.')
                 self.json(200, predict_corners(image, target))
                 return
+            if self.path == "/api/overwrite-preview":
+                operation = str(data.get("operation") or "crop")
+                raw_paths = data.get("paths") if isinstance(data.get("paths"), list) else []
+                if data.get("path"):
+                    raw_paths = [data.get("path"), *raw_paths]
+                if not raw_paths:
+                    raise ValueError("Select photos to check.")
+                paths = [image_path(value) for value in raw_paths]
+                plans = [stage_files.plan(path, operation, index=i + 1, batch_size=len(paths))
+                         for i, path in enumerate(paths)]
+                targets = stage_files.planned_overwrites(plans)
+                self.json(200, {
+                    "count": len(targets),
+                    "names": [path.name for path in targets],
+                    "paths": [str(path) for path in targets],
+                })
+                return
             if self.path == "/api/crop":
                 path = image_path(data.get("path", ""))
+                refusal = overwrite_response([stage_files.plan(path, "crop")], data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 destination, size = save_image(path, data.get("points", []), data.get("settings", {}), int(data.get("rotation", 0)), data.get("aspect_ratio"))
                 self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "source_moved": not path.exists()})
                 return
@@ -541,6 +601,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/enhance":
                 path = image_path(data.get("path", ""))
+                refusal = overwrite_response([stage_files.plan(path, "enhance")], data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 requested = data.get("settings", {})
                 source_paths = [str(path)]
                 link = next((item for item in read_links(path.parent)
@@ -565,6 +629,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/restore":
                 path = image_path(data.get("path", ""))
+                refusal = overwrite_response([stage_files.plan(path, "enhance")], data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 destination, size, changes, archived = save_restored_image(path, data.get("operation", ""), data.get("strokes"))
                 self.json(200, {"path": str(destination or path), "name": (destination or path).name,
                                 "width": size[0], "height": size[1], "changes": changes,
@@ -698,6 +766,24 @@ class Handler(BaseHTTPRequestHandler):
                 record, image = get_pending(stage_id)
                 with review_lock(Path(record['front_path'])):
                     record, image = get_pending(stage_id)
+                    if self.path.endswith("accept"):
+                        operation = record.get("operation") or "restore"
+                        front = image_path(record["front_path"])
+                        plans = [stage_files.plan(front, operation)]
+                        dests = [Path(value) for value in (record.get("output_paths") or [])]
+                        if record.get("output_path"):
+                            dests = [Path(record["output_path"]), *dests]
+                        if dests:
+                            for item, dest in zip(plans, dests):
+                                item["output"] = dest
+                                item["overwrite"] = dest.exists() and (
+                                    bool(item.get("overwrite"))
+                                    or (app_settings.load_settings().get("conflict_policy") == "overwrite")
+                                )
+                        refusal = overwrite_response(plans, data)
+                        if refusal:
+                            self.json(409, refusal)
+                            return
                     outputs = accept_linked(record, image.read_bytes()) if self.path.endswith("accept") else []
                     removed = [stage_id]
                     if outputs:
@@ -753,7 +839,11 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None, help="Per-user data folder (default: %%APPDATA%%/Cropper)")
     args = parser.parse_args()
     app_settings.configure_runtime(args.data_dir)
-    port = resolve_port(args.port)
+    try:
+        port = resolve_port(args.port)
+    except ValueError as exc:
+        print(str(exc), flush=True)
+        sys.exit(1)
     try:
         server = LocalServer(("127.0.0.1", port), Handler)
     except OSError:
@@ -768,7 +858,7 @@ def main() -> None:
             if not args.no_browser:
                 webbrowser.open(address)
             return
-        print(f"Port {args.port} is already in use by another program.", flush=True)
+        print(f"Port {port} is already in use by another program.", flush=True)
         sys.exit(1)
     address = f"http://127.0.0.1:{server.server_port}"
     print(f"Cropper is running at {address}", flush=True)
