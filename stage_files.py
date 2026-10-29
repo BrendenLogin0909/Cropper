@@ -47,8 +47,26 @@ def _settings():
                 'replace_original': False, 'backup_originals': True, 'output_folder': ''}
 
 
-def path_key(path: Path) -> str:
-    return os.path.normcase(str(Path(path).resolve()))
+def _native_path_text(path: Path | str) -> str:
+    text = os.fspath(path)
+    if text.startswith('\\\\?\\UNC\\'):
+        return '\\\\' + text[8:]
+    if text.startswith('\\\\?\\'):
+        return text[4:]
+    return text
+
+
+def path_key(path: Path | str) -> str:
+    text = _native_path_text(path)
+    try:
+        text = str(Path(text).resolve())
+    except OSError:
+        pass
+    return os.path.normcase(_native_path_text(text))
+
+
+def same_path(left: Path | str, right: Path | str) -> bool:
+    return path_key(left) == path_key(right)
 
 
 def _is_windows() -> bool:

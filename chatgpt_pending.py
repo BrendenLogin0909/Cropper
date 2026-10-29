@@ -220,7 +220,8 @@ def list_pending(folder: Path, root: Path | None = None) -> list[dict]:
             record, image = get_pending(metadata.stem, root)
             if not image_is_readable(image):
                 continue
-            if Path(record["front_path"]).parent == folder:
+            from stage_files import same_path
+            if same_path(Path(record["front_path"]).parent, folder):
                 items.append(record)
         except (ValueError, OSError, KeyError, json.JSONDecodeError, TypeError):
             continue

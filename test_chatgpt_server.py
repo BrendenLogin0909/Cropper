@@ -14,6 +14,7 @@ import app_settings
 import server
 import chatgpt_pending
 import photo_pairs
+import stage_files as stages
 
 
 class ServerPendingTests(unittest.TestCase):
@@ -110,7 +111,7 @@ class ServerPendingTests(unittest.TestCase):
                      patch.object(server, "remove_pending", side_effect=lambda ident: chatgpt_pending.remove_pending(ident, pending)):
                     post('/api/photo-link', {'front_path':str(sources[0]), 'composite_path':str(composite), 'split':50, 'layout':'right'})
                     first = post("/api/chatgpt-generate", {"front_path": str(sources[0])})
-                    self.assertEqual(first['link']['composite_path'], str(composite))
+                    self.assertTrue(stages.same_path(first['link']['composite_path'], composite))
                     second = post("/api/chatgpt-generate", {"front_path": str(sources[1])})
                     self.assertNotEqual(first["id"], second["id"])
                     self.assertTrue(all(source.is_file() for source in sources))

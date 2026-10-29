@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
 from app_settings import default_data_dir
+from stage_files import path_key, same_path
 
 ROOT = default_data_dir()
 LOCK = threading.Lock()
@@ -15,10 +16,13 @@ LOCK = threading.Lock()
 def read_links(folder):
     path = ROOT / 'photo-links.json'
     records = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-    return [item for item in records.values() if Path(item['front_path']).parent == folder.resolve()]
+    folder_key = path_key(folder)
+    return [item for item in records.values() if path_key(Path(item['front_path']).parent) == folder_key]
 
 def approve_link(front, composite, split, layout):
-    if front == composite or front.parent != composite.parent:
+    front = Path(front).resolve()
+    composite = Path(composite).resolve()
+    if same_path(front, composite) or path_key(front.parent) != path_key(composite.parent):
         raise ValueError('Choose two different images in the same folder.')
     if not 10 <= int(split) <= 90 or layout not in ('right', 'below'):
         raise ValueError('Choose a valid split boundary and back position.')
@@ -26,9 +30,9 @@ def approve_link(front, composite, split, layout):
         ROOT.mkdir(parents=True, exist_ok=True)
         path = ROOT / 'photo-links.json'
         records = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-        if any(v['composite_path'] == str(front) or (v['front_path'] == str(composite)) for v in records.values()):
+        if any(same_path(v['composite_path'], front) or same_path(v['front_path'], composite) for v in records.values()):
             raise ValueError('A file cannot be both a standalone front and a combined image in different links.')
-        if any(v['composite_path'] == str(composite) and k != str(front) for k,v in records.items()):
+        if any(same_path(v['composite_path'], composite) and not same_path(k, front) for k,v in records.items()):
             raise ValueError('This combined image is already linked to another front.')
         record = dict(front_path=str(front), composite_path=str(composite), split=int(split), layout=layout)
         records[str(front)] = record

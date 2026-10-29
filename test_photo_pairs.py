@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 import photo_pairs
 import chatgpt_pending
+import stage_files as stages
 
 class PairTests(unittest.TestCase):
     def test_suggest_link_restore_once_and_preserve_back(self):
@@ -18,7 +19,7 @@ class PairTests(unittest.TestCase):
             original.save(front)
             combined=Image.new('RGB',(140,100),'ivory');combined.paste(original,(0,0));combined.save(composite)
             candidates=photo_pairs.suggestions(root)
-            self.assertTrue(any(item['front_path']==str(front) and item['composite_path']==str(composite) for item in candidates))
+            self.assertTrue(any(stages.same_path(item['front_path'], front) and stages.same_path(item['composite_path'], composite) for item in candidates))
             with patch.object(photo_pairs,'ROOT',root/'store'):
                 link=photo_pairs.approve_link(front,composite,50,'right')
                 self.assertEqual(photo_pairs.read_links(root)[0],link)
@@ -27,7 +28,7 @@ class PairTests(unittest.TestCase):
             staged=chatgpt_pending.attach_link(staged['id'],link,root/'pending')
             with patch.object(photo_pairs,'ROOT',root/'store'):
                 outputs=photo_pairs.accept_linked(staged,png.getvalue())
-                self.assertEqual(photo_pairs.read_links(outputs[0].parent)[0]['front_path'],str(outputs[0]))
+                self.assertTrue(stages.same_path(photo_pairs.read_links(outputs[0].parent)[0]['front_path'], outputs[0]))
             self.assertEqual(len(outputs),2)
             with Image.open(outputs[1]) as result:
                 self.assertEqual(result.getpixel((10,10)),(255,0,0))

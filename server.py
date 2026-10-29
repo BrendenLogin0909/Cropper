@@ -298,7 +298,8 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
 
 def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, int], list[str], Path]:
     stage_files.plan(source, 'enhance')
-    link = next((item for item in read_links(source.parent) if str(source) in {item['front_path'], item['composite_path']}), None)
+    link = next((item for item in read_links(source.parent)
+                 if stage_files.same_path(source, item['front_path']) or stage_files.same_path(source, item['composite_path'])), None)
     if link:
         source = image_path(link['front_path'])
     image, info = load_image(source)
@@ -541,7 +542,8 @@ class Handler(BaseHTTPRequestHandler):
                 path = image_path(data.get("path", ""))
                 requested = data.get("settings", {})
                 source_paths = [str(path)]
-                link = next((item for item in read_links(path.parent) if str(path) in {item['front_path'],item['composite_path']}), None)
+                link = next((item for item in read_links(path.parent)
+                             if stage_files.same_path(path, item['front_path']) or stage_files.same_path(path, item['composite_path'])), None)
                 if link: source_paths = [link['front_path'],link['composite_path']]
                 destination, size, changes, archived_source = save_enhanced_image(path, requested)
                 self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source), "source_paths":source_paths})
@@ -580,12 +582,15 @@ class Handler(BaseHTTPRequestHandler):
                 links = []
                 for folder in {path.parent for path in paths}:
                     for link in read_links(folder):
-                        members = {Path(link['front_path']), Path(link['composite_path'])}
-                        if paths & members:
-                            paths.update(image_path(str(member)) for member in members)
+                        members = [image_path(link['front_path']), image_path(link['composite_path'])]
+                        if any(stage_files.same_path(path, member) for path in paths for member in members):
+                            paths.update(members)
                             links.append(link)
                 pending = [item for folder in {path.parent for path in paths} for item in list_pending(folder)]
-                if any(Path(item['front_path']) in paths or Path(item.get('link', {}).get('composite_path', '')) in paths for item in pending):
+                if any(any(stage_files.same_path(item['front_path'], path) or
+                           (item.get('link', {}).get('composite_path') and
+                            stage_files.same_path(item['link']['composite_path'], path))
+                           for path in paths) for item in pending):
                     raise ValueError('Review or reject pending results before finishing these photos.')
                 planned = [stage_files.plan(path, 'finish') for path in sorted(paths)]
                 if data.get('dry_run', True):
@@ -594,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Each pair is atomic; report partial batch success explicitly.
                 remaining = set(paths)
                 finished, errors = [], []
-                groups = [[Path(link['front_path']), Path(link['composite_path'])] for link in links]
+                groups = [[image_path(link['front_path']), image_path(link['composite_path'])] for link in links]
                 paired = {path for group in groups for path in group}
                 groups += [[path] for path in sorted(paths - paired)]
                 for group in groups:
@@ -616,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
                 composite = image_path(data.get('composite_path', ''))
                 link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'))
                 for pending in list_pending(front.parent):
-                    if pending['front_path'] == str(front): attach_link(pending['id'], link)
+                    if stage_files.same_path(pending['front_path'], front): attach_link(pending['id'], link)
                 self.json(200, link)
                 return
             if self.path == "/api/chatgpt-generate":
@@ -625,13 +630,13 @@ class Handler(BaseHTTPRequestHandler):
                 front = image_path(data.get("front_path", ""))
                 stage_files.plan(front, operation)  # Fail before paying for a request.
                 links = read_links(front.parent)
-                if any(item['composite_path'] == str(front) for item in links):
+                if any(stage_files.same_path(item['composite_path'], front) for item in links):
                     raise ValueError('This is a linked combined image. Select its standalone front or use Generate selected pairs.')
-                link = next((item for item in links if item['front_path'] == str(front)), None)
+                link = next((item for item in links if stage_files.same_path(item['front_path'], front)), None)
                 composite = image_path(link['composite_path']) if link else None
                 if composite is not None:
                     stage_files.plan(composite, operation)
-                if any(item["front_path"] == str(front) for item in list_pending(front.parent)):
+                if any(stage_files.same_path(item["front_path"], front) for item in list_pending(front.parent)):
                     raise ValueError("This photo already has a pending AI result. Review it before generating another.")
                 plans = stage_files.prepare_ai_plans(front, operation, composite)
                 reserved = [item['output'] for item in plans if item.get('output') is not None]
