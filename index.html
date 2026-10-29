@@ -276,10 +276,19 @@
     <div class="chatgpt-preview-head"><h2 id="overwrite-dialog-title">Overwrite existing files?</h2></div>
     <p>This batch would overwrite <strong id="overwrite-dialog-count">0</strong> existing file(s).</p>
     <p id="overwrite-dialog-names" class="aspect-note"></p>
-    <label class="toggle-line"><input type="checkbox" id="overwrite-skip-session"><span class="switch"></span><span>Don't ask again this session</span></label>
+    <label class="toggle-line"><input type="checkbox" id="overwrite-skip-batch"><span class="switch"></span><span>Don't ask again this batch</span></label>
     <form method="dialog" class="chatgpt-zoom-tools" style="margin-top:12px">
-      <button class="button button-quiet" value="cancel">Cancel</button>
+      <button class="button button-quiet" value="cancel" data-testid="overwrite-cancel">Cancel</button>
       <button class="button button-primary" value="overwrite" data-testid="overwrite-confirm">Overwrite</button>
+    </form>
+  </dialog>
+  <dialog id="replace-dialog" class="app-settings-dialog" aria-labelledby="replace-dialog-title">
+    <div class="chatgpt-preview-head"><h2 id="replace-dialog-title">Replace original files?</h2></div>
+    <p>This batch would replace <strong id="replace-dialog-count">0</strong> original file(s). A backup is kept in 0. Backups until the new file is verified.</p>
+    <p id="replace-dialog-names" class="aspect-note"></p>
+    <form method="dialog" class="chatgpt-zoom-tools" style="margin-top:12px">
+      <button class="button button-quiet" value="cancel" data-testid="replace-cancel">Cancel</button>
+      <button class="button button-primary" value="replace" data-testid="replace-confirm">Replace</button>
     </form>
   </dialog>
   <dialog id="first-run-dialog" aria-labelledby="first-run-title">

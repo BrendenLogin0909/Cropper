@@ -129,33 +129,64 @@ async function setOutputFolder(path) {
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
 function url(path, filePath) { return `${path}?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(state.token)}`; }
-const overwriteSession = { skip: false };
-function askOverwrite(count, names) {
-  const dialog = $('overwrite-dialog');
+const batchPromptState = { overwriteSkip: new Set(), replaceConfirmed: new Set() };
+function hasOverwriteSkip(batchId) { return !!(batchId && batchPromptState.overwriteSkip.has(batchId)); }
+function hasReplaceAck(batchId) { return !!(batchId && batchPromptState.replaceConfirmed.has(batchId)); }
+function overwriteAckForBatch(batchId, skip) {
+  if (!batchId) return { confirm_overwrite: true };
+  if (skip) batchPromptState.overwriteSkip.add(batchId);
+  return { confirm_overwrite: true, skip_overwrite_prompt: !!skip, batch_id: batchId };
+}
+function replaceAckForBatch(batchId) {
+  if (!batchId) return { confirm_replace: true };
+  batchPromptState.replaceConfirmed.add(batchId);
+  return { confirm_replace: true, batch_id: batchId };
+}
+function askModal(dialogId, confirmValue, countId, namesId, skipId, count, names) {
+  const dialog = $(dialogId);
   if (!dialog || typeof dialog.showModal !== 'function') {
     return Promise.resolve({ ok: false, skip: false });
   }
-  $('overwrite-dialog-count').textContent = String(count || 0);
-  $('overwrite-dialog-names').textContent = (names || []).join(', ');
-  $('overwrite-skip-session').checked = false;
+  if (countId && $(countId)) $(countId).textContent = String(count || 0);
+  if (namesId && $(namesId)) $(namesId).textContent = (names || []).join(', ');
+  if (skipId && $(skipId)) $(skipId).checked = false;
   return new Promise(resolve => {
     const onClose = () => {
       dialog.removeEventListener('close', onClose);
-      resolve({ ok: dialog.returnValue === 'overwrite', skip: !!$('overwrite-skip-session')?.checked });
+      resolve({ ok: dialog.returnValue === confirmValue, skip: !!(skipId && $(skipId)?.checked) });
     };
     dialog.addEventListener('close', onClose);
     try { dialog.showModal(); } catch (_) { dialog.setAttribute('open', ''); }
   });
 }
+function askOverwrite(count, names) {
+  return askModal('overwrite-dialog', 'overwrite', 'overwrite-dialog-count', 'overwrite-dialog-names', 'overwrite-skip-batch', count, names);
+}
+function askReplace(count, names) {
+  return askModal('replace-dialog', 'replace', 'replace-dialog-count', 'replace-dialog-names', null, count, names);
+}
 async function ensureOverwriteConfirmed(paths, operation) {
   if (!paths || !paths.length) return {};
-  if (overwriteSession.skip) return { confirm_overwrite: true, skip_overwrite_prompt: true };
   const preview = await api('/api/overwrite-preview', { paths, operation });
-  if (!preview.count) return {};
-  const decision = await askOverwrite(preview.count, preview.names);
-  if (!decision.ok) throw new Error('Overwrite cancelled.');
-  if (decision.skip) overwriteSession.skip = true;
-  return { confirm_overwrite: true, skip_overwrite_prompt: !!decision.skip };
+  const batchId = preview.batch_id;
+  const extra = {};
+  if (preview.replace_count) {
+    if (!hasReplaceAck(batchId)) {
+      const decision = await askReplace(preview.replace_count, preview.replace_names);
+      if (!decision.ok) throw new Error('Replace original cancelled.');
+    }
+    Object.assign(extra, replaceAckForBatch(batchId));
+  }
+  if (preview.count) {
+    if (!hasOverwriteSkip(batchId)) {
+      const decision = await askOverwrite(preview.count, preview.names);
+      if (!decision.ok) throw new Error('Overwrite cancelled.');
+      Object.assign(extra, overwriteAckForBatch(batchId, decision.skip));
+    } else {
+      Object.assign(extra, overwriteAckForBatch(batchId, true));
+    }
+  }
+  return extra;
 }
 async function api(path, body) {
   if ((body?.stage_routing || body?.settings?.stage_routing || path === '/api/stage-finish') && !state.stageRoutingAvailable) {
@@ -165,9 +196,15 @@ async function api(path, body) {
   for (;;) {
     const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: { 'X-Cropper-Token': state.token, ...(payload === null ? {} : payload === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }) });
     const data = await response.json();
-    if (response.status === 409 && data.code === 'overwrite_confirmation_required' && payload && typeof payload === 'object') {
-      if (overwriteSession.skip) {
-        payload = { ...payload, confirm_overwrite: true, skip_overwrite_prompt: true };
+    if (response.status === 409 && payload && typeof payload === 'object' && data.code === 'overwrite_confirmation_required') {
+      const batchId = data.batch_id;
+      if (!batchId || (payload.batch_id === batchId && (payload.confirm_overwrite || payload.skip_overwrite_prompt))) {
+        const error = new Error(data.error || 'Overwrite cancelled.');
+        error.status = 409; error.code = data.code; error.count = data.count; error.names = data.names;
+        throw error;
+      }
+      if (hasOverwriteSkip(batchId)) {
+        payload = { ...payload, ...overwriteAckForBatch(batchId, true) };
         continue;
       }
       const decision = await askOverwrite(data.count, data.names);
@@ -176,8 +213,27 @@ async function api(path, body) {
         error.status = 409; error.code = data.code;
         throw error;
       }
-      if (decision.skip) overwriteSession.skip = true;
-      payload = { ...payload, confirm_overwrite: true, skip_overwrite_prompt: !!decision.skip };
+      payload = { ...payload, ...overwriteAckForBatch(batchId, decision.skip) };
+      continue;
+    }
+    if (response.status === 409 && payload && typeof payload === 'object' && data.code === 'replace_confirmation_required') {
+      const batchId = data.batch_id;
+      if (!batchId || (payload.batch_id === batchId && payload.confirm_replace)) {
+        const error = new Error(data.error || 'Replace original cancelled.');
+        error.status = 409; error.code = data.code; error.count = data.count; error.names = data.names;
+        throw error;
+      }
+      if (hasReplaceAck(batchId)) {
+        payload = { ...payload, ...replaceAckForBatch(batchId) };
+        continue;
+      }
+      const decision = await askReplace(data.count, data.names);
+      if (!decision.ok) {
+        const error = new Error('Replace original cancelled.');
+        error.status = 409; error.code = data.code;
+        throw error;
+      }
+      payload = { ...payload, ...replaceAckForBatch(batchId) };
       continue;
     }
     if (!response.ok) { const error = new Error(data.error || 'Something went wrong.'); error.status = response.status; error.retryAfter = data.retry_after; error.code = data.code; error.type = data.type; error.requestId = data.request_id; error.path = data.path; error.count = data.count; error.names = data.names; throw error; }
