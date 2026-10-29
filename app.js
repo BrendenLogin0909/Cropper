@@ -890,8 +890,8 @@ function stripGuidanceControls(text) {
 function sanitizeGuidance(text) {
   const cleaned = stripGuidanceControls(String(text ?? '')).trim();
   if (!cleaned) return '';
-  const chars = Array.from(cleaned);
-  return chars.length <= 500 ? cleaned : chars.slice(0, 500).join('');
+  if (Array.from(cleaned).length > 500) return '';
+  return cleaned;
 }
 function guidanceLength(text) {
   return Array.from(stripGuidanceControls(String(text ?? '')).trim()).length;
@@ -919,26 +919,46 @@ function photoHasGuidance(path, snapshot) {
 }
 function applyGuidanceField(field, counter, truncation, notice) {
   if (!field) return '';
-  const raw = String(field.value || '');
-  const stripped = stripGuidanceControls(raw);
-  const truncated = Array.from(stripped.trim()).length > 500;
-  const next = truncated ? sanitizeGuidance(stripped) : stripped;
-  if (field.value !== next) field.value = next;
-  const sanitized = sanitizeGuidance(next);
+  if (!field.dataset) field.dataset = {};
+  const previous = field.dataset.guidanceLast || '';
+  const stripped = stripGuidanceControls(String(field.value || ''));
+  const over = Array.from(stripped.trim()).length > 500;
+  if (over) {
+    field.value = previous;
+    const sanitized = sanitizeGuidance(previous);
+    if (counter) counter.textContent = `${Array.from(sanitized).length}/500`;
+    if (truncation && truncation.classList) truncation.classList.toggle('hidden', !notice);
+    return sanitized;
+  }
+  field.dataset.guidanceLast = stripped;
+  if (field.value !== stripped) field.value = stripped;
+  const sanitized = sanitizeGuidance(stripped);
   if (counter) counter.textContent = `${Array.from(sanitized).length}/500`;
-  if (truncation && truncation.classList) truncation.classList.toggle('hidden', !(notice && truncated));
+  if (truncation && truncation.classList) truncation.classList.toggle('hidden', true);
   return sanitized;
 }
 function bindGuidanceField(field, counter, truncation, onStore) {
   if (!field || field.dataset && field.dataset.guidanceBound) return;
   if (field.dataset) field.dataset.guidanceBound = '1';
   else field.dataset = { guidanceBound: '1' };
-  field.addEventListener('paste', () => { if (field.dataset) field.dataset.guidancePaste = '1'; });
-  field.addEventListener('input', () => {
-    const pasted = field.dataset && field.dataset.guidancePaste === '1';
+  field.dataset.guidanceLast = field.value || '';
+  const store = () => {
+    const value = applyGuidanceField(field, counter, truncation, field.dataset.guidancePaste === '1');
     if (field.dataset) delete field.dataset.guidancePaste;
-    const value = applyGuidanceField(field, counter, truncation, pasted);
     if (onStore) onStore(value, field);
+  };
+  field.addEventListener('paste', () => { if (field.dataset) field.dataset.guidancePaste = '1'; });
+  field.addEventListener('drop', () => { if (field.dataset) field.dataset.guidancePaste = '1'; });
+  field.addEventListener('compositionend', () => {
+    if (field.dataset) field.dataset.guidancePaste = '1';
+    store();
+  });
+  field.addEventListener('input', event => {
+    if (event && event.isComposing) return;
+    const pasted = (field.dataset && field.dataset.guidancePaste === '1')
+      || (event && (event.inputType === 'insertFromPaste' || event.inputType === 'insertFromDrop'));
+    if (pasted && field.dataset) field.dataset.guidancePaste = '1';
+    store();
   });
 }
 function updateChatgptControls() {
@@ -1085,7 +1105,7 @@ function guidancePhotoRow(path, store) {
   truncation.className = 'guidance-truncation hidden';
   truncation.setAttribute('data-testid', 'guidance-photo-truncation');
   truncation.setAttribute('role', 'status');
-  truncation.textContent = 'Guidance is limited to 500 characters, so we trimmed the extra text.';
+  truncation.textContent = 'Guidance is limited to 500 characters. The extra text was not added.';
   fieldWrap.append(label, meta, hint, truncation);
   row.append(thumb, fieldWrap);
   applyGuidanceField(textarea, counter, truncation, false);

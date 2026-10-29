@@ -10,7 +10,8 @@ const FAMILY = '👨‍👩‍👧';
 const FLAG = '🇬🇧';
 const ACCENT = 'e\u0301';
 const HINT = 'This text is sent to OpenAI with the image. Leave out private details like full names, addresses or dates of birth.';
-const TRUNCATION = 'Guidance is limited to 500 characters, so we trimmed the extra text.';
+const TRUNCATION = 'Guidance is limited to 500 characters. The extra text was not added.';
+const CLUSTER = '👍🏽';
 const OVERRIDE = 'If this note conflicts with the batch context, follow this note.';
 
 const helpers = vm.runInNewContext(
@@ -32,15 +33,15 @@ test('AC4 code-point counting, control stripping, trim and 500 cap match the bac
   assert.equal(stripGuidanceControls('line1\nline2'), 'line1\nline2');
   assert.equal(sanitizeGuidance('  sailor hats  '), 'sailor hats');
   assert.equal(sanitizeGuidance(' \n\t '), '');
-  assert.equal(sanitizeGuidance('a'.repeat(525)), 'a'.repeat(500));
-  assert.equal(sanitizeGuidance(ACCENT.repeat(251)).length, 500);
+  assert.equal(sanitizeGuidance('a'.repeat(525)), '');
+  assert.equal(sanitizeGuidance(ACCENT.repeat(251)), '');
   assert.equal(guidanceLength('a'.repeat(500)), 500);
   assert.equal(guidanceWasTruncated('a'.repeat(501)), true);
   assert.equal(guidanceWasTruncated('a'.repeat(500)), false);
 });
 
-test('AC4 paste truncates with a visible notice; typing over the cap is trimmed without a notice', () => {
-  const field = { value: 'a'.repeat(480) };
+test('AC4 paste over 500 is refused with a notice and never trimmed', () => {
+  const field = { value: 'a'.repeat(480), dataset: {} };
   const counter = {};
   const truncation = { classList: { toggle(name, hidden) { truncation.hidden = hidden; } } };
   helpers.applyGuidanceField(field, counter, truncation, true);
@@ -48,13 +49,26 @@ test('AC4 paste truncates with a visible notice; typing over the cap is trimmed 
   assert.equal(truncation.hidden, true);
   field.value = 'a'.repeat(540);
   helpers.applyGuidanceField(field, counter, truncation, true);
-  assert.equal(field.value, 'a'.repeat(500));
-  assert.equal(counter.textContent, '500/500');
+  assert.equal(field.value, 'a'.repeat(480));
+  assert.equal(counter.textContent, '480/500');
   assert.equal(truncation.hidden, false);
   field.value = 'a'.repeat(510);
   helpers.applyGuidanceField(field, counter, truncation, false);
-  assert.equal(field.value, 'a'.repeat(500));
+  assert.equal(field.value, 'a'.repeat(480));
   assert.equal(truncation.hidden, true);
+});
+
+test('AC4 refusing a paste does not split a grapheme cluster at 499', () => {
+  const field = { value: 'a'.repeat(499), dataset: {} };
+  const counter = {};
+  const truncation = { classList: { toggle(name, hidden) { truncation.hidden = hidden; } } };
+  helpers.applyGuidanceField(field, counter, truncation, false);
+  assert.equal(Array.from(CLUSTER).length, 2);
+  field.value = 'a'.repeat(499) + CLUSTER;
+  helpers.applyGuidanceField(field, counter, truncation, true);
+  assert.equal(field.value, 'a'.repeat(499));
+  assert.equal(Array.from(field.value).length, 499);
+  assert.equal(truncation.hidden, false);
 });
 
 test('AC1 empty snapshot sends no guidance; AC5 freezes notes at run start', () => {
@@ -223,6 +237,10 @@ test('Wren copy, privacy hint, truncation notice and data-testids are present', 
   assert.match(source, /e\.g\. man in black suit and white shirt, woman in blue dress/);
   assert.match(source, /e\.g\. sailor hats, mostly lost to overexposure/);
   assert.match(source, /e\.g\. bride's bouquet is pink roses/);
+  assert.match(source, /compositionend/);
+  assert.match(source, /insertFromDrop/);
+  assert.doesNotMatch(html, /so we trimmed the extra text/);
+  assert.doesNotMatch(source, /so we trimmed the extra text/);
 });
 
 test('Prompt-order contract is documented next to the comments plumbing', () => {
