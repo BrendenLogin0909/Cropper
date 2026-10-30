@@ -161,6 +161,18 @@ def image_path(value: str) -> Path:
     return path
 
 
+def pair_image(value, root: Path, role: str) -> Path:
+    label = f'{role.capitalize()} image'
+    if value is None or not str(value).strip():
+        raise ValueError(f'{label} not found.')
+    path = stage_files.resolve_in_root(value, root, label=label)
+    if not path.is_file():
+        raise ValueError(f'{label} not found.')
+    if path.suffix.lower() not in EXTENSIONS:
+        raise ValueError("That image is unavailable or its format is unsupported.")
+    return path
+
+
 def order_corners(points: list[list[float]]) -> np.ndarray:
     """Accept four clicks in any order; return TL, TR, BR, BL."""
     array = np.asarray(points, dtype=np.float32)
@@ -322,31 +334,37 @@ def merge_front_and_back(front: Image.Image, back: Image.Image, back_rotation: i
     return output
 
 
-def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_source: str, back_rotation: int) -> tuple[Path, tuple[int, int]]:
-    if front_path.resolve() == back_path.resolve():
+def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_source: str, back_rotation: int,
+                      root: Path | None = None) -> tuple[Path, tuple[int, int]]:
+    if front_path is None or not str(front_path).strip():
+        raise ValueError('Front image not found.')
+    if back_path is None or not str(back_path).strip():
+        raise ValueError('Back image not found.')
+    allowed = stage_files.pairing_root(front_path, back_path, root)
+    front_path = pair_image(front_path, allowed, 'front')
+    back_path = pair_image(back_path, allowed, 'back')
+    if stage_files.same_path(front_path, back_path):
         raise ValueError("Choose two different images: the front first, then its back.")
-    front, front_info = load_image(front_path)
-    back, _ = load_image(back_path)
-    merged = merge_front_and_back(front, back, back_rotation)
     source_for_name = back_path if name_source == "back" else front_path if name_source == "front" else None
     if source_for_name is None:
         raise ValueError("Choose whether to name the pair from the first or second image.")
-    if front_path.parent != back_path.parent:
-        raise ValueError('Choose two different images in the same folder.')
     stem = source_for_name.stem
     protected = False
-    if front_path.parent.name == stage_files.CROP_QUEUE:
+    file_settings = stage_files._settings()
+    custom = str(file_settings.get('output_folder') or '').strip()
+    if custom:
+        output_root = Path(custom).expanduser().resolve()
+    else:
+        output_root = front_path.parent
+    if front_path.parent.name == stage_files.CROP_QUEUE and not custom:
         if stem.endswith('_c'):
             stem = stem[:-2]
         destination = front_path.parent / f'{stem}_front-back_c{source_for_name.suffix}'
-        snapshots = [source_for_name.resolve()]
+        snapshots = []
     else:
-        file_settings = stage_files._settings()
-        custom = str(file_settings.get('output_folder') or '').strip()
-        root = Path(custom).expanduser().resolve() if custom else front_path.parent
         policy = file_settings.get('conflict_policy') or 'skip'
-        destination = root / stage_files.windows_safe_filename(
-            f'{stem}_front-back{source_for_name.suffix}')
+        named = source_for_name.with_stem(f'{stem}_front-back')
+        destination = output_root / stage_files.render_filename(named, 'crop')
         occupied = {front_path.resolve(), back_path.resolve()}
         intended = destination
         destination = stage_files.protect_original_output(destination, front_path, occupied, policy)
@@ -354,6 +372,11 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
             destination, back_path, occupied | {destination}, policy)
         protected = not stage_files.same_path(destination, intended)
         snapshots = []
+    stage_files.assert_output_in_root(destination, output_root)
+    stage_files.probe_folder_writable(output_root)
+    front, front_info = load_image(front_path)
+    back, _ = load_image(back_path)
+    merged = merge_front_and_back(front, back, back_rotation)
     plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
             'keep_source': True, 'operation': 'crop', 'protected_original': protected}
     stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
@@ -844,9 +867,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, payload.getvalue(), "image/jpeg")
                 return
             if self.path == "/api/merge":
-                front_path = image_path(data.get("front_path", ""))
-                back_path = image_path(data.get("back_path", ""))
-                destination, size = save_merged_image(front_path, back_path, data.get("settings", {}), data.get("name_source", "back"), int(data.get("back_rotation", 0)))
+                folder = data.get("folder") or data.get("path") or None
+                destination, size = save_merged_image(
+                    data.get("front_path", ""), data.get("back_path", ""),
+                    data.get("settings", {}), data.get("name_source", "back"),
+                    int(data.get("back_rotation", 0)), root=folder)
                 body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]}
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
@@ -949,9 +974,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {'items': suggestions(clean_path(data.get('path', '')))})
                 return
             if self.path == '/api/photo-link':
-                front = image_path(data.get('front_path', ''))
-                composite = image_path(data.get('composite_path', ''))
-                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'))
+                folder = data.get('folder') or data.get('path') or None
+                front_raw = data.get('front_path', '')
+                composite_raw = data.get('composite_path', '')
+                allowed = stage_files.pairing_root(front_raw, composite_raw, folder)
+                front = pair_image(front_raw, allowed, 'front')
+                composite = pair_image(composite_raw, allowed, 'back')
+                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'), root=allowed)
                 for pending in list_pending(front.parent):
                     if stage_files.same_path(pending['front_path'], front): attach_link(pending['id'], link)
                 self.json(200, link)
