@@ -270,6 +270,51 @@ def apply_conflict(path: Path, taken: set[Path], policy: str) -> tuple[Path, boo
     raise ValueError(f'Output already exists: {path}. Nothing was overwritten.')
 
 
+def protect_original_output(output: Path, source: Path, taken: set[Path], policy: str) -> Path:
+    """Copy mode must never overwrite the original PNG; apply the conflict policy instead."""
+    if output is None or not same_path(output, source):
+        return output
+    policy = (policy or 'skip').lower()
+    occupied = set(taken)
+    occupied.add(source)
+    if policy == 'overwrite':
+        policy = 'auto-suffix'
+    chosen, overwrite = apply_conflict(output, occupied, policy)
+    if overwrite or same_path(chosen, source):
+        raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
+    return chosen
+
+
+def probe_folder_writable(folder: Path) -> None:
+    """Create-and-delete a temp file so unwritable destinations fail before a paid call."""
+    folder = Path(folder)
+    try:
+        target = windows_long_path(folder)
+        target.mkdir(parents=True, exist_ok=True)
+        handle, temp_name = tempfile.mkstemp(prefix='.cropper-preflight-', suffix='.tmp', dir=str(target))
+        os.close(handle)
+        Path(temp_name).unlink(missing_ok=True)
+    except PermissionError:
+        raise
+    except OSError as exc:
+        raise PermissionError(exc.filename or str(folder)) from exc
+
+
+def assert_plans_writable(plans: list[dict]) -> None:
+    seen: set[str] = set()
+    for item in plans:
+        paths = [item.get('output'), *(item.get('snapshots') or [])]
+        for path in paths:
+            if path is None:
+                continue
+            folder = Path(path).parent
+            key = path_key(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            probe_folder_writable(folder)
+
+
 @contextmanager
 def interprocess_lock(path: Path, timeout: float = LOCK_TIMEOUT_SECONDS):
     path = windows_long_path(Path(path))
@@ -416,6 +461,12 @@ def reserve_plan_outputs(plans: list[dict], policy: str | None = None) -> list[d
             output = item.get('output')
             if output is None:
                 continue
+            if item.get('replace'):
+                taken.add(Path(output).resolve())
+                continue
+            if item.get('keep_source'):
+                output = protect_original_output(output, item['source'], taken, policy)
+                item['output'] = output
             chosen, overwrite = apply_conflict(output, taken, policy)
             item['output'] = chosen
             item['overwrite'] = overwrite
@@ -514,6 +565,7 @@ def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None)
         output = plans[1]['output']
         suffix = '_col' if operation == 'colorize' else '_ai'
         plans[1]['output'] = output.with_name(f'{sources[1].stem}_front-back{suffix}.png')
+    assert_plans_writable(plans)
     return reserve_plan_outputs(plans)
 
 
@@ -559,14 +611,13 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
     stage = STAGES.get(parent.name)
     replace = bool(settings.get('replace_original')) and operation != 'finish'
     rendered = lambda op: render_filename(source, op, index=index, batch_size=batch_size)
+    keep_source = False
     if operation == 'crop':
         if parent.name in FOLDERS and parent.name != ORIGINAL:
             raise ValueError('Crop from the batch root or 1. Original, not a later stage folder.')
         snapshots = [root / ORIGINAL / source.name]
         output = root / CROP_QUEUE / rendered('crop')
-    else:
-        if stage is None:
-            raise ValueError('Open a 1.5, 1.6 or 1.7 TBP stage folder for flat batch routing.')
+    elif stage is not None:
         snapshots = [root / {1: CROPPED, 2: ENHANCED, 3: AI}[stage] / source.name]
         if operation == 'enhance':
             if stage != 1:
@@ -584,6 +635,21 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
             ) / rendered(operation)
         else:
             raise ValueError('Invalid batch stage operation.')
+    elif operation == 'finish':
+        raise ValueError('Open a 1.5, 1.6 or 1.7 TBP stage folder for flat batch routing.')
+    elif operation in {'enhance', 'restore', 'colorize'}:
+        keep_source = True
+        root = Path(custom_root).expanduser().resolve() if custom_root else parent
+        snapshots = []
+        output = root / rendered(operation)
+        if not replace:
+            occupied = set(taken or ())
+            occupied |= taken_outputs()
+            occupied.add(source)
+            output = protect_original_output(
+                output, source, occupied, settings.get('conflict_policy') or 'skip')
+    else:
+        raise ValueError('Invalid batch stage operation.')
     if replace:
         if not settings.get('backup_originals', True):
             raise ValueError('Replace original needs backups on. Cropper will not modify the original.')
@@ -600,7 +666,8 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
         chosen = next_free_index(source, operation, output.parent, occupied, start=index, batch_size=batch_size)
         output = output.parent / render_filename(source, operation, index=chosen, batch_size=batch_size)
     return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output,
-            'overwrite': False, 'replace': False, 'operation': operation}
+            'overwrite': False, 'replace': False, 'operation': operation,
+            'keep_source': keep_source}
 
 
 def planned_overwrites(plans: list[dict]) -> list[Path]:
@@ -739,11 +806,24 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                     if payload is None:
                         raise ValueError('Missing processed image.')
                     overwrite = bool(item.get('overwrite'))
+                    replacing = bool(item.get('replace')) and same_path(output, source)
+                    if replacing:
+                        overwrite = True
+                    elif item.get('keep_source') and same_path(output, source):
+                        output = protect_original_output(
+                            output, source, set(writes) | set(sources) | taken_outputs(), policy)
+                        item['output'] = output
+                        overwrite = False
                     if not overwrite and (output in writes or output.exists() or output in sources):
                         chosen, overwrite = apply_conflict(output, set(writes) | set(sources) | taken_outputs(), policy)
                         output = chosen
                         item['output'] = output
                         item['overwrite'] = overwrite
+                        if item.get('keep_source') and same_path(output, source):
+                            output = protect_original_output(
+                                output, source, set(writes) | set(sources) | taken_outputs(), policy)
+                            item['output'] = output
+                            overwrite = False
                         if not overwrite and (output in writes or output.exists() or output in sources):
                             raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
                     if overwrite and output.exists():
@@ -762,7 +842,8 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                         raise ValueError(f'Saved image verification failed: {target.name}')
                 for item in plans:
                     source = item['source']
-                    if source not in item['snapshots'] and source != item.get('output'):
+                    if (source not in item['snapshots'] and source != item.get('output')
+                            and not item.get('keep_source')):
                         if source.read_bytes() != originals[source]:
                             raise ValueError(f'Source changed while saving: {source.name}')
                         removed.append(source)
@@ -822,6 +903,9 @@ def file_results(sources: list[Path], payloads: list[bytes], operation: str,
         for item, dest in zip(plans, output_paths):
             if dest is not None:
                 item['output'] = Path(dest)
-                item['overwrite'] = Path(dest).exists() and (_settings().get('conflict_policy') == 'overwrite')
+                if item.get('replace') and same_path(dest, item['source']):
+                    item['overwrite'] = True
+                else:
+                    item['overwrite'] = Path(dest).exists() and (_settings().get('conflict_policy') == 'overwrite')
                 item['fixed_output'] = True
     return commit(plans, payloads)

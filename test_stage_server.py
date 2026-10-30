@@ -60,13 +60,23 @@ class StageServerTests(unittest.TestCase):
         self.assertFalse(source.exists());self.assertEqual(self.edit.call_count,1)
 
     def test_invalid_input_stage_is_rejected_before_api_call(self):
-        source=self.source('other','photo.png')
-        for flag in [True,False,None]:
-            body={'front_path':str(source)}
-            if flag is not None:body['stage_routing']=flag
+        nested=self.source(str(Path(stages.CROP_QUEUE)/'old-output'),'photo.png')
+        completed=self.source(stages.AI_QUEUE,'done.png')
+        for source in [nested, completed]:
+            self.edit.reset_mock()
             with self.assertRaises(HTTPError) as caught:
-                self.post('/api/chatgpt-generate',body)
-            self.assertEqual(caught.exception.code,400);caught.exception.close();self.edit.assert_not_called();self.assertTrue(source.exists())
+                self.post('/api/chatgpt-generate',{'front_path':str(source)})
+            self.assertEqual(caught.exception.code,400);caught.exception.close()
+            self.edit.assert_not_called();self.assertTrue(source.exists())
+
+    def test_non_stage_folder_is_accepted_for_ai_restore(self):
+        source=self.source('other','[Scan]_20261027_0004 [B&W].jpg')
+        record=self.post('/api/chatgpt-generate',{'front_path':str(source)})
+        self.post('/api/chatgpt-accept',{'id':record['id']})
+        self.assertTrue((source.parent/'[Scan]_20261027_0004 [B&W]_ai.png').exists())
+        self.assertTrue(source.exists())
+        self.assertEqual(self.edit.call_count,1)
+        self.assertFalse((source.parent/stages.AI_QUEUE).exists())
 
     def test_false_and_missing_flags_cannot_restore_legacy_filing(self):
         for index, flag in enumerate([False, None]):

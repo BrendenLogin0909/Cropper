@@ -139,8 +139,12 @@ class StageFilesTests(unittest.TestCase):
 
     def test_invalid_stage_refused(self):
         with TemporaryDirectory() as tmp:
-            root=Path(tmp);source=self.source(root,'unrecognised')
-            with self.assertRaisesRegex(ValueError,'TBP stage'): stages.plan(source,'restore')
+            root=Path(tmp)
+            source=self.source(root,'unrecognised')
+            planned=stages.plan(source,'restore')
+            self.assertTrue(stages.same_path(planned['output'], source.parent/'photo_c_ai.png'))
+            self.assertTrue(planned.get('keep_source'))
+            with self.assertRaisesRegex(ValueError,'TBP stage'): stages.plan(source,'finish')
             source=self.source(root,stages.AI_QUEUE)
             with self.assertRaisesRegex(ValueError,'already completed'): stages.plan(source,'restore')
 
