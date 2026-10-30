@@ -50,9 +50,18 @@ CONFIRMATION_TTL_SECONDS = 15 * 60
 CONFIRMATIONS: dict[str, dict] = {}
 CONFIRMATIONS_LOCK = threading.Lock()
 TABS: dict[tuple[str, str], float] = {}
+ALLOWED_ROOTS: dict[tuple[str, str], set[str]] = {}
 TABS_LOCK = threading.Lock()
 TAB_ID_MIN_LEN = 16
 TAB_ID_MAX_LEN = 128
+
+
+class ConfirmationRequired(Exception):
+    """Raised when a write needs an overwrite/replace token before it can proceed."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error") or "Confirmation required.")
+        self.payload = payload
 
 
 def hostname_of(host_header: str) -> str:
@@ -141,11 +150,11 @@ def image_path(value: str) -> Path:
     return path
 
 
-def pair_image(value, root: Path, role: str) -> Path:
+def pair_image(value, roots, role: str) -> Path:
     label = f'{role.capitalize()} image'
     if value is None or not str(value).strip():
         raise ValueError(f'{label} not found.')
-    path = stage_files.resolve_in_root(value, root, label=label)
+    path = stage_files.resolve_in_allowed_roots(value, roots, label=label)
     if not path.is_file():
         raise ValueError(f'{label} not found.')
     if path.suffix.lower() not in EXTENSIONS:
@@ -315,14 +324,17 @@ def merge_front_and_back(front: Image.Image, back: Image.Image, back_rotation: i
 
 
 def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_source: str, back_rotation: int,
-                      root: Path | None = None) -> tuple[Path, tuple[int, int]]:
+                      root: Path | None = None, allowed_roots=None, tab_id: str | None = None,
+                      confirm=None) -> tuple[Path, tuple[int, int]]:
     if front_path is None or not str(front_path).strip():
         raise ValueError('Front image not found.')
     if back_path is None or not str(back_path).strip():
         raise ValueError('Back image not found.')
-    allowed = stage_files.pairing_root(front_path, back_path, root)
-    front_path = pair_image(front_path, allowed, 'front')
-    back_path = pair_image(back_path, allowed, 'back')
+    roots = allowed_roots
+    if roots is None and tab_id:
+        roots = allowed_roots_for(tab_id)
+    front_path = pair_image(front_path, roots, 'front')
+    back_path = pair_image(back_path, roots, 'back')
     if stage_files.same_path(front_path, back_path):
         raise ValueError("Choose two different images: the front first, then its back.")
     source_for_name = back_path if name_source == "back" else front_path if name_source == "front" else None
@@ -339,12 +351,12 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     if front_path.parent.name == stage_files.CROP_QUEUE and not custom:
         if stem.endswith('_c'):
             stem = stem[:-2]
-        destination = front_path.parent / f'{stem}_front-back_c{source_for_name.suffix}'
+        destination = front_path.parent / f'{stem}_front-back{source_for_name.suffix}'
         snapshots = []
     else:
         policy = file_settings.get('conflict_policy') or 'skip'
         named = source_for_name.with_stem(f'{stem}_front-back')
-        destination = output_root / stage_files.render_filename(named, 'crop')
+        destination = output_root / stage_files.render_filename(named, 'merge')
         occupied = {front_path.resolve(), back_path.resolve()}
         intended = destination
         destination = stage_files.protect_original_output(destination, front_path, occupied, policy)
@@ -354,11 +366,16 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
         snapshots = []
     stage_files.assert_output_in_root(destination, output_root)
     stage_files.probe_folder_writable(output_root)
+    plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
+            'keep_source': True, 'operation': 'merge', 'protected_original': protected,
+            'root': output_root}
+    if confirm:
+        refusal = confirm([plan])
+        if refusal:
+            raise ConfirmationRequired(refusal)
     front, front_info = load_image(front_path)
     back, _ = load_image(back_path)
     merged = merge_front_and_back(front, back, back_rotation)
-    plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
-            'keep_source': True, 'operation': 'crop', 'protected_original': protected}
     stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
     stage_files.remember_protected_outputs([plan])
     return destination, merged.size
@@ -389,7 +406,8 @@ def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, 
     outputs = stage_files.file_results(sources, payloads, 'enhance')
     if link:
         try:
-            approve_link(outputs[0], outputs[1], link['split'], link['layout'])
+            approve_link(outputs[0], outputs[1], link['split'], link['layout'],
+                         allowed_roots=[outputs[0].parent, outputs[1].parent])
         except (OSError, ValueError) as error:
             warnings.warn(f'Images saved, but output pair link could not be carried forward: {error}')
     archived = planned['snapshots'][0] if planned.get('snapshots') else None
@@ -417,9 +435,37 @@ def reset_confirmations() -> None:
 
 
 def reset_tabs() -> None:
-    """Drop registered browser tabs. Restarts empty this store."""
+    """Drop registered browser tabs and their allowed roots. Restarts empty this store."""
     with TABS_LOCK:
         TABS.clear()
+        ALLOWED_ROOTS.clear()
+
+
+def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path | None:
+    """Remember a folder this tab opened or picked. `/` and unnamed tabs are ignored."""
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id or not tab_is_registered(tab_id, session):
+        return None
+    try:
+        path = Path(folder).expanduser().resolve()
+    except OSError:
+        return None
+    if not path.is_dir() or stage_files.is_filesystem_root(path):
+        return None
+    with TABS_LOCK:
+        ALLOWED_ROOTS.setdefault((session, tab_id), set()).add(stage_files.path_key(path))
+    return path
+
+
+def allowed_roots_for(tab_id: str, session: str | None = None) -> list[Path]:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return []
+    with TABS_LOCK:
+        keys = list(ALLOWED_ROOTS.get((session, tab_id), ()))
+    return [Path(key) for key in keys]
 
 
 def normalize_tab_id(value: object) -> str:
@@ -702,6 +748,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/list":
                 base = folder_listing(query.get("path", [""])[0])
                 folder = Path(base["path"])
+                register_allowed_root(folder, self.request_tab_id())
                 entries = list(folder.iterdir())
                 images = sorted(({"name": p.name, "path": str(p), "bytes": p.stat().st_size, "modified": p.stat().st_mtime} for p in entries if p.is_file() and p.suffix.lower() in EXTENSIONS), key=lambda x: x["name"].lower())
                 self.json(200, {**base, "images": images})
@@ -847,11 +894,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, payload.getvalue(), "image/jpeg")
                 return
             if self.path == "/api/merge":
-                folder = data.get("folder") or data.get("path") or None
-                destination, size = save_merged_image(
-                    data.get("front_path", ""), data.get("back_path", ""),
-                    data.get("settings", {}), data.get("name_source", "back"),
-                    int(data.get("back_rotation", 0)), root=folder)
+                try:
+                    destination, size = save_merged_image(
+                        data.get("front_path", ""), data.get("back_path", ""),
+                        data.get("settings", {}), data.get("name_source", "back"),
+                        int(data.get("back_rotation", 0)),
+                        allowed_roots=allowed_roots_for(self.request_tab_id()),
+                        confirm=lambda plans: self.confirm(plans, data))
+                except ConfirmationRequired as exc:
+                    self.json(409, exc.payload)
+                    return
                 body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]}
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
@@ -954,13 +1006,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {'items': suggestions(clean_path(data.get('path', '')))})
                 return
             if self.path == '/api/photo-link':
-                folder = data.get('folder') or data.get('path') or None
+                roots = allowed_roots_for(self.request_tab_id())
                 front_raw = data.get('front_path', '')
                 composite_raw = data.get('composite_path', '')
-                allowed = stage_files.pairing_root(front_raw, composite_raw, folder)
-                front = pair_image(front_raw, allowed, 'front')
-                composite = pair_image(composite_raw, allowed, 'back')
-                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'), root=allowed)
+                front = pair_image(front_raw, roots, 'front')
+                composite = pair_image(composite_raw, roots, 'back')
+                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'),
+                                    allowed_roots=roots)
                 for pending in list_pending(front.parent):
                     if stage_files.same_path(pending['front_path'], front): attach_link(pending['id'], link)
                 self.json(200, link)

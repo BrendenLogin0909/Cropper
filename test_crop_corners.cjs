@@ -40,7 +40,11 @@ test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
   const keys=code.slice(code.indexOf("document.addEventListener('keydown'"));
   assert.ok(keys.indexOf("'INPUT','TEXTAREA','SELECT'")<keys.indexOf("event.key==='Shift'"));
   assert.match(keys,/event.key==='Shift'/);
-  assert.match(keys,/event.ctrlKey\|\|event.metaKey\)return/);
+  assert.match(keys,/event.ctrlKey\|\|event.metaKey/);
+  assert.match(keys,/key==='z'/);
+  assert.match(keys,/key==='q'/);
+  assert.match(keys,/clearCropPoints\(\)/);
+  assert.match(keys,/state.points.pop\(\)/);
   assert.doesNotMatch(keys,/event.key==='Control'/);
   assert.doesNotMatch(keys,/event.key.toLowerCase\(\)==='a'&&event.ctrlKey/);
   assert.doesNotMatch(keys,/predictCropCorners\(\);\}/);
@@ -48,8 +52,18 @@ test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
   assert.match(keys,/ArrowRight.*openImage\(state.index\+1\)/);
   const html=fs.readFileSync(__dirname+'/index.html','utf8');
   assert.match(html,/SHIFT[\s\S]*hold to zoom/);
+  assert.match(html,/Choose back/);
   assert.doesNotMatch(html,/Runs on this computer/);
   assert.match(html,/data-testid="processing-location-crop">Local/);
   assert.match(html,/data-testid="processing-location-enhance">Local/);
   assert.match(html,/data-testid="processing-location-chatgpt">OpenAI, uses your API key/);
+});
+test('merge keeps front by path and opens Choose back from the current folder',()=>{
+  assert.match(code,/merge: \{ front: null, back: null/);
+  assert.match(code,/function emptyMerge\(\)/);
+  assert.match(code,/pickFolder\(false, true\)/);
+  assert.match(code,/forBack/);
+  assert.match(code,/Choose back folder/);
+  assert.doesNotMatch(code,/state.merge = \{ front: -1/);
+  assert.match(code,/front_path: front.path, back_path: back.path/);
 });

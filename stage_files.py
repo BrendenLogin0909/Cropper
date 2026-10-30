@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import hashlib
+import io
 import json
 import os
 import re
@@ -112,11 +113,22 @@ def _link_escapes(path: Path, root: Path) -> bool:
     return False
 
 
+def is_filesystem_root(path: Path | str) -> bool:
+    """True for `/`, `C:\\`, or any drive/share root. Those cannot be allowed roots."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return False
+    return resolved.parent == resolved
+
+
 def resolve_in_root(value: Path | str, root: Path | str, *, label: str = 'That image') -> Path:
     """Resolve a user path inside root. Refuse traversal and symlink/junction escape."""
     if value is None or not str(value).strip():
         raise ValueError(f'{label} is missing.')
     root = Path(root).expanduser().resolve()
+    if is_filesystem_root(root):
+        raise ValueError(f'{label} is outside the allowed folder.')
     raw = Path(str(value).strip()).expanduser()
     candidate = raw if raw.is_absolute() else root / raw
     try:
@@ -128,22 +140,44 @@ def resolve_in_root(value: Path | str, root: Path | str, *, label: str = 'That i
     return resolved
 
 
+def allowed_root_paths(roots) -> list[Path]:
+    """Resolved, de-duplicated folders. Filesystem roots and missing values are dropped."""
+    result: list[Path] = []
+    seen: set[str] = set()
+    for item in roots or ():
+        if item is None or not str(item).strip():
+            continue
+        try:
+            path = Path(item).expanduser().resolve()
+        except OSError:
+            continue
+        if is_filesystem_root(path):
+            continue
+        key = path_key(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return result
+
+
+def resolve_in_allowed_roots(value: Path | str, roots, *, label: str = 'That image') -> Path:
+    """Resolve a user path inside any registered root. Client-supplied folder is not used."""
+    allowed = allowed_root_paths(roots)
+    if not allowed:
+        raise ValueError(f'{label} is outside the allowed folder.')
+    last_error = None
+    for root in allowed:
+        try:
+            return resolve_in_root(value, root, label=label)
+        except ValueError as exc:
+            last_error = exc
+            continue
+    raise last_error or ValueError(f'{label} is outside the allowed folder.')
+
+
 def assert_output_in_root(path: Path | str, root: Path | str) -> Path:
     """Refuse a write target that would leave the chosen output folder."""
     return resolve_in_root(path, root, label='The output')
-
-
-def pairing_root(front, back, folder=None) -> Path:
-    """Allowed root for a pair. Explicit folder wins; otherwise the shared ancestor."""
-    if folder:
-        return Path(folder).expanduser().resolve()
-    try:
-        return Path(os.path.commonpath([
-            str(Path(front).expanduser().resolve().parent),
-            str(Path(back).expanduser().resolve().parent),
-        ]))
-    except (ValueError, OSError) as exc:
-        raise ValueError('Choose a front and a back image.') from exc
 
 
 def _is_windows() -> bool:
@@ -313,7 +347,8 @@ def render_filename(source: Path, operation: str, index: int = 1, template: str 
     settings = _settings()
     template = template or settings.get('filename_template') or '{name}{suffix}{ext}'
     suffix = OPERATION_SUFFIX.get(operation, '')
-    ext = source.suffix if operation in {'crop', 'enhance'} else (source.suffix if operation == 'finish' else '.png')
+    ext = source.suffix if operation in {'crop', 'enhance', 'merge'} else (
+        source.suffix if operation == 'finish' else '.png')
     try:
         name = template.format(name=source.stem, date=date or time.strftime('%Y%m%d'),
                                index=format_index(index, batch_size), ext=ext, suffix=suffix)
@@ -392,11 +427,23 @@ def mark_protected(item: dict, intended: Path | None, chosen: Path | None) -> No
 
 
 def probe_folder_writable(folder: Path) -> None:
-    """Create-and-delete a temp file so unwritable destinations fail before a paid call."""
+    """Probe an existing ancestor. Do not create the destination folder until the first write."""
     folder = Path(folder)
+    current = folder
+    while True:
+        try:
+            exists = current.exists()
+        except OSError:
+            exists = False
+        if exists or current.parent == current:
+            break
+        current = current.parent
     try:
-        target = windows_long_path(folder)
-        target.mkdir(parents=True, exist_ok=True)
+        if not current.exists() or not current.is_dir():
+            error = PermissionError(str(folder))
+            error.filename = str(folder)
+            raise error
+        target = windows_long_path(current)
         handle, temp_name = tempfile.mkstemp(prefix='.cropper-preflight-', suffix='.tmp', dir=str(target))
         os.close(handle)
         Path(temp_name).unlink(missing_ok=True)
@@ -867,6 +914,78 @@ def resolve_index_outputs(plans: list[dict]) -> None:
         occupied.add(chosen)
 
 
+_PAYLOAD_FORMATS = {
+    '.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.webp': 'WEBP',
+    '.tif': 'TIFF', '.tiff': 'TIFF', '.bmp': 'BMP',
+}
+
+
+def _has_useful_alpha(image) -> bool:
+    if image.mode in {'RGBA', 'LA', 'PA'}:
+        extrema = image.getchannel('A').getextrema()
+        return bool(extrema) and extrema[0] < 255
+    if image.mode == 'P' and 'transparency' in image.info:
+        return True
+    return False
+
+
+def encode_payload_for_path(payload: bytes, destination: Path) -> tuple[bytes, Path]:
+    """Re-encode payload to match destination extension. Alpha that JPEG cannot hold becomes stem.png."""
+    from PIL import Image
+    dest = Path(destination)
+    original_ext = dest.suffix.lower()
+    with Image.open(io.BytesIO(payload)) as source:
+        source.load()
+        fmt = source.format
+        needs_alpha = _has_useful_alpha(source)
+        image = source.copy()
+    if needs_alpha and dest.suffix.lower() in {'.jpg', '.jpeg', '.bmp'}:
+        dest = dest.with_suffix('.png')
+    wanted = _PAYLOAD_FORMATS.get(dest.suffix.lower())
+    if wanted and fmt == wanted and dest.suffix.lower() == original_ext:
+        return payload, dest
+    if dest.suffix.lower() in {'.jpg', '.jpeg'}:
+        image = image.convert('RGB')
+    elif dest.suffix.lower() == '.png' and needs_alpha and image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    with tempfile.TemporaryDirectory(prefix='cropper-encode-') as temporary:
+        rendered = Path(temporary) / ('image' + dest.suffix)
+        options = {}
+        format_name = _PAYLOAD_FORMATS[dest.suffix.lower()]
+        if format_name == 'JPEG':
+            options.update(quality=95, subsampling=0, optimize=True)
+        elif format_name == 'WEBP':
+            options.update(quality=95, method=6)
+        image.save(rendered, format=format_name, **options)
+        return rendered.read_bytes(), dest
+
+
+def _missing_parents(folder: Path) -> list[Path]:
+    current = Path(folder)
+    missing: list[Path] = []
+    while True:
+        try:
+            exists = current.exists()
+        except OSError:
+            exists = False
+        if exists or current.parent == current:
+            break
+        missing.append(current)
+        current = current.parent
+    missing.reverse()
+    return missing
+
+
+def _remove_empty_dirs(folders: list[Path]) -> None:
+    for folder in reversed(folders):
+        try:
+            target = windows_long_path(folder)
+            if target.is_dir() and not any(target.iterdir()):
+                target.rmdir()
+        except OSError:
+            pass
+
+
 def _atomic_create(target: Path, data: bytes, overwrite: bool = False) -> bool:
     """Write target via temp + os.replace. Returns True if this call created a new file to roll back."""
     target = Path(target)
@@ -962,8 +1081,12 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                     writes[output] = payload
                     outputs.append(output)
             created, removed = [], []
+            created_dirs: list[Path] = []
             try:
                 for target, data in writes.items():
+                    for folder in _missing_parents(Path(target).parent):
+                        if folder not in created_dirs:
+                            created_dirs.append(folder)
                     overwrite = target in overwrites
                     new_file = _atomic_create(target, data, overwrite=overwrite)
                     if new_file:
@@ -1014,6 +1137,7 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                             windows_long_path(target).unlink(missing_ok=True)
                         except OSError:
                             pass
+                    _remove_empty_dirs(created_dirs)
                 raise
             return outputs
     finally:
@@ -1039,6 +1163,18 @@ def file_results(sources: list[Path], payloads: list[bytes], operation: str,
                 else:
                     item['overwrite'] = Path(dest).exists() and (_settings().get('conflict_policy') == 'overwrite')
                 item['fixed_output'] = True
-    outputs = commit(plans, payloads)
+    encoded: list[bytes | None] = []
+    policy = (_settings().get('conflict_policy') or 'skip').lower()
+    for item, payload in zip(plans, payloads):
+        if item.get('replace') and payload is not None and item.get('output') is not None:
+            data, dest = encode_payload_for_path(payload, Path(item['output']))
+            if not same_path(dest, item['output']):
+                item['output'] = dest
+                item['replace'] = False
+                item['overwrite'] = dest.exists() and policy == 'overwrite'
+            encoded.append(data)
+        else:
+            encoded.append(payload)
+    outputs = commit(plans, encoded)
     remember_protected_outputs(plans)
     return outputs

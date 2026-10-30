@@ -117,7 +117,7 @@ class StageServerTests(unittest.TestCase):
     def test_finish_preview_then_files_both_pair_members_without_api(self):
         front=self.source(stages.ENHANCE_QUEUE,'photo_c_e.png')
         combined=self.source(stages.ENHANCE_QUEUE,'photo_front-back_c_e.png')
-        photo_pairs.approve_link(front,combined,50,'right')
+        photo_pairs.approve_link(front,combined,50,'right',allowed_roots=[front.parent])
         preview=self.post('/api/stage-finish',{'paths':[str(front)],'dry_run':True})
         self.assertEqual(len(preview['items']),2);self.assertTrue(front.exists());self.assertTrue(combined.exists())
         result=self.post('/api/stage-finish',{'paths':[str(front)],'dry_run':False})

@@ -74,8 +74,8 @@ class CropperCoreTests(unittest.TestCase):
             folder = Path(temporary)/"1.5. TBP Cropped"; folder.mkdir()
             front_path, back_path = folder / "front.jpg", folder / "back.jpg"
             portrait.save(front_path); back.save(back_path)
-            destination, _ = save_merged_image(front_path, back_path, {"mode": "subfolder", "subfolder": "Front and Back", "suffix": "_paired"}, "back", 0)
-            self.assertEqual(destination.name, "back_front-back_c.jpg")
+            destination, _ = save_merged_image(front_path, back_path, {"mode": "subfolder", "subfolder": "Front and Back", "suffix": "_paired"}, "back", 0, allowed_roots=[folder])
+            self.assertEqual(destination.name, "back_front-back.jpg")
             self.assertTrue(destination.exists())
 
 
