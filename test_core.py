@@ -57,7 +57,7 @@ class CropperCoreTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertEqual(source.read_bytes(),original)
             self.assertTrue(result.is_file())
-            self.assertEqual(result.parent, source.parent)
+            self.assertTrue(stages.same_path(result.parent, source.parent))
             self.assertFalse((source.parent/'1.5. TBP Cropped').exists())
 
     def test_front_and_back_layout_and_back_filename(self):
