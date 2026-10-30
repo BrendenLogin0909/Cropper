@@ -467,6 +467,9 @@ def reset_tabs() -> None:
 
 def choose_folder_dialog() -> Path | None:
     """Open the native OS folder dialog on its own thread. None if the user cancels."""
+    stub = os.environ.get("CROPPER_TEST_DIALOG_FOLDER", "").strip()
+    if stub:
+        return None if stub == "-" else Path(stub)
     result: list = []
     errors: list = []
 
