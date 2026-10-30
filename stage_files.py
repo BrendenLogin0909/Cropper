@@ -271,7 +271,7 @@ def apply_conflict(path: Path, taken: set[Path], policy: str) -> tuple[Path, boo
 
 
 def protect_original_output(output: Path, source: Path, taken: set[Path], policy: str) -> Path:
-    """Copy mode must never overwrite the original PNG; apply the conflict policy instead."""
+    """Overwrite never replaces the original; only Replace original can. Apply conflict policy instead."""
     if output is None or not same_path(output, source):
         return output
     policy = (policy or 'skip').lower()
@@ -283,6 +283,36 @@ def protect_original_output(output: Path, source: Path, taken: set[Path], policy
     if overwrite or same_path(chosen, source):
         raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
     return chosen
+
+
+def protected_original_message(name: str) -> str:
+    return f'Saved as {name} to protect the original'
+
+
+_last_protected: set[str] = set()
+
+
+def remember_protected_outputs(plans: list[dict]) -> None:
+    names = {
+        path_key(item['output'])
+        for item in plans
+        if item.get('protected_original') and item.get('output') is not None
+    }
+    with LOCK:
+        global _last_protected
+        _last_protected = names
+
+
+def saved_protected(path: Path | str) -> bool:
+    with LOCK:
+        return path_key(path) in _last_protected
+
+
+def mark_protected(item: dict, intended: Path | None, chosen: Path | None) -> None:
+    if chosen is None or intended is None:
+        return
+    if not same_path(chosen, intended):
+        item['protected_original'] = True
 
 
 def probe_folder_writable(folder: Path) -> None:
@@ -467,8 +497,10 @@ def reserve_plan_outputs(plans: list[dict], policy: str | None = None) -> list[d
                 taken.add(Path(output).resolve())
                 continue
             if item.get('keep_source'):
+                intended = output
                 output = protect_original_output(output, item['source'], taken, policy)
                 item['output'] = output
+                mark_protected(item, intended, output)
             chosen, overwrite = apply_conflict(output, taken, policy)
             item['output'] = chosen
             item['overwrite'] = overwrite
@@ -604,52 +636,69 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
          taken: set[Path] | None = None) -> dict:
     source = source.resolve()
     parent = source.parent
-    if any(ancestor.name in FOLDERS for ancestor in parent.parents):
-        raise ValueError('Nested stage folders are not supported. Open the batch root or its stage folder directly.')
+    nested = any(ancestor.name in FOLDERS for ancestor in parent.parents)
     settings = _settings()
     custom_root = str(settings.get('output_folder') or '').strip()
     root = Path(custom_root).expanduser().resolve() if custom_root else (
         parent.parent if parent.name in FOLDERS else parent)
-    stage = STAGES.get(parent.name)
+    stage = None if nested else STAGES.get(parent.name)
     replace = bool(settings.get('replace_original')) and operation != 'finish'
     rendered = lambda op: render_filename(source, op, index=index, batch_size=batch_size)
     keep_source = False
-    if operation == 'crop':
-        if parent.name in FOLDERS and parent.name != ORIGINAL:
-            raise ValueError('Crop from the batch root or 1. Original, not a later stage folder.')
-        snapshots = [root / ORIGINAL / source.name]
-        output = root / CROP_QUEUE / rendered('crop')
-    elif stage is not None:
-        snapshots = [root / {1: CROPPED, 2: ENHANCED, 3: AI}[stage] / source.name]
-        if operation == 'enhance':
-            if stage != 1:
-                raise ValueError('Auto-improve must start from 1.5. TBP Cropped.')
-            output = root / ENHANCE_QUEUE / rendered('enhance')
-        elif operation in {'restore', 'colorize', 'finish'}:
-            if operation == 'restore' and stage == 3:
-                raise ValueError('This photo already completed AI enhancement. Colourise or finish it instead.')
-            if stage == 1:
-                snapshots.append(root / SKIP_ENHANCE / source.name)
-            if operation in {'colorize', 'finish'} and stage < 3:
-                snapshots.append(root / SKIP_AI / source.name)
-            output = None if operation == 'finish' else root / (
-                COLOR if operation == 'colorize' else AI_QUEUE
-            ) / rendered(operation)
-        else:
+    protected_original = False
+    snapshots: list[Path] = []
+    output = None
+
+    def fallback() -> None:
+        nonlocal keep_source, root, snapshots, output, protected_original
+        if operation not in {'crop', 'enhance', 'restore', 'colorize', 'finish'}:
             raise ValueError('Invalid batch stage operation.')
-    elif operation == 'finish':
-        raise ValueError('Open a 1.5, 1.6 or 1.7 TBP stage folder for flat batch routing.')
-    elif operation in {'enhance', 'restore', 'colorize'}:
         keep_source = True
         root = Path(custom_root).expanduser().resolve() if custom_root else parent
         snapshots = []
+        if operation == 'finish':
+            output = None
+            return
         output = root / rendered(operation)
         if not replace:
             occupied = set(taken or ())
             occupied |= taken_outputs()
             occupied.add(source)
+            intended = output
             output = protect_original_output(
                 output, source, occupied, settings.get('conflict_policy') or 'skip')
+            protected_original = output is not None and not same_path(output, intended)
+
+    if nested:
+        fallback()
+    elif operation == 'crop':
+        if parent.name in FOLDERS and parent.name != ORIGINAL:
+            fallback()
+        else:
+            snapshots = [root / ORIGINAL / source.name]
+            output = root / CROP_QUEUE / rendered('crop')
+    elif stage is not None:
+        snapshots = [root / {1: CROPPED, 2: ENHANCED, 3: AI}[stage] / source.name]
+        if operation == 'enhance':
+            if stage != 1:
+                fallback()
+            else:
+                output = root / ENHANCE_QUEUE / rendered('enhance')
+        elif operation in {'restore', 'colorize', 'finish'}:
+            if operation == 'restore' and stage == 3:
+                fallback()
+            else:
+                if stage == 1:
+                    snapshots.append(root / SKIP_ENHANCE / source.name)
+                if operation in {'colorize', 'finish'} and stage < 3:
+                    snapshots.append(root / SKIP_AI / source.name)
+                output = None if operation == 'finish' else root / (
+                    COLOR if operation == 'colorize' else AI_QUEUE
+                ) / rendered(operation)
+        else:
+            fallback()
+    elif operation in {'crop', 'enhance', 'restore', 'colorize', 'finish'}:
+        fallback()
     else:
         raise ValueError('Invalid batch stage operation.')
     if replace:
@@ -669,7 +718,7 @@ def plan(source: Path, operation: str, index: int = 1, batch_size: int = 1,
         output = output.parent / render_filename(source, operation, index=chosen, batch_size=batch_size)
     return {'source': source, 'root': root, 'snapshots': snapshots, 'output': output,
             'overwrite': False, 'replace': False, 'operation': operation,
-            'keep_source': keep_source}
+            'keep_source': keep_source, 'protected_original': protected_original}
 
 
 def planned_overwrites(plans: list[dict]) -> list[Path]:
@@ -812,9 +861,11 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                     if replacing:
                         overwrite = True
                     elif item.get('keep_source') and same_path(output, source):
+                        intended = output
                         output = protect_original_output(
                             output, source, set(writes) | set(sources) | taken_outputs(), policy)
                         item['output'] = output
+                        mark_protected(item, intended, output)
                         overwrite = False
                     if not overwrite and (output in writes or output.exists() or output in sources):
                         chosen, overwrite = apply_conflict(output, set(writes) | set(sources) | taken_outputs(), policy)
@@ -822,9 +873,11 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
                         item['output'] = output
                         item['overwrite'] = overwrite
                         if item.get('keep_source') and same_path(output, source):
+                            intended = output
                             output = protect_original_output(
                                 output, source, set(writes) | set(sources) | taken_outputs(), policy)
                             item['output'] = output
+                            mark_protected(item, intended, output)
                             overwrite = False
                         if not overwrite and (output in writes or output.exists() or output in sources):
                             raise ValueError(f'Output already exists: {output}. Nothing was overwritten.')
@@ -910,4 +963,6 @@ def file_results(sources: list[Path], payloads: list[bytes], operation: str,
                 else:
                     item['overwrite'] = Path(dest).exists() and (_settings().get('conflict_policy') == 'overwrite')
                 item['fixed_output'] = True
-    return commit(plans, payloads)
+    outputs = commit(plans, payloads)
+    remember_protected_outputs(plans)
+    return outputs

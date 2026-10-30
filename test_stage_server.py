@@ -59,15 +59,16 @@ class StageServerTests(unittest.TestCase):
         self.assertTrue((self.root/stages.SKIP_ENHANCE/source.name).exists())
         self.assertFalse(source.exists());self.assertEqual(self.edit.call_count,1)
 
-    def test_invalid_input_stage_is_rejected_before_api_call(self):
+    def test_nested_and_completed_stage_restore_use_output_settings(self):
         nested=self.source(str(Path(stages.CROP_QUEUE)/'old-output'),'photo.png')
         completed=self.source(stages.AI_QUEUE,'done.png')
         for source in [nested, completed]:
             self.edit.reset_mock()
-            with self.assertRaises(HTTPError) as caught:
-                self.post('/api/chatgpt-generate',{'front_path':str(source)})
-            self.assertEqual(caught.exception.code,400);caught.exception.close()
-            self.edit.assert_not_called();self.assertTrue(source.exists())
+            record=self.post('/api/chatgpt-generate',{'front_path':str(source)})
+            self.post('/api/chatgpt-accept',{'id':record['id']})
+            self.assertTrue(source.exists())
+            self.assertTrue((source.parent/f'{source.stem}_ai.png').exists())
+            self.assertEqual(self.edit.call_count,1)
 
     def test_non_stage_folder_is_accepted_for_ai_restore(self):
         source=self.source('other','[Scan]_20261027_0004 [B&W].jpg')

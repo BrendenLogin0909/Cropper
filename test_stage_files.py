@@ -144,9 +144,13 @@ class StageFilesTests(unittest.TestCase):
             planned=stages.plan(source,'restore')
             self.assertTrue(stages.same_path(planned['output'], source.parent/'photo_c_ai.png'))
             self.assertTrue(planned.get('keep_source'))
-            with self.assertRaisesRegex(ValueError,'TBP stage'): stages.plan(source,'finish')
+            finished=stages.plan(source,'finish')
+            self.assertTrue(finished.get('keep_source'))
+            self.assertIsNone(finished.get('output'))
             source=self.source(root,stages.AI_QUEUE)
-            with self.assertRaisesRegex(ValueError,'already completed'): stages.plan(source,'restore')
+            again=stages.plan(source,'restore')
+            self.assertTrue(again.get('keep_source'))
+            self.assertTrue(stages.same_path(again['output'], source.parent/'photo_c_ai.png'))
 
     def test_comment_cannot_replace_archive_filename(self):
         with TemporaryDirectory() as tmp:

@@ -36,11 +36,20 @@ test('old backend gives an explicit restart message without modifying points',as
   const h=harness(async()=>{throw new Error('Not found.');});
   await h.predict();assert.match(h.messages[0],/backend restart/);assert.equal(h.state.points.length,0);
 });
-test('shortcuts preserve text entry, Ctrl zoom and navigation',()=>{
+test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
   const keys=code.slice(code.indexOf("document.addEventListener('keydown'"));
-  assert.ok(keys.indexOf("'INPUT','TEXTAREA','SELECT'")<keys.indexOf("event.key==='Control'"));
-  assert.match(keys,/event.key.toLowerCase\(\)==='a'.*predictCropCorners/);
-  assert.match(keys,/event.key.toLowerCase\(\)==='q'.*clearCropPoints/);
+  assert.ok(keys.indexOf("'INPUT','TEXTAREA','SELECT'")<keys.indexOf("event.key==='Shift'"));
+  assert.match(keys,/event.key==='Shift'/);
+  assert.match(keys,/event.ctrlKey\|\|event.metaKey\)return/);
+  assert.doesNotMatch(keys,/event.key==='Control'/);
+  assert.doesNotMatch(keys,/event.key.toLowerCase\(\)==='a'&&event.ctrlKey/);
+  assert.doesNotMatch(keys,/predictCropCorners\(\);\}/);
   assert.match(keys,/ArrowLeft.*openImage\(state.index-1\)/);
   assert.match(keys,/ArrowRight.*openImage\(state.index\+1\)/);
+  const html=fs.readFileSync(__dirname+'/index.html','utf8');
+  assert.match(html,/SHIFT[\s\S]*hold to zoom/);
+  assert.doesNotMatch(html,/Runs on this computer/);
+  assert.match(html,/data-testid="processing-location-crop">Local/);
+  assert.match(html,/data-testid="processing-location-enhance">Local/);
+  assert.match(html,/data-testid="processing-location-chatgpt">OpenAI, uses your API key/);
 });

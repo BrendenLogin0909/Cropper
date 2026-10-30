@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 import json
 
 from PIL import Image
+import numpy as np
 
 import app_settings
 import chatgpt_pending
@@ -751,6 +752,126 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertTrue(saved.is_file())
         self.assertFalse((folder / stages.AI_QUEUE).exists())
         self.assertFalse((folder / stages.CROPPED).exists())
+
+    def test_non_stage_crop_is_not_blocked(self):
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'plain copy.jpg'
+            Image.new('RGB', (16, 16), 'red').save(source)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                cropped, _ = server.save_image(source, corners, {}, 0)
+            self.assertTrue(cropped.is_file())
+
+    def test_non_stage_enhance_finish_and_merge(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'plain copy.jpg'
+            Image.new('RGB', (16, 16), 'red').save(source)
+            original = source.read_bytes()
+            dusty = photos / 'dusty.png'
+            pixels = np.full((70, 90, 3), 120, dtype=np.uint8)
+            pixels[30:33, 40:43] = 245
+            Image.fromarray(pixels).save(dusty)
+            dusty_bytes = dusty.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                enhanced, _, _, archived = server.save_enhanced_image(source, {})
+                restored, _, _, restore_archived = server.save_restored_image(dusty, 'dust')
+                finished = stages.plan(source, 'finish')
+                stages.commit([finished], [None])
+            self.assertTrue(enhanced.is_file())
+            self.assertIsNone(archived)
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), original)
+            self.assertTrue(restored.is_file())
+            self.assertIsNone(restore_archived)
+            self.assertTrue(dusty.exists())
+            self.assertEqual(dusty.read_bytes(), dusty_bytes)
+            self.assertTrue(finished.get('keep_source'))
+            self.assertIsNone(finished.get('output'))
+            self.assertFalse((photos / stages.ENHANCE_QUEUE).exists())
+
+            front = photos / 'front.jpg'
+            back = photos / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                merged, _ = server.save_merged_image(front, back, {}, 'front', 0)
+            self.assertEqual(merged.name, 'front_front-back.jpg')
+            self.assertTrue(front.exists())
+            self.assertTrue(back.exists())
+
+    def test_crop_from_later_folder_and_photo_link_in_non_stage_folder(self):
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        with TemporaryDirectory() as tmp:
+            later = Path(tmp) / stages.CROPPED
+            later.mkdir()
+            source = later / 'photo.png'
+            source.write_bytes(png())
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                output, _ = server.save_image(source, corners, {}, 0)
+            self.assertTrue(source.exists())
+            self.assertTrue(stages.same_path(output, later / 'photo_c.png'))
+            self.assertFalse((later / stages.CROP_QUEUE).exists())
+
+            import photo_pairs
+            front = Path(tmp) / 'scans' / 'a.jpg'
+            combined = Path(tmp) / 'scans' / 'a-back.jpg'
+            front.parent.mkdir()
+            Image.new('RGB', (8, 8), 'red').save(front)
+            Image.new('RGB', (8, 8), 'blue').save(combined)
+            with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
+                link = photo_pairs.approve_link(front, combined, 50, 'right')
+            self.assertEqual(Path(link['front_path']), front)
+
+    def test_copy_mode_overwrite_reports_protected_original(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'keep original.png'
+            source.write_bytes(png('red'))
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(
+                    filename_template='{name}{ext}', conflict_policy='overwrite')):
+                output = stages.file_results([source], [png('blue')], 'restore')[0]
+            self.assertEqual(output.name, 'keep original-2.png')
+            self.assertEqual(source.read_bytes(), original)
+            self.assertTrue(stages.saved_protected(output))
+            self.assertEqual(stages.protected_original_message(output.name),
+                             'Saved as keep original-2.png to protect the original')
+
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        folder = Path(self.folder.name) / 'scans'
+        folder.mkdir()
+        png_source = folder / 'keep original.png'
+        png_source.write_bytes(png('red'))
+        app_settings.save_settings({
+            'filename_template': '{name}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+            'backup_originals': True,
+            'output_folder': '',
+        })
+        with patch.object(server, 'read_links', return_value=[]), \
+             patch.object(server, 'edit_front', return_value=png('blue')):
+            status, record = self._json(http.server_port, '/api/chatgpt-generate', {
+                'front_path': str(png_source), 'operation': 'restore',
+            })
+            self.assertEqual(status, 200)
+            status, accepted = self._json(http.server_port, '/api/chatgpt-accept', {
+                'id': record['id'],
+            })
+        self.assertEqual(status, 200)
+        self.assertTrue(accepted.get('protected_original'))
+        self.assertEqual(accepted.get('protected_message'),
+                         'Saved as keep original-2.png to protect the original')
+        self.assertTrue(png_source.exists())
+        self.assertTrue((folder / 'keep original-2.png').is_file())
 
     def test_next_free_index_counts_finish_snapshot_names(self):
         with TemporaryDirectory() as tmp:

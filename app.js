@@ -382,7 +382,7 @@ async function mergeSave() {
   state.merge.busy = true; renderMerge();
   try {
     const result = await api('/api/merge', { front_path: state.images[front].path, back_path: state.images[back].path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
-    toast(`Saved ${result.name} · ${result.width} × ${result.height} px`);
+    toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
   } catch (error) { if (!offerChooseOutputFolder(error)) toast(error.message, true); }
   finally { state.merge.busy = false; renderMerge(); }
@@ -451,7 +451,7 @@ async function saveEnhancedBatch() {
   const paths = state.images.map(image => image.path).filter(path => state.enhance.selected.has(path));
   const batchSettings = { ...enhanceSettings, stage_routing:stageRoutingEnabled() };
   state.enhance.busy = true; state.enhance.stop = false; renderEnhanceControls();
-  let saved = 0; const failed = []; const archived = new Set();
+  let saved = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try { extra = await ensureOverwriteConfirmed(paths, 'enhance'); }
   catch (error) { state.enhance.busy = false; renderEnhanceControls(); toast(error.message, true); return; }
@@ -459,7 +459,7 @@ async function saveEnhancedBatch() {
     if (archived.has(path)) continue;
     if (state.enhance.stop) break;
     $('enhance-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
-    try { const result=await api('/api/enhance', { path, settings: batchSettings, ...extra }); for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved);archived.add(moved);} saved++; }
+    try { const result=await api('/api/enhance', { path, settings: batchSettings, ...extra }); if (result.protected_message) protectedNote = result.protected_message; for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved); if (result.archived_path) archived.add(moved);} saved++; }
     catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (offerChooseOutputFolder(error)) state.enhance.stop = true; }
     refreshEnhanceTiles(); renderEnhanceControls();
   }
@@ -470,8 +470,8 @@ async function saveEnhancedBatch() {
     $('image-count').textContent = state.images.length;
     clearEnhancePreview(); renderImages(); renderEnhanceControls();
   }
-  $('enhance-progress').textContent = `${saved} saved and original${saved === 1 ? '' : 's'} archived${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · batch stopped' : ''}`;
-  if (failed.length) toast(failed[0], true); else toast(`${saved} enhanced ${saved === 1 ? 'copy' : 'copies'} saved; source snapshots filed in ${'2. Cropped'}${stopped ? ' before stopping' : ''}.`);
+  $('enhance-progress').textContent = protectedNote || `${saved} saved and original${saved === 1 ? '' : 's'} archived${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · batch stopped' : ''}`;
+  if (failed.length) toast(failed[0], true); else toast(protectedNote || `${saved} enhanced ${saved === 1 ? 'copy' : 'copies'} saved${stopped ? ' before stopping' : ''}.`);
 }
 function renderRestorationControls() {
   const count = state.restore.selected.size;
@@ -580,7 +580,7 @@ async function saveRestorationBatch() {
   const operation = state.view; const info = RESTORE_INFO[operation];
   const paths = state.images.map(image => image.path).filter(path => state.restore.selected.has(path));
   state.restore.busy = true; state.restore.stop = false; renderRestorationControls();
-  let saved = 0, skipped = 0; const failed = []; const archived = new Set();
+  let saved = 0, skipped = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try { extra = await ensureOverwriteConfirmed(paths, 'enhance'); }
   catch (error) { state.restore.busy = false; renderRestorationControls(); toast(error.message, true); return; }
@@ -592,7 +592,9 @@ async function saveRestorationBatch() {
       state.restore.selected.delete(path);
       if (result.skipped) { state.restore.notNeeded.add(path); skipped++; }
       else {
-        archived.add(path); saved++;
+        if (result.protected_message) protectedNote = result.protected_message;
+        if (result.archived_path) archived.add(path);
+        saved++;
         state.restore.marks.delete(path);
         state.restore.resultsFolder = result.path.slice(0, Math.max(result.path.lastIndexOf('/'), result.path.lastIndexOf('\\')));
       }
@@ -615,8 +617,8 @@ async function saveRestorationBatch() {
     renderImages(); $('restore-open-results').classList.remove('hidden');
   }
   renderRestorationControls();
-  $('restore-progress').textContent = `${saved} saved to ${info.output}; ${skipped} skipped because no useful change was found${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
-  if (failed.length) toast(failed[0], true); else toast(saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`);
+  $('restore-progress').textContent = protectedNote || `${saved} saved to ${info.output}; ${skipped} skipped because no useful change was found${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
+  if (failed.length) toast(failed[0], true); else toast(protectedNote || (saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`));
 }
 async function pickFolder(forOutput = false) {
   state.picker = { path: ($('settings-output-folder')?.value || state.folder || state.home), parent: null, forOutput };
@@ -795,7 +797,7 @@ function updateControls() {
   [...$('progress-dots').children].forEach((dot,index)=>dot.classList.toggle('done',index<count));
   $('step-title').textContent = count < 4 ? `Select corner ${count + 1} of 4` : complete ? 'Crop is ready' : 'Adjust the corners';
   $('step-detail').textContent = count < 4 ? 'Click anywhere on the image. Order does not matter.' : complete ? 'Drag any point to refine, then save.' : 'Corners must form a four-sided area.';
-  $('canvas-help').textContent = count < 4 ? 'Ctrl+A predicts corners · For several photos, place one point inside the intended print first' : complete ? 'Drag corners to refine · Ctrl+A cycles outlines · Enter to save' : 'Drag a point to make a four-sided area';
+  $('canvas-help').textContent = count < 4 ? 'Predict corners finds the print · For several photos, place one point inside the intended print first' : complete ? 'Drag corners to refine · Predict corners cycles outlines · Enter to save' : 'Drag a point to make a four-sided area';
   $('undo').disabled = !count; $('reset').disabled = !count; $('rotate-left').disabled = state.index < 0; $('rotate-right').disabled = state.index < 0;
   $('save').disabled = !complete || state.busy || !!validSettings();
   $('select-whole').disabled = state.index < 0 || !state.width || state.busy;
@@ -842,7 +844,7 @@ async function predictCropCorners() {
     cache.index = (cache.index+1) % cache.candidates.length;
     state.points = cache.candidates[cache.index].points.map(([x,y]) => ({x:Math.max(0,Math.min(state.width-1,x)),y:Math.max(0,Math.min(state.height-1,y))}));
     renderOverlay(); updateControls();
-    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. Ctrl+A cycles alternatives; Ctrl+Q clears. Always check the corners.`);
+    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. Use Predict corners to cycle alternatives. Always check the corners.`);
   } catch (error) { toast(error.message,true); }
   finally { cropPredictionBusy = false; updateControls(); }
 }
@@ -865,7 +867,7 @@ async function cropSave() {
     const extra = await ensureOverwriteConfirmed([state.images[sourceIndex].path], 'crop');
     const result = await api('/api/crop', { path: state.images[sourceIndex].path, points: state.points.map(p=>[p.x,p.y]), rotation: state.rotation, aspect_ratio: cropAspectRatio(), settings:{...settings,stage_routing:stageRoutingEnabled()}, ...extra });
     $('save-error').classList.add('hidden');
-    toast(`Saved ${result.name} · ${result.width} × ${result.height} px`);
+    toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
     if (result.source_moved) {
       state.images.splice(sourceIndex,1);state.index=-1;state.points=[];renderImages();
@@ -1250,7 +1252,7 @@ async function finishChatgpt(accept) {
   const reviewed = current.review;
   current.reviewBusy = true; updateChatgptControls();
   try {
-    await api(accept ? '/api/chatgpt-accept' : '/api/chatgpt-reject', { id: reviewed.id });
+    const accepted = await api(accept ? '/api/chatgpt-accept' : '/api/chatgpt-reject', { id: reviewed.id });
     const path = reviewed.front_path;
     const reviewIndex = current.pending.findIndex(item => item.id === reviewed.id);
     const nextCandidates = reviewIndex < 0 ? current.pending : [
@@ -1266,7 +1268,14 @@ async function finishChatgpt(accept) {
     if (nextReview) reviewChatgptItem(nextReview);
     else { current.preview = [...current.selected][0] || null; showChatgptPreview(); }
     renderImages(); updateChatgptControls();
-    if (!current.busy) $('chatgpt-progress').textContent = accept ? 'Accepted: PNG filed and original archived. Review the next pending image when ready.' : 'Rejected: original untouched. Review the next pending image when ready.';
+    if (!current.busy) {
+      if (accept && accepted.protected_message) {
+        $('chatgpt-progress').textContent = accepted.protected_message;
+        toast(accepted.protected_message);
+      } else {
+        $('chatgpt-progress').textContent = accept ? 'Accepted: PNG filed and original archived. Review the next pending image when ready.' : 'Rejected: original untouched. Review the next pending image when ready.';
+      }
+    }
   } catch (error) { if (typeof offerChooseOutputFolder !== 'function' || !offerChooseOutputFolder(error)) toast(error.message, true); if (!current.busy) $('chatgpt-progress').textContent = error.message; }
   finally { current.reviewBusy = false; updateChatgptControls(); }
 }
@@ -1613,18 +1622,16 @@ function wire() {
     if(!$('folder-modal').classList.contains('hidden')){if(event.key==='Escape')closePicker();return;}
     if (state.view !== 'crop') return;
     if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable || document.querySelector('dialog[open]'))return;
-    if(event.key==='Control'){startZoom();return;}
+    if(event.key==='Shift'){startZoom();return;}
+    if(event.ctrlKey||event.metaKey)return;
     if(state.busy)return;
-    if(event.key.toLowerCase()==='a'&&event.ctrlKey){event.preventDefault();if(!event.repeat)predictCropCorners();}
-    else if(event.key.toLowerCase()==='q'&&event.ctrlKey){event.preventDefault();clearCropPoints();}
-    else if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
+    if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
     else if(event.key==='ArrowRight'){event.preventDefault();openImage(state.index+1);}
     else if(event.key==='Enter'){event.preventDefault();cropSave();}
     else if(event.key==='Backspace'){event.preventDefault();state.points=[];renderOverlay();updateControls();}
-    else if(event.key.toLowerCase()==='z'&&event.ctrlKey){event.preventDefault();state.points.pop();renderOverlay();updateControls();}
   });
-  document.addEventListener('keyup',event=>{if(event.key==='Control')endZoom();}); window.addEventListener('blur',endZoom);
-  $('canvas-shell').addEventListener('wheel',event=>{if(event.ctrlKey)event.preventDefault();},{passive:false});
+  document.addEventListener('keyup',event=>{if(event.key==='Shift')endZoom();}); window.addEventListener('blur',endZoom);
+  $('canvas-shell').addEventListener('wheel',event=>{if(event.shiftKey)event.preventDefault();},{passive:false});
   new ResizeObserver(fitImage).observe($('canvas-shell'));
   new ResizeObserver(drawBrushCanvas).observe($('restore-before-wrap'));
   updateStageRoutingDisplay();updateControls();
