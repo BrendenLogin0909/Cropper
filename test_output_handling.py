@@ -340,6 +340,18 @@ class OutputHandlingTests(unittest.TestCase):
             stages.probe_folder_writable(Path(tmp))
             self.assertEqual([path.name for path in Path(tmp).iterdir() if path.name.startswith('.cropper-preflight-')], [])
 
+    def test_probe_folder_writable_wraps_oserror_as_permission_error(self):
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / 'locked'
+            dest.mkdir()
+            error = OSError('denied')
+            error.filename = str(dest)
+            with patch.object(stages.tempfile, 'mkstemp', side_effect=error):
+                with self.assertRaises(PermissionError) as caught:
+                    stages.probe_folder_writable(dest)
+            self.assertEqual(str(caught.exception.filename), str(dest))
+
+    @unittest.skipUnless(os.name != 'nt', 'Unix mode bits do not make Windows folders unwritable')
     def test_probe_folder_writable_raises_on_unwritable_folder(self):
         with TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'locked'
@@ -618,6 +630,11 @@ class OutputHandlingTests(unittest.TestCase):
             calls.append(path)
             return png('blue')
 
+        def boom(*args, **kwargs):
+            error = PermissionError('denied')
+            error.filename = str(dest)
+            raise error
+
         app_settings.save_settings({
             'filename_template': '{name}{suffix}{ext}',
             'conflict_policy': 'skip',
@@ -625,15 +642,12 @@ class OutputHandlingTests(unittest.TestCase):
             'backup_originals': True,
             'output_folder': str(dest),
         })
-        dest.chmod(0o555)
-        try:
-            with patch.object(server, 'read_links', return_value=[]), \
-                 patch.object(server, 'edit_front', side_effect=edit):
-                status, body = self._json(http.server_port, '/api/chatgpt-generate', {
-                    'front_path': str(source), 'operation': 'restore',
-                })
-        finally:
-            dest.chmod(0o755)
+        with patch.object(server, 'read_links', return_value=[]), \
+             patch.object(server, 'edit_front', side_effect=edit), \
+             patch.object(stages, 'probe_folder_writable', side_effect=boom):
+            status, body = self._json(http.server_port, '/api/chatgpt-generate', {
+                'front_path': str(source), 'operation': 'restore',
+            })
         self.assertEqual(status, 403)
         self.assertEqual(body['code'], 'permission_denied')
         self.assertIn('Choose another output folder', body['error'])
