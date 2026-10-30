@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
+const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: null, back: null, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
 state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false, guidance: { batch: '', photos: {} }, guidanceEdit: false };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
@@ -350,38 +350,42 @@ function selectionCard(label, image) {
   const picture = document.createElement('img'); picture.alt = `${label}: ${image.name}`; picture.src = url('/api/image', image.path) + `&v=${image.modified}`;
   card.append(tag, picture); return card;
 }
+function emptyMerge() {
+  return { front: null, back: null, frontInfo: null, backInfo: null, busy: false };
+}
 function renderMerge() {
   const { front, back, frontInfo, busy } = state.merge;
-  const ready = front >= 0 && back >= 0; const problem = validMergeSettings();
+  const ready = !!(front && back); const problem = validMergeSettings();
   $('merge-save').disabled = !ready || busy || !!problem;
   $('merge-save-hint').textContent = busy ? 'Saving merged image…' : problem || (ready ? 'Ready to merge these two photos' : 'Select a front and a back to enable saving');
   const instructions = $('merge-instructions'); const preview = $('merge-preview'); preview.replaceChildren();
-  if (front < 0) { instructions.classList.remove('hidden'); instructions.innerHTML = '<span class="merge-step-number">1</span><strong>Select the front</strong><small>Its shape decides whether the back goes beside or below it.</small>'; preview.classList.add('hidden'); $('merge-summary').textContent = 'Choose the front photo, then the back photo.'; return; }
-  if (back < 0) { instructions.classList.remove('hidden'); instructions.innerHTML = '<span class="merge-step-number">2</span><strong>Now select its back</strong><small>Click the matching back image in the Explorer.</small>'; preview.classList.add('hidden'); $('merge-summary').textContent = `Front: ${state.images[front].name}. Select the back next.`; return; }
+  if (!front) { instructions.classList.remove('hidden'); instructions.innerHTML = '<span class="merge-step-number">1</span><strong>Select the front</strong><small>Its shape decides whether the back goes beside or below it.</small>'; preview.classList.add('hidden'); $('merge-summary').textContent = 'Choose the front photo, then the back photo.'; return; }
+  if (!back) { instructions.classList.remove('hidden'); instructions.innerHTML = '<span class="merge-step-number">2</span><strong>Now select its back</strong><small>Click the matching back image, or Choose back… to open another folder.</small>'; preview.classList.add('hidden'); $('merge-summary').textContent = `Front: ${front.name}. Select the back next.`; return; }
   instructions.classList.add('hidden'); preview.classList.remove('hidden');
   const stacked = !!frontInfo && frontInfo.width >= frontInfo.height; preview.classList.toggle('stack', stacked);
-  preview.append(selectionCard('FRONT', state.images[front]));
+  preview.append(selectionCard('FRONT', front));
   const divider = document.createElement('div'); divider.className = 'merge-divider'; divider.textContent = stacked ? '↓' : '→'; preview.append(divider);
-  preview.append(selectionCard('BACK', state.images[back]));
+  preview.append(selectionCard('BACK', back));
   $('merge-summary').textContent = stacked ? 'Landscape front: the back will be placed below it.' : 'Portrait front: the back will be placed to its right.';
 }
 async function selectMergeImage(index) {
   if (index < 0 || index >= state.images.length || state.merge.busy) return;
-  if (state.merge.front < 0 || state.merge.back >= 0) { state.merge.front = index; state.merge.back = -1; state.merge.backInfo = null; }
-  else if (index !== state.merge.front) state.merge.back = index;
+  const image = state.images[index];
+  if (!state.merge.front || state.merge.back) { state.merge.front = image; state.merge.back = null; state.merge.backInfo = null; }
+  else if (image.path !== state.merge.front.path) state.merge.back = image;
   else { toast('Choose a different image for the back.', true); return; }
   try {
-    if (state.merge.front === index) state.merge.frontInfo = await api(`/api/info?path=${encodeURIComponent(state.images[index].path)}`);
-    else state.merge.backInfo = await api(`/api/info?path=${encodeURIComponent(state.images[index].path)}`);
+    if (state.merge.front.path === image.path) state.merge.frontInfo = await api(`/api/info?path=${encodeURIComponent(image.path)}`);
+    else state.merge.backInfo = await api(`/api/info?path=${encodeURIComponent(image.path)}`);
   } catch (error) { toast(error.message, true); }
   renderImages(); renderMerge();
 }
 async function mergeSave() {
   const { front, back } = state.merge; const problem = validMergeSettings();
-  if (state.merge.busy || front < 0 || back < 0 || problem) { if (problem) toast(problem, true); return; }
+  if (state.merge.busy || !front || !back || problem) { if (problem) toast(problem, true); return; }
   state.merge.busy = true; renderMerge();
   try {
-    const result = await api('/api/merge', { folder: state.folder, front_path: state.images[front].path, back_path: state.images[back].path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
+    const result = await api('/api/merge', { front_path: front.path, back_path: back.path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
     toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
   } catch (error) { if (!offerChooseOutputFolder(error)) toast(error.message, true); }
@@ -620,9 +624,10 @@ async function saveRestorationBatch() {
   $('restore-progress').textContent = protectedNote || `${saved} saved to ${info.output}; ${skipped} skipped because no useful change was found${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
   if (failed.length) toast(failed[0], true); else toast(protectedNote || (saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`));
 }
-async function pickFolder(forOutput = false) {
-  state.picker = { path: ($('settings-output-folder')?.value || state.folder || state.home), parent: null, forOutput };
-  $('folder-modal-title').textContent = forOutput ? 'Choose another output folder' : 'Choose image folder';
+async function pickFolder(forOutput = false, forBack = false) {
+  const start = forBack ? (state.folder || state.home) : ($('settings-output-folder')?.value || state.folder || state.home);
+  state.picker = { path: start, parent: null, forOutput, forBack };
+  $('folder-modal-title').textContent = forBack ? 'Choose back folder' : forOutput ? 'Choose another output folder' : 'Choose image folder';
   $('folder-modal').classList.remove('hidden');
   $('folder-modal-list').replaceChildren();
   $('folder-modal-message').textContent = 'Loading folders…';
@@ -659,9 +664,13 @@ async function loadPickerFolder(path) {
 function closePicker() { state.picker = null; ++state.pickerRequest; $('folder-modal').classList.add('hidden'); }
 async function selectPickerFolder() {
   if (!state.picker) return;
-  const { path, forOutput } = state.picker; closePicker();
+  const { path, forOutput, forBack } = state.picker; closePicker();
   if (forOutput) { await setOutputFolder(path); return; }
   await loadFolder(path);
+  if (forBack && state.view === 'merge') {
+    toast('Back folder opened. Click the matching back image.');
+    renderMerge();
+  }
 }
 async function loadFolder(path, preserve = false) {
   if (state.chatgpt.busy || state.chatgpt.reviewBusy || state.chatgpt.resubmissions?.size) { toast('Wait for active image requests before changing folders. You can still review other pending images.', true); return; }
@@ -686,7 +695,6 @@ async function loadFolder(path, preserve = false) {
     const priorIndex = data.images.findIndex(image => image.path === prior);
     if (priorIndex >= 0) await openImage(priorIndex);
     else { state.index = -1; clearEditor(); updateControls(); }
-    state.merge = { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false };
     if (state.view === 'merge') renderMerge();
     if (!data.images.length) toast('No supported images in this folder. Open a subfolder or choose another folder.');
   } catch (error) { toast(error.message, true); }
@@ -711,7 +719,7 @@ function renderImages() {
     const meta = document.createElement('div'); meta.className = 'tile-meta'; meta.textContent = state.view==='chatgpt' && chatgptOperation==='colorize' ? (colorCandidates.get(image.path)?.kind || 'Not scanned') : formatBytes(image.bytes);
     tile.append(picture, name, meta); tile.addEventListener('dblclick', () => { if (state.view === 'crop') openImage(index); });
     tile.addEventListener('click', event => { if (state.view === 'chatgpt') selectChatgptImage(index, event); else if (state.view === 'enhance') selectEnhanceImage(index); else if (RESTORE_INFO[state.view]) selectRestorationImage(index); else if (state.view === 'merge') selectMergeImage(index); else { document.querySelectorAll('.image-tile.selected').forEach(el => el.classList.remove('selected')); tile.classList.add('selected'); } });
-    tile.classList.toggle('merge-front', state.view === 'merge' && state.merge.front === index); tile.classList.toggle('merge-back', state.view === 'merge' && state.merge.back === index);
+    tile.classList.toggle('merge-front', state.view === 'merge' && state.merge.front?.path === image.path); tile.classList.toggle('merge-back', state.view === 'merge' && state.merge.back?.path === image.path);
     tile.classList.toggle('enhance-selected', state.view === 'enhance' && state.enhance.selected.has(image.path));
     tile.classList.toggle('enhance-previewed', state.view === 'enhance' && state.enhance.preview === index);
     tile.classList.toggle('restore-selected', !!RESTORE_INFO[state.view] && state.restore.selected.has(image.path));
@@ -1819,7 +1827,8 @@ function wire() {
   });
   const finishBrush = ()=>{ if (!state.restore.drawing) return; state.restore.drawing = null; if (state.restore.preview >= 0) previewRestoration(state.restore.preview); };
   brushCanvas.addEventListener('pointerup',finishBrush); brushCanvas.addEventListener('pointercancel',finishBrush);
-  $('merge-clear').addEventListener('click',()=>{ state.merge = { front: -1, back: -1, frontInfo: null, backInfo: null, busy: false }; renderImages(); renderMerge(); });
+  $('merge-clear').addEventListener('click',()=>{ state.merge = emptyMerge(); renderImages(); renderMerge(); });
+  $('merge-choose-back').addEventListener('click',()=>pickFolder(false, true));
   $('merge-save').addEventListener('click',mergeSave);
   $('folder-modal-close').addEventListener('click',closePicker);
   $('folder-modal-cancel').addEventListener('click',closePicker);
@@ -1854,7 +1863,12 @@ function wire() {
     if (state.view !== 'crop') return;
     if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable || document.querySelector('dialog[open]'))return;
     if(event.key==='Shift'){startZoom();return;}
-    if(event.ctrlKey||event.metaKey)return;
+    if(event.ctrlKey||event.metaKey){
+      const key=event.key.toLowerCase();
+      if(key==='z'){event.preventDefault();if(!state.busy){state.points.pop();renderOverlay();updateControls();}}
+      else if(key==='q'){event.preventDefault();clearCropPoints();}
+      return;
+    }
     if(state.busy)return;
     if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
     else if(event.key==='ArrowRight'){event.preventDefault();openImage(state.index+1);}

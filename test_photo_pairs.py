@@ -21,7 +21,7 @@ class PairTests(unittest.TestCase):
             candidates=photo_pairs.suggestions(root)
             self.assertTrue(any(stages.same_path(item['front_path'], front) and stages.same_path(item['composite_path'], composite) for item in candidates))
             with patch.object(photo_pairs,'ROOT',root/'store'):
-                link=photo_pairs.approve_link(front,composite,50,'right')
+                link=photo_pairs.approve_link(front,composite,50,'right',allowed_roots=[root])
                 self.assertEqual(photo_pairs.read_links(root)[0],link)
             png=io.BytesIO();Image.new('RGB',(70,100),'red').save(png,'PNG')
             staged=chatgpt_pending.save_pending(front,png.getvalue(),root/'pending')

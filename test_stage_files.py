@@ -132,8 +132,8 @@ class StageFilesTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);front=self.source(root,stages.CROP_QUEUE,'front_c.png')
             back=self.source(root,stages.CROP_QUEUE,'back_c.png')
-            output,_=save_merged_image(front,back,{'stage_routing':True},'front',0)
-            self.assertEqual(output.name,'front_front-back_c.png')
+            output,_=save_merged_image(front,back,{'stage_routing':True},'front',0,allowed_roots=[front.parent])
+            self.assertEqual(output.name,'front_front-back.png')
             self.assertTrue(stages.same_path(output.parent, front.parent))
             self.assertTrue(front.exists());self.assertTrue(back.exists())
 
@@ -170,7 +170,7 @@ class StageFilesTests(unittest.TestCase):
             composite=self.source(root,stages.CROP_QUEUE,'front-back_c.png')
             image=Image.new('RGB',(32,16),'green');image.paste(Image.new('RGB',(16,16),'red'),(0,0));image.save(composite)
             with patch.object(photo_pairs,'ROOT',root/'links'):
-                photo_pairs.approve_link(front,composite,50,'right')
+                photo_pairs.approve_link(front,composite,50,'right',allowed_roots=[front.parent])
                 save_enhanced_image(composite,{'stage_routing':True})
                 links=photo_pairs.read_links(root/stages.ENHANCE_QUEUE)
                 self.assertEqual(len(links),1)

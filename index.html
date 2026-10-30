@@ -78,17 +78,17 @@
           <div class="progress-group"><div class="progress-dots" id="progress-dots"><span></span><span></span><span></span><span></span></div><div><strong id="step-title">Select four corners</strong><small id="step-detail">Click once for each corner, or drag a point to refine it.</small></div></div>
           <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="predict-corners" title="Predict the photo corners locally">✦ <span>Predict corners</span></button><button class="tool-button" id="select-whole" title="Select the full image boundary">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
         </div>
-        <div class="shortcut-strip"><span><kbd>SHIFT</kbd> hold to zoom</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
+        <div class="shortcut-strip"><span><kbd>SHIFT</kbd> hold to zoom</span><span><kbd>Ctrl</kbd><kbd>Z</kbd> undo point</span><span><kbd>Ctrl</kbd><kbd>Q</kbd> clear points</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
         </div>
         <section id="merge-workspace" class="merge-workspace hidden" aria-labelledby="merge-title">
           <div class="editor-top merge-top">
-            <div class="editor-title"><div class="eyebrow">PHOTO PAIRING</div><h1 id="merge-title">Front + Back</h1><p>Click the front photo first, then the back photo in the Explorer.</p><p class="processing-location" data-testid="processing-location-merge">Local</p></div>
+            <div class="editor-title"><div class="eyebrow">PHOTO PAIRING</div><h1 id="merge-title">Front + Back</h1><p>Click the front photo first, then the back photo in the Explorer. Use Choose back… to open a folder of backs.</p><p class="processing-location" data-testid="processing-location-merge">Local</p></div>
           </div>
           <div class="merge-canvas">
             <div class="merge-instructions" id="merge-instructions"><span class="merge-step-number">1</span><strong>Select the front</strong><small>Its shape decides whether the back goes beside or below it.</small></div>
             <div id="merge-preview" class="merge-preview hidden" aria-live="polite"></div>
           </div>
-          <div class="merge-bottom"><p id="merge-summary">Choose the front photo, then the back photo.</p><button class="button button-quiet" id="merge-clear">Clear pair</button></div>
+          <div class="merge-bottom"><p id="merge-summary">Choose the front photo, then the back photo.</p><div class="merge-bottom-actions"><button class="button button-quiet" id="merge-choose-back">Choose back…</button><button class="button button-quiet" id="merge-clear">Clear pair</button></div></div>
         </section>
         <section id="enhance-workspace" class="enhance-workspace hidden" aria-labelledby="enhance-title">
           <div class="editor-top">

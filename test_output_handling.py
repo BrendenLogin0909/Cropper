@@ -593,12 +593,15 @@ class OutputHandlingTests(unittest.TestCase):
             photos = Path(tmp) / 'scans'
             photos.mkdir()
             source = photos / 'replace me & copy.jpg'
-            source.write_bytes(png())
+            Image.new('RGB', (16, 16), 'red').save(source, 'JPEG')
             original = source.read_bytes()
             with patch.object(stages, '_settings', return_value=self._non_stage_settings(replace_original=True)):
                 output = stages.file_results([source], [png('yellow')], 'restore')[0]
             self.assertTrue(stages.same_path(output, source))
-            self.assertEqual(source.read_bytes(), png('yellow'))
+            self.assertTrue(source.read_bytes().startswith(b'\xff\xd8'))
+            with Image.open(source) as result:
+                self.assertEqual(result.format, 'JPEG')
+            self.assertNotEqual(source.read_bytes(), png('yellow'))
             backup = photos / stages.BACKUPS / source.name
             self.assertTrue(backup.is_file())
             self.assertEqual(backup.read_bytes(), original)
@@ -696,7 +699,10 @@ class OutputHandlingTests(unittest.TestCase):
                 'confirmation_token': body['confirmation_token'],
             }, tab=tab)
         self.assertEqual(status, 200)
-        self.assertEqual(source.read_bytes(), png('yellow'))
+        self.assertTrue(source.read_bytes().startswith(b'\xff\xd8'))
+        with Image.open(source) as result:
+            self.assertEqual(result.format, 'JPEG')
+        self.assertNotEqual(source.read_bytes(), png('yellow'))
         backup = folder / stages.BACKUPS / source.name
         self.assertTrue(backup.is_file())
         self.assertEqual(backup.read_bytes(), original)
@@ -799,8 +805,8 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (16, 20), 'red').save(front)
             Image.new('RGB', (16, 20), 'blue').save(back)
             with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
-                merged, _ = server.save_merged_image(front, back, {}, 'front', 0)
-            self.assertEqual(merged.name, 'front_front-back_c.jpg')
+                merged, _ = server.save_merged_image(front, back, {}, 'front', 0, allowed_roots=[photos])
+            self.assertEqual(merged.name, 'front_front-back.jpg')
             self.assertTrue(front.exists())
             self.assertTrue(back.exists())
 
@@ -823,7 +829,7 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (8, 8), 'red').save(front)
             Image.new('RGB', (8, 8), 'blue').save(combined)
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
-                link = photo_pairs.approve_link(front, combined, 50, 'right')
+                link = photo_pairs.approve_link(front, combined, 50, 'right', allowed_roots=[front.parent])
             self.assertTrue(stages.same_path(link['front_path'], front))
 
     def test_crop_in_non_tbp_folder_uses_output_settings(self):
@@ -855,16 +861,18 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (16, 20), 'blue').save(back)
             front_bytes, back_bytes = front.read_bytes(), back.read_bytes()
             with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
-                merged, _ = server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+                merged, _ = server.save_merged_image(
+                    front, back, {}, 'front', 0, allowed_roots=[fronts, backs])
             self.assertTrue(stages.same_path(merged.parent, fronts))
-            self.assertEqual(merged.name, 'front_front-back_c.jpg')
+            self.assertEqual(merged.name, 'front_front-back.jpg')
             self.assertTrue(front.exists())
             self.assertTrue(back.exists())
             self.assertEqual(front.read_bytes(), front_bytes)
             self.assertEqual(back.read_bytes(), back_bytes)
             self.assertFalse((backs / merged.name).exists())
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
-                link = photo_pairs.approve_link(front, back, 50, 'right', root=allowed)
+                link = photo_pairs.approve_link(
+                    front, back, 50, 'right', allowed_roots=[fronts, backs])
             self.assertTrue(stages.same_path(link['front_path'], front))
             self.assertTrue(stages.same_path(link['composite_path'], back))
 
@@ -885,7 +893,8 @@ class OutputHandlingTests(unittest.TestCase):
                 backs.chmod(0o555)
             try:
                 with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
-                    merged, _ = server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+                    merged, _ = server.save_merged_image(
+                        front, back, {}, 'front', 0, allowed_roots=[fronts, backs])
             finally:
                 if os.name != 'nt':
                     backs.chmod(0o755)
@@ -903,21 +912,23 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (8, 8), 'red').save(front)
             missing = fronts / 'gone.jpg'
             with self.assertRaisesRegex(ValueError, 'Back image not found'):
-                server.save_merged_image(front, missing, {}, 'front', 0, root=allowed)
+                server.save_merged_image(front, missing, {}, 'front', 0, allowed_roots=[fronts])
             with self.assertRaisesRegex(ValueError, 'Back image not found'):
-                server.save_merged_image(front, '', {}, 'front', 0, root=allowed)
+                server.save_merged_image(front, '', {}, 'front', 0, allowed_roots=[fronts])
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
                 with self.assertRaisesRegex(ValueError, 'Back image not found'):
-                    photo_pairs.approve_link(front, '', 50, 'right', root=allowed)
+                    photo_pairs.approve_link(front, '', 50, 'right', allowed_roots=[fronts])
 
             http = server.LocalServer(('127.0.0.1', 0), server.Handler)
             threading.Thread(target=http.serve_forever, daemon=True).start()
             self.addCleanup(http.server_close)
             self.addCleanup(http.shutdown)
+            tab = self._tab()
+            self._open_folder(http.server_port, fronts, tab)
             status, body = self._json(http.server_port, '/api/merge', {
                 'folder': str(fronts), 'front_path': str(front), 'back_path': str(missing),
                 'name_source': 'front', 'back_rotation': 0, 'settings': {},
-            })
+            }, tab=tab)
             self.assertEqual(status, 400)
             self.assertRegex(body['error'], 'Back image not found')
 
@@ -934,24 +945,26 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (8, 8), 'blue').save(secret)
             traversed = fronts / '..' / 'outside' / 'secret.jpg'
             with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
-                server.save_merged_image(front, secret, {}, 'front', 0, root=fronts)
+                server.save_merged_image(front, secret, {}, 'front', 0, allowed_roots=[fronts])
             with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
-                server.save_merged_image(front, traversed, {}, 'front', 0, root=fronts)
+                server.save_merged_image(front, traversed, {}, 'front', 0, allowed_roots=[fronts])
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
                 with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
-                    photo_pairs.approve_link(front, secret, 50, 'right', root=fronts)
+                    photo_pairs.approve_link(front, secret, 50, 'right', allowed_roots=[fronts])
                 with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
-                    photo_pairs.approve_link(front, traversed, 50, 'right', root=fronts)
+                    photo_pairs.approve_link(front, traversed, 50, 'right', allowed_roots=[fronts])
             self.assertFalse(any(fronts.glob('*front-back*')))
 
             http = server.LocalServer(('127.0.0.1', 0), server.Handler)
             threading.Thread(target=http.serve_forever, daemon=True).start()
             self.addCleanup(http.server_close)
             self.addCleanup(http.shutdown)
+            tab = self._tab()
+            self._open_folder(http.server_port, fronts, tab)
             status, body = self._json(http.server_port, '/api/merge', {
                 'folder': str(fronts), 'front_path': str(front), 'back_path': str(traversed),
                 'name_source': 'front', 'back_rotation': 0, 'settings': {},
-            })
+            }, tab=tab)
             self.assertEqual(status, 400)
             self.assertRegex(body['error'], 'outside the allowed folder')
 
@@ -971,9 +984,252 @@ class OutputHandlingTests(unittest.TestCase):
             with patch.object(stages, '_settings', return_value=self._non_stage_settings()), \
                  patch.object(stages, 'probe_folder_writable', side_effect=error):
                 with self.assertRaises(PermissionError):
-                    server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+                    server.save_merged_image(front, back, {}, 'front', 0, allowed_roots=[fronts, backs])
             self.assertEqual({path.name for path in fronts.iterdir()}, {front.name})
             self.assertEqual({path.name for path in backs.iterdir()}, {back.name})
+
+    def test_merge_name_from_back_does_not_use_crop_suffix(self):
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / 'scans'
+            folder.mkdir()
+            front = folder / 'x front.jpg'
+            back = folder / 'x back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                merged, _ = server.save_merged_image(
+                    front, back, {}, 'back', 0, allowed_roots=[folder])
+            self.assertEqual(merged.name, 'x back_front-back.jpg')
+            self.assertNotIn('_c', merged.stem)
+
+    def test_picked_second_folder_back_is_accepted(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            fronts = Path(tmp) / 'fronts'
+            backs = Path(tmp) / 'backs'
+            fronts.mkdir()
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            self._open_folder(http.server_port, fronts, tab)
+            self._open_folder(http.server_port, backs, tab)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                }, tab=tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body['name'], 'front_front-back.jpg')
+
+    def test_unpicked_folder_and_client_folder_field_are_rejected(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            fronts = Path(tmp) / 'fronts'
+            backs = Path(tmp) / 'backs'
+            fronts.mkdir()
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            self._open_folder(http.server_port, fronts, tab)
+            payload = {
+                'front_path': str(front), 'back_path': str(back),
+                'name_source': 'front', 'back_rotation': 0, 'settings': {},
+            }
+            status, body = self._json(http.server_port, '/api/merge', payload, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            status, body = self._json(http.server_port, '/api/merge', {
+                **payload, 'folder': str(backs),
+            }, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            status, body = self._json(http.server_port, '/api/merge', {
+                **payload, 'folder': '/',
+            }, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            browse = self._get(http.server_port, f'/api/folders?path={quote(str(backs))}', tab=tab)
+            self.assertEqual(browse[0], 200)
+            status, body = self._json(http.server_port, '/api/merge', payload, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+
+    def test_missing_folder_field_and_slash_cannot_grant_unpicked_back(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            fronts = Path(tmp) / 'fronts'
+            backs = Path(tmp) / 'backs'
+            fronts.mkdir()
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (8, 8), 'red').save(front)
+            Image.new('RGB', (8, 8), 'blue').save(back)
+            self._open_folder(http.server_port, fronts, tab)
+            for extra in ({}, {'folder': '/'}):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                    **extra,
+                }, tab=tab)
+                self.assertEqual(status, 400)
+                self.assertRegex(body['error'], 'outside the allowed folder')
+
+    def test_symlink_escape_through_resolve_in_root_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            fronts = Path(tmp) / 'fronts'
+            outside = Path(tmp) / 'outside'
+            fronts.mkdir()
+            outside.mkdir()
+            front = fronts / 'front.jpg'
+            secret = outside / 'secret.jpg'
+            Image.new('RGB', (8, 8), 'red').save(front)
+            Image.new('RGB', (8, 8), 'blue').save(secret)
+            link = fronts / 'escape.jpg'
+            try:
+                link.symlink_to(secret)
+            except OSError:
+                self.skipTest('symlinks are not available')
+            with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                stages.resolve_in_root(link, fronts, label='Back image')
+            with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                server.save_merged_image(front, link, {}, 'front', 0, allowed_roots=[fronts])
+
+    def test_allowed_root_registered_on_one_tab_cannot_be_used_from_another(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        other = self._tab('tabid-test-000002')
+        with TemporaryDirectory() as tmp:
+            fronts = Path(tmp) / 'fronts'
+            backs = Path(tmp) / 'backs'
+            fronts.mkdir()
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            self._open_folder(http.server_port, fronts, tab)
+            self._open_folder(http.server_port, backs, tab)
+            self._open_folder(http.server_port, fronts, other)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                    'folder': str(backs),
+                }, tab=other)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                }, tab=tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body['name'], 'front_front-back.jpg')
+
+    def test_merge_overwrite_requires_tab_bound_confirmation(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        other = self._tab('tabid-test-000002')
+        with TemporaryDirectory() as tmp:
+            folder = Path(tmp) / 'scans'
+            folder.mkdir()
+            front = folder / 'front.jpg'
+            back = folder / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            existing = folder / 'front_front-back.jpg'
+            existing.write_bytes(b'existing-merge')
+            self._open_folder(http.server_port, folder, tab)
+            self._open_folder(http.server_port, folder, other)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                }, tab=tab)
+            self.assertEqual(status, 409)
+            self.assertEqual(body['code'], 'overwrite_confirmation_required')
+            token = body['confirmation_token']
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
+                status, other_body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                    'confirm_overwrite': True, 'confirmation_token': token,
+                }, tab=other)
+            self.assertEqual(status, 409)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
+                status, body = self._json(http.server_port, '/api/merge', {
+                    'front_path': str(front), 'back_path': str(back),
+                    'name_source': 'front', 'back_rotation': 0, 'settings': {},
+                    'confirm_overwrite': True, 'confirmation_token': token,
+                }, tab=tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body['name'], 'front_front-back.jpg')
+            self.assertNotEqual(existing.read_bytes(), b'existing-merge')
+
+    def test_probe_does_not_create_missing_stage_folder(self):
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / stages.AI_QUEUE
+            stages.probe_folder_writable(missing)
+            self.assertFalse(missing.exists())
+            self.assertEqual([path.name for path in Path(tmp).iterdir() if path.name.startswith('.cropper-preflight-')], [])
+
+    def test_failed_ai_generate_does_not_leave_empty_stage_folder(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        queue = Path(self.folder.name) / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        source = queue / 'photo_c.png'
+        source.write_bytes(png())
+        with patch.object(server, 'edit_front', side_effect=RuntimeError('paid call failed')):
+            status, body = self._json(http.server_port, '/api/chatgpt-generate', {
+                'front_path': str(source), 'operation': 'restore',
+            })
+        self.assertNotEqual(status, 200)
+        self.assertFalse((Path(self.folder.name) / stages.AI_QUEUE).exists())
+
+    def test_replace_alpha_result_writes_png_and_keeps_backup(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'photo.jpg'
+            Image.new('RGB', (16, 16), 'red').save(source, 'JPEG')
+            original = source.read_bytes()
+            payload = io.BytesIO()
+            Image.new('RGBA', (16, 16), (0, 255, 0, 80)).save(payload, 'PNG')
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(replace_original=True)):
+                output = stages.file_results([source], [payload.getvalue()], 'restore')[0]
+            self.assertEqual(output.suffix.lower(), '.png')
+            self.assertEqual(output.name, 'photo.png')
+            self.assertTrue((photos / stages.BACKUPS / 'photo.jpg').is_file())
+            self.assertEqual((photos / stages.BACKUPS / 'photo.jpg').read_bytes(), original)
+            with Image.open(output) as result:
+                self.assertEqual(result.format, 'PNG')
+                self.assertIn('A', result.mode)
 
     def test_copy_mode_overwrite_reports_protected_original(self):
         with TemporaryDirectory() as tmp:
@@ -1134,6 +1390,24 @@ class OutputHandlingTests(unittest.TestCase):
     def _tab(self, tab_id='tabid-test-000001'):
         server.register_tab(tab_id)
         return tab_id
+
+    def _get(self, port, path, tab=None):
+        headers = {'X-Cropper-Token': server.TOKEN}
+        if tab:
+            headers['X-Cropper-Tab'] = tab
+        request = Request(f'http://127.0.0.1:{port}{path}', headers=headers)
+        try:
+            with urlopen(request) as response:
+                return response.status, json.load(response)
+        except HTTPError as exc:
+            payload = json.loads(exc.read().decode())
+            exc.close()
+            return exc.code, payload
+
+    def _open_folder(self, port, folder, tab):
+        status, body = self._get(port, f'/api/list?path={quote(str(folder))}', tab=tab)
+        self.assertEqual(status, 200)
+        return body
 
     def _json(self, port, path, body, tab=None):
         headers = {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'}

@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
 from app_settings import default_data_dir
-from stage_files import pairing_root, path_key, resolve_in_root, same_path
+from stage_files import path_key, resolve_in_allowed_roots, same_path
 
 ROOT = default_data_dir()
 LOCK = threading.Lock()
@@ -21,14 +21,14 @@ def read_links(folder):
             if path_key(Path(item['front_path']).parent) == folder_key
             or path_key(Path(item['composite_path']).parent) == folder_key]
 
-def approve_link(front, composite, split, layout, root=None):
+def approve_link(front, composite, split, layout, allowed_roots=None, root=None):
     if composite is None or not str(composite).strip():
         raise ValueError('Back image not found.')
     if front is None or not str(front).strip():
         raise ValueError('Front image not found.')
-    root = pairing_root(front, composite, root)
-    front = resolve_in_root(front, root, label='Front image')
-    composite = resolve_in_root(composite, root, label='Back image')
+    roots = allowed_roots
+    front = resolve_in_allowed_roots(front, roots, label='Front image')
+    composite = resolve_in_allowed_roots(composite, roots, label='Back image')
     if not front.is_file():
         raise ValueError('Front image not found.')
     if not composite.is_file():
@@ -96,7 +96,8 @@ def accept_linked(record, png):
     outputs = file_accepted(Path(record['front_path']), png, composite, combined, operation=operation,
                             output_paths=reserved)
     try:
-        approve_link(outputs[0], outputs[1], link['split'], link['layout'])
+        approve_link(outputs[0], outputs[1], link['split'], link['layout'],
+                     allowed_roots=[outputs[0].parent, outputs[1].parent])
     except (OSError, ValueError) as error:
         warnings.warn(f'Images saved, but output pair link could not be carried forward: {error}')
     return outputs

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.parse import quote
 from types import SimpleNamespace
 
 from PIL import Image
@@ -92,10 +93,17 @@ class ServerPendingTests(unittest.TestCase):
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
             base = f"http://127.0.0.1:{local_server.server_port}"
-            headers = {"X-Cropper-Token": server.TOKEN}
+            tab = 'tabid-test-000001'
+            server.register_tab(tab)
+            headers = {"X-Cropper-Token": server.TOKEN, "X-Cropper-Tab": tab}
 
             def post(endpoint, payload):
                 request = Request(base + endpoint, json.dumps(payload).encode(), {**headers, "Content-Type": "application/json"})
+                with urlopen(request) as response:
+                    return json.load(response)
+
+            def open_folder(path):
+                request = Request(base + "/api/list?path=" + quote(str(path)), headers=headers)
                 with urlopen(request) as response:
                     return json.load(response)
 
@@ -109,6 +117,7 @@ class ServerPendingTests(unittest.TestCase):
                      patch.object(server, "list_pending", side_effect=lambda location: chatgpt_pending.list_pending(location, pending)), \
                      patch.object(server, "list_recovered", side_effect=lambda: chatgpt_pending.list_recovered(pending)), \
                      patch.object(server, "remove_pending", side_effect=lambda ident: chatgpt_pending.remove_pending(ident, pending)):
+                    open_folder(root)
                     post('/api/photo-link', {'front_path':str(sources[0]), 'composite_path':str(composite), 'split':50, 'layout':'right'})
                     first = post("/api/chatgpt-generate", {"front_path": str(sources[0])})
                     self.assertTrue(stages.same_path(first['link']['composite_path'], composite))
