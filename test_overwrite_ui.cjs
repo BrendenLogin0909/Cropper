@@ -60,11 +60,13 @@ function pythonBin() {
   throw new Error('python interpreter not found');
 }
 
-function startServer(python, dataDir) {
+function startServer(python, dataDir, extras = {}) {
   return new Promise((resolve, reject) => {
+    const env = { ...process.env, PYTHONUNBUFFERED: '1' };
+    if (extras.dialogFolder) env.CROPPER_TEST_DIALOG_FOLDER = extras.dialogFolder;
     const child = spawn(python, ['server.py', '--no-browser', '--data-dir', dataDir, '--port', '0'], {
       cwd: __dirname,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env,
     });
     let buf = '';
     let settled = false;
@@ -247,7 +249,8 @@ for name in ${JSON.stringify(names)}:
 }
 
 async function startCropSession(python, dataDir, { skipChecked, overwriteReturn, tab }) {
-  const { child, base } = await startServer(python, dataDir);
+  const batch = path.join(dataDir, 'batch');
+  const { child, base } = await startServer(python, dataDir, { dialogFolder: batch });
   const session = await (await fetch(`${base}/api/session`, {
     headers: { 'X-Cropper-Tab': tab },
   })).json();
@@ -255,6 +258,7 @@ async function startCropSession(python, dataDir, { skipChecked, overwriteReturn,
   const client = loadCropClient({
     base, token: session.token, els, skipChecked, overwriteReturn, tab,
   });
+  await client.api('/api/pick-folder', {});
   await client.api('/api/settings', {
     conflict_policy: 'overwrite',
     replace_original: false,
@@ -368,6 +372,7 @@ test('another tab cannot reuse a skip grant', async () => {
     const otherClient = loadCropClient({
       base, token: session.token, els: {}, skipChecked: true, tab: otherTab,
     });
+    await otherClient.api('/api/pick-folder', {});
     await otherClient.api('/api/crop', cropPayload(batch, 'photo2'));
     assert.equal(otherClient.dialogOpens.overwrite, 1);
   } finally {

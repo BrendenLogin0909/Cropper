@@ -62,8 +62,8 @@ test('merge keeps front by path and opens Choose back from the current folder',(
   assert.match(code,/merge: \{ front: null, back: null/);
   assert.match(code,/function emptyMerge\(\)/);
   assert.match(code,/pickFolder\(false, true\)/);
-  assert.match(code,/forBack/);
-  assert.match(code,/Choose back folder/);
+  assert.match(code,/pickNativeFolder/);
+  assert.match(code,/\/api\/pick-folder/);
   assert.doesNotMatch(code,/state.merge = \{ front: -1/);
   assert.match(code,/front_path: front.path, back_path: back.path/);
 });
