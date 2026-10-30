@@ -20,6 +20,7 @@ import numpy as np
 
 import app_settings
 import chatgpt_pending
+import photo_pairs
 import server
 import stage_files as stages
 
@@ -799,7 +800,7 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (16, 20), 'blue').save(back)
             with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
                 merged, _ = server.save_merged_image(front, back, {}, 'front', 0)
-            self.assertEqual(merged.name, 'front_front-back.jpg')
+            self.assertEqual(merged.name, 'front_front-back_c.jpg')
             self.assertTrue(front.exists())
             self.assertTrue(back.exists())
 
@@ -816,7 +817,6 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertTrue(stages.same_path(output, later / 'photo_c.png'))
             self.assertFalse((later / stages.CROP_QUEUE).exists())
 
-            import photo_pairs
             front = Path(tmp) / 'scans' / 'a.jpg'
             combined = Path(tmp) / 'scans' / 'a-back.jpg'
             front.parent.mkdir()
@@ -825,6 +825,155 @@ class OutputHandlingTests(unittest.TestCase):
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
                 link = photo_pairs.approve_link(front, combined, 50, 'right')
             self.assertTrue(stages.same_path(link['front_path'], front))
+
+    def test_crop_in_non_tbp_folder_uses_output_settings(self):
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        with TemporaryDirectory() as tmp:
+            later = Path(tmp) / stages.ENHANCE_QUEUE
+            later.mkdir()
+            source = later / 'photo.png'
+            source.write_bytes(png())
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                output, _ = server.save_image(source, corners, {}, 0)
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), original)
+            self.assertTrue(stages.same_path(output, later / 'photo_c.png'))
+            self.assertFalse((later / stages.CROP_QUEUE).exists())
+            self.assertFalse((Path(tmp) / stages.ORIGINAL).exists())
+
+    def test_cross_folder_pair_and_merge(self):
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'batch'
+            fronts = allowed / 'fronts'
+            backs = allowed / 'backs'
+            fronts.mkdir(parents=True)
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            front_bytes, back_bytes = front.read_bytes(), back.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                merged, _ = server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+            self.assertTrue(stages.same_path(merged.parent, fronts))
+            self.assertEqual(merged.name, 'front_front-back_c.jpg')
+            self.assertTrue(front.exists())
+            self.assertTrue(back.exists())
+            self.assertEqual(front.read_bytes(), front_bytes)
+            self.assertEqual(back.read_bytes(), back_bytes)
+            self.assertFalse((backs / merged.name).exists())
+            with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
+                link = photo_pairs.approve_link(front, back, 50, 'right', root=allowed)
+            self.assertTrue(stages.same_path(link['front_path'], front))
+            self.assertTrue(stages.same_path(link['composite_path'], back))
+
+    def test_read_only_back_folder_still_merges(self):
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'batch'
+            fronts = allowed / 'fronts'
+            backs = allowed / 'backs'
+            fronts.mkdir(parents=True)
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            original = back.read_bytes()
+            before = {path.name for path in backs.iterdir()}
+            if os.name != 'nt':
+                backs.chmod(0o555)
+            try:
+                with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                    merged, _ = server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+            finally:
+                if os.name != 'nt':
+                    backs.chmod(0o755)
+            self.assertTrue(merged.is_file())
+            self.assertTrue(stages.same_path(merged.parent, fronts))
+            self.assertEqual(back.read_bytes(), original)
+            self.assertEqual({path.name for path in backs.iterdir()}, before)
+
+    def test_missing_back_is_a_clear_error(self):
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'batch'
+            fronts = allowed / 'fronts'
+            fronts.mkdir(parents=True)
+            front = fronts / 'front.jpg'
+            Image.new('RGB', (8, 8), 'red').save(front)
+            missing = fronts / 'gone.jpg'
+            with self.assertRaisesRegex(ValueError, 'Back image not found'):
+                server.save_merged_image(front, missing, {}, 'front', 0, root=allowed)
+            with self.assertRaisesRegex(ValueError, 'Back image not found'):
+                server.save_merged_image(front, '', {}, 'front', 0, root=allowed)
+            with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
+                with self.assertRaisesRegex(ValueError, 'Back image not found'):
+                    photo_pairs.approve_link(front, '', 50, 'right', root=allowed)
+
+            http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+            threading.Thread(target=http.serve_forever, daemon=True).start()
+            self.addCleanup(http.server_close)
+            self.addCleanup(http.shutdown)
+            status, body = self._json(http.server_port, '/api/merge', {
+                'folder': str(fronts), 'front_path': str(front), 'back_path': str(missing),
+                'name_source': 'front', 'back_rotation': 0, 'settings': {},
+            })
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'Back image not found')
+
+    def test_back_outside_allowed_root_or_traversal_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'batch'
+            fronts = allowed / 'fronts'
+            outside = Path(tmp) / 'outside'
+            fronts.mkdir(parents=True)
+            outside.mkdir()
+            front = fronts / 'front.jpg'
+            secret = outside / 'secret.jpg'
+            Image.new('RGB', (8, 8), 'red').save(front)
+            Image.new('RGB', (8, 8), 'blue').save(secret)
+            traversed = fronts / '..' / 'outside' / 'secret.jpg'
+            with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                server.save_merged_image(front, secret, {}, 'front', 0, root=fronts)
+            with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                server.save_merged_image(front, traversed, {}, 'front', 0, root=fronts)
+            with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
+                with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                    photo_pairs.approve_link(front, secret, 50, 'right', root=fronts)
+                with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                    photo_pairs.approve_link(front, traversed, 50, 'right', root=fronts)
+            self.assertFalse(any(fronts.glob('*front-back*')))
+
+            http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+            threading.Thread(target=http.serve_forever, daemon=True).start()
+            self.addCleanup(http.server_close)
+            self.addCleanup(http.shutdown)
+            status, body = self._json(http.server_port, '/api/merge', {
+                'folder': str(fronts), 'front_path': str(front), 'back_path': str(traversed),
+                'name_source': 'front', 'back_rotation': 0, 'settings': {},
+            })
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+
+    def test_read_only_output_folder_fails_before_merge_write(self):
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'batch'
+            fronts = allowed / 'fronts'
+            backs = allowed / 'backs'
+            fronts.mkdir(parents=True)
+            backs.mkdir()
+            front = fronts / 'front.jpg'
+            back = backs / 'back.jpg'
+            Image.new('RGB', (16, 20), 'red').save(front)
+            Image.new('RGB', (16, 20), 'blue').save(back)
+            error = PermissionError('denied')
+            error.filename = str(fronts)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()), \
+                 patch.object(stages, 'probe_folder_writable', side_effect=error):
+                with self.assertRaises(PermissionError):
+                    server.save_merged_image(front, back, {}, 'front', 0, root=allowed)
+            self.assertEqual({path.name for path in fronts.iterdir()}, {front.name})
+            self.assertEqual({path.name for path in backs.iterdir()}, {back.name})
 
     def test_copy_mode_overwrite_reports_protected_original(self):
         with TemporaryDirectory() as tmp:

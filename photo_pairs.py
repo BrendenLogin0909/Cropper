@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
 from app_settings import default_data_dir
-from stage_files import path_key, same_path
+from stage_files import pairing_root, path_key, resolve_in_root, same_path
 
 ROOT = default_data_dir()
 LOCK = threading.Lock()
@@ -17,13 +17,24 @@ def read_links(folder):
     path = ROOT / 'photo-links.json'
     records = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     folder_key = path_key(folder)
-    return [item for item in records.values() if path_key(Path(item['front_path']).parent) == folder_key]
+    return [item for item in records.values()
+            if path_key(Path(item['front_path']).parent) == folder_key
+            or path_key(Path(item['composite_path']).parent) == folder_key]
 
-def approve_link(front, composite, split, layout):
-    front = Path(front).resolve()
-    composite = Path(composite).resolve()
-    if same_path(front, composite) or path_key(front.parent) != path_key(composite.parent):
-        raise ValueError('Choose two different images in the same folder.')
+def approve_link(front, composite, split, layout, root=None):
+    if composite is None or not str(composite).strip():
+        raise ValueError('Back image not found.')
+    if front is None or not str(front).strip():
+        raise ValueError('Front image not found.')
+    root = pairing_root(front, composite, root)
+    front = resolve_in_root(front, root, label='Front image')
+    composite = resolve_in_root(composite, root, label='Back image')
+    if not front.is_file():
+        raise ValueError('Front image not found.')
+    if not composite.is_file():
+        raise ValueError('Back image not found.')
+    if same_path(front, composite):
+        raise ValueError('Choose two different images: the front first, then its back.')
     if not 10 <= int(split) <= 90 or layout not in ('right', 'below'):
         raise ValueError('Choose a valid split boundary and back position.')
     with LOCK:

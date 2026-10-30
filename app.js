@@ -381,7 +381,7 @@ async function mergeSave() {
   if (state.merge.busy || front < 0 || back < 0 || problem) { if (problem) toast(problem, true); return; }
   state.merge.busy = true; renderMerge();
   try {
-    const result = await api('/api/merge', { front_path: state.images[front].path, back_path: state.images[back].path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
+    const result = await api('/api/merge', { folder: state.folder, front_path: state.images[front].path, back_path: state.images[back].path, back_rotation: Number(mergeSettings.rotation), settings:{...mergeSettings,stage_routing:stageRoutingEnabled()}, name_source: mergeSettings.nameSource });
     toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
     await refreshStageFolders();
   } catch (error) { if (!offerChooseOutputFolder(error)) toast(error.message, true); }
@@ -1440,7 +1440,7 @@ function photoPairCard(item, target, onApproved) {
   approve.addEventListener('click', async () => {
     approve.disabled=true;
     const autoQueue=$('photo-pairs-auto-queue').checked;
-    try { const link = await api('/api/photo-link', {...item, split:Number(split.value), layout:layout.value}); photoLinks = photoLinks.filter(old => old.front_path !== link.front_path); photoLinks.push(link); selectedPairs.add(link.front_path); const pending=state.chatgpt.pending.find(item=>item.front_path===link.front_path);if(pending)pending.link=link;renderPhotoLinks(); approve.textContent='Link approved ✓'; layout.disabled=split.disabled=true;if(autoQueue)queueApprovedPair(link);if(onApproved)onApproved(); }
+    try { const link = await api('/api/photo-link', {...item, folder:state.folder, split:Number(split.value), layout:layout.value}); photoLinks = photoLinks.filter(old => old.front_path !== link.front_path); photoLinks.push(link); selectedPairs.add(link.front_path); const pending=state.chatgpt.pending.find(item=>item.front_path===link.front_path);if(pending)pending.link=link;renderPhotoLinks(); approve.textContent='Link approved ✓'; layout.disabled=split.disabled=true;if(autoQueue)queueApprovedPair(link);if(onApproved)onApproved(); }
     catch(error) {toast(error.message,true);approve.disabled=false;}
   });
   controls.append(layout, document.createTextNode('Front ends at %:'), split, approve); card.append(pictures,controls); target.append(card); updatePhotoPairApproveLabels();

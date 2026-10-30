@@ -70,6 +70,82 @@ def same_path(left: Path | str, right: Path | str) -> bool:
     return path_key(left) == path_key(right)
 
 
+def is_link(path: Path) -> bool:
+    """True for a symlink or a Windows junction."""
+    try:
+        if path.is_symlink():
+            return True
+        checker = getattr(path, 'is_junction', None)
+        return bool(checker and checker())
+    except OSError:
+        return False
+
+
+def contained_in(path: Path | str, root: Path | str) -> bool:
+    """True when path resolves inside root, including Windows short vs long names."""
+    try:
+        child = str(Path(path).expanduser().resolve())
+        base = str(Path(root).expanduser().resolve())
+        common = os.path.commonpath([child, base])
+    except (ValueError, OSError):
+        return False
+    return path_key(common) == path_key(base)
+
+
+def _link_escapes(path: Path, root: Path) -> bool:
+    current = Path(path)
+    seen = set()
+    while True:
+        key = path_key(current)
+        if key in seen:
+            break
+        seen.add(key)
+        try:
+            if current.exists() and is_link(current):
+                if not contained_in(current.resolve(), root):
+                    return True
+        except OSError:
+            pass
+        if current.parent == current or path_key(current) == path_key(root):
+            break
+        current = current.parent
+    return False
+
+
+def resolve_in_root(value: Path | str, root: Path | str, *, label: str = 'That image') -> Path:
+    """Resolve a user path inside root. Refuse traversal and symlink/junction escape."""
+    if value is None or not str(value).strip():
+        raise ValueError(f'{label} is missing.')
+    root = Path(root).expanduser().resolve()
+    raw = Path(str(value).strip()).expanduser()
+    candidate = raw if raw.is_absolute() else root / raw
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError(f'{label} is unavailable.') from exc
+    if not contained_in(resolved, root) or _link_escapes(candidate, root) or _link_escapes(resolved, root):
+        raise ValueError(f'{label} is outside the allowed folder.')
+    return resolved
+
+
+def assert_output_in_root(path: Path | str, root: Path | str) -> Path:
+    """Refuse a write target that would leave the chosen output folder."""
+    return resolve_in_root(path, root, label='The output')
+
+
+def pairing_root(front, back, folder=None) -> Path:
+    """Allowed root for a pair. Explicit folder wins; otherwise the shared ancestor."""
+    if folder:
+        return Path(folder).expanduser().resolve()
+    try:
+        return Path(os.path.commonpath([
+            str(Path(front).expanduser().resolve().parent),
+            str(Path(back).expanduser().resolve().parent),
+        ]))
+    except (ValueError, OSError) as exc:
+        raise ValueError('Choose a front and a back image.') from exc
+
+
 def _is_windows() -> bool:
     return os.name == 'nt'
 
@@ -593,7 +669,7 @@ def prepare_ai_plans(front: Path, operation: str, composite: Path | None = None)
     """Reserve saveable output names before a paid AI call."""
     sources = [front] + ([composite] if composite is not None else [])
     plans = plan_many(sources, operation)
-    if len({item['root'] for item in plans}) != 1:
+    if len({item['root'] for item in plans}) != 1 and not all(item.get('keep_source') for item in plans):
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:
         output = plans[1]['output']
@@ -947,7 +1023,7 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
 def file_results(sources: list[Path], payloads: list[bytes], operation: str,
                  output_paths: list[Path] | None = None) -> list[Path]:
     plans = plan_many(sources, operation)
-    if len({item['root'] for item in plans}) != 1:
+    if len({item['root'] for item in plans}) != 1 and not all(item.get('keep_source') for item in plans):
         raise ValueError('Linked photos must belong to the same batch root.')
     if len(plans) == 2 and plans[0]['output'] == plans[1]['output']:
         output = plans[1]['output']
