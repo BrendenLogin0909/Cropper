@@ -38,16 +38,28 @@ class StageServerTests(unittest.TestCase):
         threading.Thread(target=self.http.serve_forever,daemon=True).start()
         self.addCleanup(self.stop_server)
         self.base=f'http://127.0.0.1:{self.http.server_port}'
+        server.reset_tabs(); server.reset_confirmations()
+        self.tab='tabid-test-000001'
+        server.register_tab(self.tab)
+        with patch.object(server,'choose_folder_dialog',return_value=self.root):
+            request=Request(self.base+'/api/pick-folder',b'{}',{'X-Cropper-Token':server.TOKEN,'X-Cropper-Tab':self.tab,'Content-Type':'application/json'})
+            with urlopen(request) as response: json.load(response)
 
     def stop_server(self):
         self.http.shutdown();self.http.server_close()
 
     def post(self,endpoint,body):
-        request=Request(self.base+endpoint,json.dumps(body).encode(),{'X-Cropper-Token':server.TOKEN,'Content-Type':'application/json'})
+        request=Request(self.base+endpoint,json.dumps(body).encode(),{'X-Cropper-Token':server.TOKEN,'X-Cropper-Tab':self.tab,'Content-Type':'application/json'})
         with urlopen(request) as response:return json.load(response)
 
     def source(self,folder,name):
-        source=self.root/folder/name;source.parent.mkdir(parents=True,exist_ok=True);source.write_bytes(self.png);return source
+        source=self.root/folder/name;source.parent.mkdir(parents=True,exist_ok=True)
+        suffix=Path(name).suffix.lower()
+        if suffix in {'.jpg','.jpeg'}:
+            stream=io.BytesIO();Image.new('RGB',(8,8),'blue').save(stream,'JPEG');source.write_bytes(stream.getvalue())
+        else:
+            source.write_bytes(self.png)
+        return source
 
     def test_new_routing_survives_pending_reload_and_is_not_changed_at_acceptance(self):
         source=self.source(stages.CROP_QUEUE,'photo_c.png')

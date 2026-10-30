@@ -986,9 +986,25 @@ def _remove_empty_dirs(folders: list[Path]) -> None:
             pass
 
 
+def bytes_for_destination(target: Path, data: bytes) -> bytes:
+    """Re-encode image bytes so they match the destination extension, or raise."""
+    dest = Path(target)
+    suffix = dest.suffix.lower()
+    if suffix not in _PAYLOAD_FORMATS:
+        return data
+    try:
+        encoded, encoded_dest = encode_payload_for_path(data, dest)
+    except Exception as exc:
+        raise ValueError('Image data does not match the destination file type.') from exc
+    if encoded_dest.suffix.lower() != suffix:
+        raise ValueError('Image data does not match the destination file type.')
+    return encoded
+
+
 def _atomic_create(target: Path, data: bytes, overwrite: bool = False) -> bool:
     """Write target via temp + os.replace. Returns True if this call created a new file to roll back."""
     target = Path(target)
+    data = bytes_for_destination(target, data)
     parent = windows_long_path(target.parent)
     parent.mkdir(parents=True, exist_ok=True)
     destination = windows_long_path(target)
@@ -1083,12 +1099,14 @@ def commit(plans: list[dict], payloads: list[bytes | None]) -> list[Path]:
             created, removed = [], []
             created_dirs: list[Path] = []
             try:
-                for target, data in writes.items():
+                for target, data in list(writes.items()):
+                    prepared = bytes_for_destination(target, data)
+                    writes[target] = prepared
                     for folder in _missing_parents(Path(target).parent):
                         if folder not in created_dirs:
                             created_dirs.append(folder)
                     overwrite = target in overwrites
-                    new_file = _atomic_create(target, data, overwrite=overwrite)
+                    new_file = _atomic_create(target, prepared, overwrite=overwrite)
                     if new_file:
                         created.append(target)
                 for target, data in writes.items():

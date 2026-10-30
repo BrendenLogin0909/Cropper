@@ -29,6 +29,16 @@ class ServerPendingTests(unittest.TestCase):
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
             base = f'http://127.0.0.1:{local_server.server_port}'
+            tab = 'tabid-test-000001'
+            server.reset_tabs()
+            server.reset_confirmations()
+            server.register_tab(tab)
+            with patch.object(server, 'choose_folder_dialog', return_value=queue):
+                pick = Request(base + '/api/pick-folder', b'{}', {
+                    'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json',
+                })
+                with urlopen(pick) as response:
+                    json.load(response)
             cases = [
                 (429, 'rate_limit_exceeded', 'rate_limit_error', 429),
                 (429, 'billing_not_active', 'insufficient_quota', 429),
@@ -53,7 +63,7 @@ class ServerPendingTests(unittest.TestCase):
                             error.response = SimpleNamespace(headers={'retry-after': '300', 'x-request-id': 'req_example'})
                             request = Request(base + '/api/chatgpt-generate',
                                 json.dumps({'front_path': str(source)}).encode(),
-                                {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                                {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
                             with patch.object(server, 'edit_front', side_effect=error), \
                                  self.assertRaises(HTTPError) as caught:
                                 urlopen(request)
@@ -103,9 +113,10 @@ class ServerPendingTests(unittest.TestCase):
                     return json.load(response)
 
             def open_folder(path):
-                request = Request(base + "/api/list?path=" + quote(str(path)), headers=headers)
-                with urlopen(request) as response:
-                    return json.load(response)
+                with patch.object(server, 'choose_folder_dialog', return_value=Path(path)):
+                    request = Request(base + "/api/pick-folder", b'{}', {**headers, "Content-Type": "application/json"})
+                    with urlopen(request) as response:
+                        return json.load(response)
 
             try:
                 with patch.object(photo_pairs, 'ROOT', root / 'links'), \

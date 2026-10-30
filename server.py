@@ -54,6 +54,10 @@ ALLOWED_ROOTS: dict[tuple[str, str], set[str]] = {}
 TABS_LOCK = threading.Lock()
 TAB_ID_MIN_LEN = 16
 TAB_ID_MAX_LEN = 128
+TAB_LIMIT = 32
+TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
+_DIALOG_LOCK = threading.Lock()
+_GRANTED = threading.local()
 
 
 class ConfirmationRequired(Exception):
@@ -461,19 +465,60 @@ def reset_tabs() -> None:
         ALLOWED_ROOTS.clear()
 
 
-def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path | None:
-    """Remember a folder this tab opened or picked. `/` and unnamed tabs are ignored."""
+def choose_folder_dialog() -> Path | None:
+    """Open the native OS folder dialog on its own thread. None if the user cancels."""
+    result: list = []
+    errors: list = []
+
+    def run() -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            chosen = filedialog.askdirectory(title="Choose folder")
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+            result.append(chosen)
+        except Exception as exc:  # pragma: no cover - exercised via monkeypatch
+            errors.append(exc)
+
+    with _DIALOG_LOCK:
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=300)
+    if errors:
+        raise ValueError("Could not open the folder dialog.") from errors[0]
+    if not result or not result[0]:
+        return None
+    return Path(result[0])
+
+
+def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path:
+    """Register only a dialog-chosen folder for this session and tab. Drive roots and parents are refused."""
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     if not tab_id or not tab_is_registered(tab_id, session):
-        return None
+        raise ValueError("This browser tab must register a random id first.")
     try:
         path = Path(folder).expanduser().resolve()
-    except OSError:
-        return None
-    if not path.is_dir() or stage_files.is_filesystem_root(path):
-        return None
+    except OSError as exc:
+        raise ValueError("Folder not found.") from exc
+    if not path.is_dir():
+        raise ValueError("Folder not found.")
+    if stage_files.is_filesystem_root(path):
+        raise ValueError("A drive or filesystem root cannot be registered.")
     with TABS_LOCK:
+        existing = [Path(key) for key in ALLOWED_ROOTS.get((session, tab_id), ())]
+        for root in existing:
+            if stage_files.contained_in(root, path) and not stage_files.same_path(root, path):
+                raise ValueError("A parent of an already opened folder cannot be registered.")
         ALLOWED_ROOTS.setdefault((session, tab_id), set()).add(stage_files.path_key(path))
     return path
 
@@ -481,7 +526,7 @@ def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Pa
 def allowed_roots_for(tab_id: str, session: str | None = None) -> list[Path]:
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
-    if not tab_id:
+    if not tab_id or not tab_is_registered(tab_id, session):
         return []
     with TABS_LOCK:
         keys = list(ALLOWED_ROOTS.get((session, tab_id), ()))
@@ -497,14 +542,30 @@ def normalize_tab_id(value: object) -> str:
     return text
 
 
+def _purge_tabs_locked(now: float | None = None) -> None:
+    stamp = time.time() if now is None else now
+    expired = [key for key, seen in TABS.items() if seen + TAB_IDLE_SECONDS <= stamp]
+    for key in expired:
+        TABS.pop(key, None)
+        ALLOWED_ROOTS.pop(key, None)
+
+
 def register_tab(tab_id: str, session: str | None = None) -> str:
-    """Remember this browser tab for the current app session."""
+    """Remember this browser tab for the current app session. Cap is 32 live tabs."""
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     if not tab_id:
         raise ValueError("This browser tab must register a random id first.")
     with TABS_LOCK:
-        TABS[(session, tab_id)] = time.time()
+        _purge_tabs_locked()
+        key = (session, tab_id)
+        if key in TABS:
+            TABS[key] = time.time()
+            return tab_id
+        live = sum(1 for sess, _tid in TABS if sess == session)
+        if live >= TAB_LIMIT:
+            raise ValueError("Too many browser tabs are registered. Close an idle tab and try again.")
+        TABS[key] = time.time()
     return tab_id
 
 
@@ -514,7 +575,12 @@ def tab_is_registered(tab_id: str, session: str | None = None) -> bool:
     if not tab_id:
         return False
     with TABS_LOCK:
-        return (session, tab_id) in TABS
+        _purge_tabs_locked()
+        key = (session, tab_id)
+        if key not in TABS:
+            return False
+        TABS[key] = time.time()
+        return True
 
 
 def _purge_confirmations_locked(now: float | None = None) -> None:
@@ -530,6 +596,29 @@ def _target_keys(paths: list[Path]) -> frozenset[str]:
 
 def _batch_key(plans: list[dict]) -> str:
     return "\n".join(sorted({stage_files.path_key(stage_files.plan_root(item)) for item in plans}))
+
+
+def _new_batch_id() -> str:
+    return secrets.token_urlsafe(16)
+
+
+def _clear_granted() -> None:
+    _GRANTED.token = None
+    _GRANTED.batch_id = None
+
+
+def granted_confirmation() -> tuple[str | None, str | None]:
+    return getattr(_GRANTED, "token", None), getattr(_GRANTED, "batch_id", None)
+
+
+def _confirmation_public(token: str) -> dict:
+    with CONFIRMATIONS_LOCK:
+        record = CONFIRMATIONS.get(token) or {}
+        batch_id = record.get("batch_id") or ""
+    payload = {"confirmation_token": token}
+    if batch_id:
+        payload["batch_id"] = batch_id
+    return payload
 
 
 def _secret_matches(stored: str, given: str) -> bool:
@@ -564,25 +653,30 @@ def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
 
 def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
                        session: str | None = None, payload: dict | None = None,
-                       tab_id: str | None = None) -> str:
-    """Mint a random in-memory token bound to this session, tab, folder, and targets."""
+                       tab_id: str | None = None, scope: str | None = None) -> str:
+    """Mint a random in-memory token bound to this session, tab, server batch id, and targets."""
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     covered = set(_target_keys(targets))
-    scope = "files"
+    granted = "batch" if kind == "replace" else "files"
+    if scope in {"batch", "files"}:
+        granted = scope
+    batch_id = _new_batch_id()
     previous = str((payload or {}).get("confirmation_token") or "")
     inherited = _record_for_token(previous, kind, plans, session, tab_id)
     if inherited:
         covered |= set(inherited.get("targets") or ())
         if inherited.get("scope") == "batch":
-            scope = "batch"
+            granted = "batch"
+        batch_id = inherited.get("batch_id") or batch_id
     token = secrets.token_urlsafe(32)
     record = {
         "kind": kind,
         "session": session,
         "tab_id": tab_id,
         "batch": _batch_key(plans),
-        "scope": scope,
+        "batch_id": batch_id,
+        "scope": granted,
         "targets": frozenset(covered),
         "expires": time.time() + CONFIRMATION_TTL_SECONDS,
     }
@@ -594,7 +688,8 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
 
 def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: list[Path],
                         session: str | None = None, tab_id: str | None = None) -> bool:
-    """True only for a live registered-tab token covering this folder, and files unless batch-wide."""
+    """True only for a live registered-tab token. File tokens are single-use; flags never widen them."""
+    _clear_granted()
     flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
     if not any(payload.get(flag) for flag in flags):
         return False
@@ -604,18 +699,24 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     record = _record_for_token(token, kind, plans, session, tab_id)
     if record is None:
         return False
-    batch_grant = record.get("scope") == "batch"
-    if kind == "overwrite" and payload.get("skip_overwrite_prompt"):
-        batch_grant = True
-    if kind == "replace" and payload.get("confirm_replace"):
-        batch_grant = True
-    if batch_grant:
-        with CONFIRMATIONS_LOCK:
-            live = CONFIRMATIONS.get(token)
-            if live is not None:
-                live["scope"] = "batch"
+    if record.get("scope") == "batch":
+        _GRANTED.token = token
+        _GRANTED.batch_id = record.get("batch_id")
         return True
-    return _target_keys(targets) <= (record.get("targets") or frozenset())
+    if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+        return False
+    promoted = None
+    if kind == "overwrite" and payload.get("skip_overwrite_prompt"):
+        promoted = issue_confirmation(kind, plans, targets, session, payload, tab_id, scope="batch")
+    with CONFIRMATIONS_LOCK:
+        CONFIRMATIONS.pop(token, None)
+    if promoted:
+        with CONFIRMATIONS_LOCK:
+            live = CONFIRMATIONS.get(promoted) or {}
+            batch_id = live.get("batch_id")
+        _GRANTED.token = promoted
+        _GRANTED.batch_id = batch_id
+    return True
 
 
 def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None,
@@ -628,12 +729,13 @@ def overwrite_response(plans: list[dict], data: dict | None, session: str | None
     session = session or TOKEN
     if confirmation_allows("overwrite", payload, plans, targets, session, tab_id):
         return None
+    token = issue_confirmation("overwrite", plans, targets, session, payload, tab_id)
     return {
         "code": "overwrite_confirmation_required",
         "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "confirmation_token": issue_confirmation("overwrite", plans, targets, session, payload, tab_id),
+        **_confirmation_public(token),
     }
 
 
@@ -647,12 +749,13 @@ def replace_response(plans: list[dict], data: dict | None, session: str | None =
     session = session or TOKEN
     if confirmation_allows("replace", payload, plans, targets, session, tab_id):
         return None
+    token = issue_confirmation("replace", plans, targets, session, payload, tab_id)
     return {
         "code": "replace_confirmation_required",
         "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
-        "confirmation_token": issue_confirmation("replace", plans, targets, session, payload, tab_id),
+        **_confirmation_public(token),
     }
 
 
@@ -694,6 +797,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def request_tab_id(self) -> str:
         return normalize_tab_id(self.headers.get("X-Cropper-Tab", ""))
+
+    def request_roots(self) -> list[Path]:
+        return allowed_roots_for(self.request_tab_id())
+
+    def request_image(self, value, label: str = "That image") -> Path:
+        path = stage_files.resolve_in_allowed_roots(value, self.request_roots(), label=label)
+        if not path.is_file() or path.suffix.lower() not in EXTENSIONS:
+            raise ValueError("That image is unavailable or its format is unsupported.")
+        return path
+
+    def request_folder(self, value, label: str = "Folder") -> Path:
+        path = stage_files.resolve_in_allowed_roots(value, self.request_roots(), label=label)
+        if not path.is_dir():
+            raise ValueError("Folder not found.")
+        return path
+
+    def attach_granted(self, body: dict) -> dict:
+        token, batch_id = granted_confirmation()
+        if token:
+            body["confirmation_token"] = token
+            if batch_id:
+                body["batch_id"] = batch_id
+        return body
 
     def confirm(self, plans: list[dict], data: dict | None) -> dict | None:
         return confirmation_response(plans, data, TOKEN, self.request_tab_id())
@@ -749,17 +875,16 @@ class Handler(BaseHTTPRequestHandler):
                 if query.get('part', [''])[0] == 'combined' and record.get('link'):
                     from chatgpt_restore import reassemble
                     link = record['link']
-                    png = reassemble(png, Path(link['composite_path']), link['split'], link['layout'])
+                    composite = self.request_image(link['composite_path'], label='Back image')
+                    png = reassemble(png, composite, link['split'], link['layout'])
                 self.reply(200, png, "image/png")
                 return
             if parsed.path == '/api/photo-links':
-                folder = clean_path(query.get('path', [''])[0])
+                folder = self.request_folder(query.get('path', [''])[0])
                 self.json(200, {'links': read_links(folder)})
                 return
             if parsed.path == "/api/chatgpt-pending":
-                folder = clean_path(query.get("path", [""])[0])
-                if not folder.is_dir():
-                    raise ValueError("Folder not found.")
+                folder = self.request_folder(query.get("path", [""])[0])
                 self.json(200, {"items": list_pending(folder), "recovered": list_recovered()})
                 return
             if parsed.path == "/api/folders":
@@ -768,13 +893,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/list":
                 base = folder_listing(query.get("path", [""])[0])
                 folder = Path(base["path"])
-                register_allowed_root(folder, self.request_tab_id())
                 entries = list(folder.iterdir())
                 images = sorted(({"name": p.name, "path": str(p), "bytes": p.stat().st_size, "modified": p.stat().st_mtime} for p in entries if p.is_file() and p.suffix.lower() in EXTENSIONS), key=lambda x: x["name"].lower())
                 self.json(200, {**base, "images": images})
                 return
             if parsed.path in {"/api/image", "/api/thumb", "/api/enhance-original"}:
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 limit = 440 if parsed.path == "/api/thumb" else 1800 if parsed.path == "/api/enhance-original" else 7000
                 image, _ = load_image(path)
                 image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
@@ -783,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg")
                 return
             if parsed.path == "/api/enhance-preview":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 image, _ = load_image(path)
                 image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 enhanced, changes = auto_enhance(image)
@@ -792,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
                 return
             if parsed.path == "/api/restore-preview":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 operation = query.get("operation", [""])[0]
                 image, _ = load_image(path)
                 restored, changes = restore(image, operation)
@@ -802,7 +926,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
                 return
             if parsed.path == "/api/info":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 with Image.open(path) as image:
                     width, height = image.size
                     if image.getexif().get(274) in {5, 6, 7, 8}:
@@ -830,6 +954,14 @@ class Handler(BaseHTTPRequestHandler):
                 register_tab(tab_id, TOKEN)
                 self.json(200, {"registered": True})
                 return
+            if self.path == "/api/pick-folder":
+                chosen = choose_folder_dialog()
+                if chosen is None:
+                    self.json(200, {"cancelled": True, "path": None})
+                    return
+                path = register_allowed_root(chosen, self.request_tab_id())
+                self.json(200, {"cancelled": False, "path": str(path)})
+                return
             if self.path == "/api/settings":
                 if not isinstance(data, dict):
                     raise ValueError("Invalid settings.")
@@ -837,6 +969,9 @@ class Handler(BaseHTTPRequestHandler):
                 if key is not None and str(key).strip():
                     app_settings.set_stored_api_key(str(key))
                 key = None
+                folder = str(data.get("output_folder") or "").strip()
+                if folder:
+                    data["output_folder"] = str(self.request_folder(folder, label="The output folder"))
                 app_settings.save_settings(data)
                 self.json(200, app_settings.public_settings())
                 return
@@ -853,7 +988,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, result)
                 return
             if self.path == '/api/crop-corners':
-                path = image_path(data.get('path', ''))
+                path = self.request_image(data.get('path', ''))
                 image, _ = load_image(path)
                 target = data.get('target')
                 if target is not None and (not isinstance(target, list) or len(target) != 2 or
@@ -868,7 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
                     raw_paths = [data.get("path"), *raw_paths]
                 if not raw_paths:
                     raise ValueError("Select photos to check.")
-                paths = [image_path(value) for value in raw_paths]
+                paths = [self.request_image(value) for value in raw_paths]
                 plans = stage_files.plan_many(paths, operation)
                 targets = stage_files.planned_overwrites(plans)
                 replaces = stage_files.planned_replaces(plans)
@@ -882,15 +1017,19 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 tab_id = self.request_tab_id()
                 if targets:
-                    body["confirmation_token"] = issue_confirmation(
-                        "overwrite", plans, targets, TOKEN, data, tab_id)
+                    token = issue_confirmation("overwrite", plans, targets, TOKEN, data, tab_id)
+                    body.update(_confirmation_public(token))
                 if replaces:
-                    body["replace_confirmation_token"] = issue_confirmation(
+                    replace_token = issue_confirmation(
                         "replace", plans, replaces, TOKEN, data, tab_id)
+                    body["replace_confirmation_token"] = replace_token
+                    public = _confirmation_public(replace_token)
+                    if public.get("batch_id") and "batch_id" not in body:
+                        body["batch_id"] = public["batch_id"]
                 self.json(200, body)
                 return
             if self.path == "/api/crop":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 refusal = self.confirm([stage_files.plan(path, "crop")], data)
                 if refusal:
                     self.json(409, refusal)
@@ -900,10 +1039,10 @@ class Handler(BaseHTTPRequestHandler):
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
                     body['protected_message'] = stage_files.protected_original_message(destination.name)
-                self.json(200, body)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/crop-preview":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 image, _ = load_image(path)
                 original_width, original_height = image.size
                 image.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
@@ -928,10 +1067,10 @@ class Handler(BaseHTTPRequestHandler):
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
                     body['protected_message'] = stage_files.protected_original_message(destination.name)
-                self.json(200, body)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/enhance":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 refusal = self.confirm([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
@@ -946,10 +1085,10 @@ class Handler(BaseHTTPRequestHandler):
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
                     body['protected_message'] = stage_files.protected_original_message(destination.name)
-                self.json(200, body)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/restore-preview":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 operation = data.get("operation", "")
                 image, _ = load_image(path)
                 if data.get("show_marks") and operation == "dust":
@@ -963,7 +1102,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                    "X-Cropper-Useful": str(useful_change(changes)).lower()})
                 return
             if self.path == "/api/restore":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 refusal = self.confirm([stage_files.plan(path, "enhance")], data)
                 if refusal:
                     self.json(409, refusal)
@@ -976,22 +1115,22 @@ class Handler(BaseHTTPRequestHandler):
                 if destination is not None and stage_files.saved_protected(destination):
                     body['protected_original'] = True
                     body['protected_message'] = stage_files.protected_original_message(destination.name)
-                self.json(200, body)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == '/api/colorization-candidates':
-                folder=clean_path(data.get('path',''))
+                folder=self.request_folder(data.get('path',''))
                 self.json(200, {'items':candidates(folder,read_links(folder))})
                 return
             if self.path == '/api/stage-finish':
                 requested = data.get('paths', [])
                 if not isinstance(requested, list) or not 1 <= len(requested) <= 1000:
                     raise ValueError('Select between 1 and 1000 photos to finish.')
-                paths = {image_path(value) for value in requested}
+                paths = {self.request_image(value) for value in requested}
                 # Resolve either selected member to its complete approved pair.
                 links = []
                 for folder in {path.parent for path in paths}:
                     for link in read_links(folder):
-                        members = [image_path(link['front_path']), image_path(link['composite_path'])]
+                        members = [self.request_image(link['front_path']), self.request_image(link['composite_path'])]
                         if any(stage_files.same_path(path, member) for path in paths for member in members):
                             paths.update(members)
                             links.append(link)
@@ -1008,7 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Each pair is atomic; report partial batch success explicitly.
                 remaining = set(paths)
                 finished, errors = [], []
-                groups = [[image_path(link['front_path']), image_path(link['composite_path'])] for link in links]
+                groups = [[self.request_image(link['front_path']), self.request_image(link['composite_path'])] for link in links]
                 paired = {path for group in groups for path in group}
                 groups += [[path] for path in sorted(paths - paired)]
                 for group in groups:
@@ -1023,7 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {'finished': finished, 'errors': errors})
                 return
             if self.path == '/api/photo-pair-suggestions':
-                self.json(200, {'items': suggestions(clean_path(data.get('path', '')))})
+                self.json(200, {'items': suggestions(self.request_folder(data.get('path', '')))})
                 return
             if self.path == '/api/photo-link':
                 roots = allowed_roots_for(self.request_tab_id())
@@ -1040,13 +1179,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/chatgpt-generate":
                 operation=data.get('operation','restore')
                 if operation not in {'restore','colorize'}: raise ValueError('Invalid image operation.')
-                front = image_path(data.get("front_path", ""))
+                front = self.request_image(data.get("front_path", ""), label="Front image")
                 stage_files.plan(front, operation)  # Fail before paying for a request.
                 links = read_links(front.parent)
                 if any(stage_files.same_path(item['composite_path'], front) for item in links):
                     raise ValueError('This is a linked combined image. Select its standalone front or use Generate selected pairs.')
                 link = next((item for item in links if stage_files.same_path(item['front_path'], front)), None)
-                composite = image_path(link['composite_path']) if link else None
+                composite = self.request_image(link['composite_path'], label='Back image') if link else None
                 if composite is not None:
                     stage_files.plan(composite, operation)
                 if any(stage_files.same_path(item["front_path"], front) for item in list_pending(front.parent)):
@@ -1089,7 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(include_previous, bool):
                     raise ValueError('Invalid previous-image option.')
                 record, _ = get_pending(data.get('id', ''))
-                front = image_path(record['front_path'])
+                front = self.request_image(record['front_path'], label="Front image")
                 with review_lock(front):
                     record, previous = get_pending(record['id'])
                     operation = record.get('operation', 'restore')
@@ -1097,7 +1236,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('Invalid image operation.')
                     planned = [stage_files.plan(front, operation)]
                     if record.get('link'):
-                        composite = image_path(record['link']['composite_path'])
+                        composite = self.request_image(record['link']['composite_path'], label='Back image')
                         planned.append(stage_files.plan(composite, operation))
                     stage_files.assert_plans_writable(planned)
                     comments = [*record.get('comments', []), comment.strip()]
@@ -1132,7 +1271,7 @@ class Handler(BaseHTTPRequestHandler):
                     record, image = get_pending(stage_id)
                     if self.path.endswith("accept"):
                         operation = record.get("operation") or "restore"
-                        front = image_path(record["front_path"])
+                        front = self.request_image(record["front_path"], label="Front image")
                         plans = [stage_files.plan(front, operation)]
                         dests = [Path(value) for value in (record.get("output_paths") or [])]
                         if record.get("output_path"):
@@ -1167,7 +1306,7 @@ class Handler(BaseHTTPRequestHandler):
                     if protected:
                         body['protected_original'] = True
                         body['protected_message'] = stage_files.protected_original_message(protected[0].name)
-                    self.json(200, body)
+                    self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/chatgpt-recovered-keep":
                 self.json(200, keep_recovered(data.get("id", "")))

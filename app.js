@@ -267,6 +267,9 @@ async function api(path, body) {
       continue;
     }
     if (!response.ok) { const error = new Error(data.error || 'Something went wrong.'); error.status = response.status; error.retryAfter = data.retry_after; error.code = data.code; error.type = data.type; error.requestId = data.request_id; error.path = data.path; error.count = data.count; error.names = data.names; throw error; }
+    if (data && data.confirmation_token && payload && payload.skip_overwrite_prompt) {
+      overwriteAckForBatch(data.confirmation_token, true);
+    }
     return data;
   }
 }
@@ -624,10 +627,27 @@ async function saveRestorationBatch() {
   $('restore-progress').textContent = protectedNote || `${saved} saved to ${info.output}; ${skipped} skipped because no useful change was found${failed.length ? ` · ${failed.length} failed` : ''}${stopped ? ' · stopped' : ''}`;
   if (failed.length) toast(failed[0], true); else toast(protectedNote || (saved ? `${saved} ${saved === 1 ? 'photo' : 'photos'} saved to ${info.output}; ${skipped} skipped.` : `${skipped} skipped; no files were changed.`));
 }
+async function pickNativeFolder() {
+  const data = await api('/api/pick-folder', {});
+  if (!data || data.cancelled || !data.path) return '';
+  return data.path;
+}
 async function pickFolder(forOutput = false, forBack = false) {
-  const start = forBack ? (state.folder || state.home) : ($('settings-output-folder')?.value || state.folder || state.home);
+  if (!forOutput) {
+    try {
+      const path = await pickNativeFolder();
+      if (!path) return;
+      await loadFolder(path);
+      if (forBack && state.view === 'merge') {
+        toast('Back folder opened. Click the matching back image.');
+        renderMerge();
+      }
+    } catch (error) { toast(error.message, true); }
+    return;
+  }
+  const start = $('settings-output-folder')?.value || state.folder || state.home;
   state.picker = { path: start, parent: null, forOutput, forBack };
-  $('folder-modal-title').textContent = forBack ? 'Choose back folder' : forOutput ? 'Choose another output folder' : 'Choose image folder';
+  $('folder-modal-title').textContent = forOutput ? 'Choose another output folder' : 'Choose image folder';
   $('folder-modal').classList.remove('hidden');
   $('folder-modal-list').replaceChildren();
   $('folder-modal-message').textContent = 'Loading folders…';
