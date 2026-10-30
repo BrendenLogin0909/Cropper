@@ -824,7 +824,7 @@ class OutputHandlingTests(unittest.TestCase):
             Image.new('RGB', (8, 8), 'blue').save(combined)
             with patch.object(photo_pairs, 'ROOT', Path(tmp) / 'links'):
                 link = photo_pairs.approve_link(front, combined, 50, 'right')
-            self.assertEqual(Path(link['front_path']), front)
+            self.assertTrue(stages.same_path(link['front_path'], front))
 
     def test_copy_mode_overwrite_reports_protected_original(self):
         with TemporaryDirectory() as tmp:
