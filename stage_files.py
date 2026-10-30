@@ -297,7 +297,9 @@ def probe_folder_writable(folder: Path) -> None:
     except PermissionError:
         raise
     except OSError as exc:
-        raise PermissionError(exc.filename or str(folder)) from exc
+        error = PermissionError(exc.filename or str(folder))
+        error.filename = exc.filename or str(folder)
+        raise error from exc
 
 
 def assert_plans_writable(plans: list[dict]) -> None:
