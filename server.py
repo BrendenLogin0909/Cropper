@@ -976,10 +976,11 @@ class Handler(BaseHTTPRequestHandler):
                     operation = record.get('operation', 'restore')
                     if operation not in {'restore', 'colorize'}:
                         raise ValueError('Invalid image operation.')
-                    stage_files.plan(front, operation)
+                    planned = [stage_files.plan(front, operation)]
                     if record.get('link'):
                         composite = image_path(record['link']['composite_path'])
-                        stage_files.plan(composite, operation)
+                        planned.append(stage_files.plan(composite, operation))
+                    stage_files.assert_plans_writable(planned)
                     comments = [*record.get('comments', []), comment.strip()]
                     if len(comments) > 20 or sum(map(len, comments)) > 12000:
                         raise ValueError('Correction history is too long. Reject these attempts and start again.')

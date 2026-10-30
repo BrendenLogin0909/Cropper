@@ -335,6 +335,22 @@ class OutputHandlingTests(unittest.TestCase):
                         pass
         self.assertGreaterEqual(fake.locking.call_count, 2)
 
+    def test_probe_folder_writable_leaves_no_temp_file(self):
+        with TemporaryDirectory() as tmp:
+            stages.probe_folder_writable(Path(tmp))
+            self.assertEqual([path.name for path in Path(tmp).iterdir() if path.name.startswith('.cropper-preflight-')], [])
+
+    def test_probe_folder_writable_raises_on_unwritable_folder(self):
+        with TemporaryDirectory() as tmp:
+            dest = Path(tmp) / 'locked'
+            dest.mkdir()
+            dest.chmod(0o555)
+            try:
+                with self.assertRaises(PermissionError):
+                    stages.probe_folder_writable(dest)
+            finally:
+                dest.chmod(0o755)
+
     def test_permission_error_distinguishes_locked_file(self):
         folder = PermissionError('denied')
         folder.filename = str(Path(self.folder.name))
@@ -435,6 +451,292 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertTrue((queue / 'scan_001.png').is_file())
         self.assertTrue((queue / 'scan_002.png').is_file())
         self.assertNotEqual(first['path'], second['path'])
+
+    def _non_stage_settings(self, **overrides):
+        data = {
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip', 'replace_original': False,
+            'backup_originals': True, 'output_folder': '',
+        }
+        data.update(overrides)
+        return data
+
+    def test_non_stage_suffix_restore_and_colorize(self):
+        name = '[Scan]_20261027_0004 [B&W].jpg'
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / name
+            Image.new('RGB', (16, 16), 'red').save(source)
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                restored = stages.file_results([source], [png('blue')], 'restore')[0]
+                coloured = stages.file_results([source], [png('green')], 'colorize')[0]
+            self.assertTrue(stages.same_path(restored, photos / '[Scan]_20261027_0004 [B&W]_ai.png'))
+            self.assertTrue(stages.same_path(coloured, photos / '[Scan]_20261027_0004 [B&W]_col.png'))
+            self.assertEqual(restored.read_bytes(), png('blue'))
+            self.assertEqual(coloured.read_bytes(), png('green'))
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), original)
+            self.assertFalse((photos / stages.AI_QUEUE).exists())
+            self.assertFalse((photos / stages.COLOR).exists())
+
+    def test_non_stage_copy_mode_and_png_source_uses_conflict_policy(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            jpg = photos / 'plain copy.jpg'
+            Image.new('RGB', (16, 16), 'red').save(jpg)
+            original_jpg = jpg.read_bytes()
+            colour_jpg = photos / 'colour copy.jpg'
+            Image.new('RGB', (16, 16), 'red').save(colour_jpg)
+            copy_settings = self._non_stage_settings(filename_template='{name}{ext}')
+            with patch.object(stages, '_settings', return_value=copy_settings):
+                output = stages.file_results([jpg], [png('blue')], 'restore')[0]
+                coloured = stages.file_results([colour_jpg], [png('green')], 'colorize')[0]
+            self.assertTrue(stages.same_path(output, photos / 'plain copy.png'))
+            self.assertEqual(output.read_bytes(), png('blue'))
+            self.assertTrue(stages.same_path(coloured, photos / 'colour copy.png'))
+            self.assertEqual(coloured.read_bytes(), png('green'))
+            self.assertTrue(jpg.exists())
+            self.assertEqual(jpg.read_bytes(), original_jpg)
+            self.assertTrue(colour_jpg.exists())
+
+            png_source = photos / 'scan & copy.png'
+            png_source.write_bytes(png('red'))
+            original_png = png_source.read_bytes()
+            with patch.object(stages, '_settings', return_value=copy_settings):
+                with self.assertRaisesRegex(ValueError, 'already exists'):
+                    stages.file_results([png_source], [png('blue')], 'restore')
+            self.assertEqual(png_source.read_bytes(), original_png)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(
+                    filename_template='{name}{ext}', conflict_policy='overwrite')):
+                output = stages.file_results([png_source], [png('blue')], 'restore')[0]
+            self.assertEqual(output.name, 'scan & copy-2.png')
+            self.assertEqual(output.read_bytes(), png('blue'))
+            self.assertEqual(png_source.read_bytes(), original_png)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(
+                    filename_template='{name}{ext}', conflict_policy='auto-suffix')):
+                output = stages.file_results([png_source], [png('green')], 'restore')[0]
+            self.assertEqual(output.name, 'scan & copy-3.png')
+            self.assertEqual(png_source.read_bytes(), original_png)
+
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(
+                    filename_template='{name}{ext}', conflict_policy='overwrite')):
+                plans = stages.prepare_ai_plans(png_source, 'restore')
+            self.assertEqual(plans[0]['output'].name, 'scan & copy-4.png')
+            self.assertFalse(plans[0]['overwrite'])
+            self.assertEqual(png_source.read_bytes(), original_png)
+            stages.release_outputs([plans[0]['output']])
+
+    def test_non_stage_new_folder_restore_and_colorize(self):
+        name = '[Scan]_20261027_0004 [B&W].jpg'
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            dest = Path(tmp) / 'restored'
+            photos.mkdir()
+            source = photos / name
+            Image.new('RGB', (16, 16), 'red').save(source)
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(output_folder=str(dest))):
+                restored = stages.file_results([source], [png('blue')], 'restore')[0]
+                coloured = stages.file_results([source], [png('green')], 'colorize')[0]
+            self.assertTrue(stages.same_path(restored, dest / '[Scan]_20261027_0004 [B&W]_ai.png'))
+            self.assertTrue(stages.same_path(coloured, dest / '[Scan]_20261027_0004 [B&W]_col.png'))
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(), original)
+            self.assertFalse((photos / stages.AI_QUEUE).exists())
+
+    def test_non_stage_suffix_conflict_policy(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'clash.jpg'
+            source.write_bytes(png())
+            existing = photos / 'clash_ai.png'
+            existing.write_bytes(b'existing')
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                with self.assertRaisesRegex(ValueError, 'already exists'):
+                    stages.file_results([source], [png('blue')], 'restore')
+            self.assertEqual(existing.read_bytes(), b'existing')
+            self.assertTrue(source.exists())
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
+                output = stages.file_results([source], [png('blue')], 'restore')[0]
+            self.assertEqual(output.read_bytes(), png('blue'))
+            self.assertTrue(source.exists())
+            taken = photos / 'other_ai.png'
+            taken.write_bytes(b'existing')
+            other = photos / 'other.jpg'
+            other.write_bytes(png())
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='auto-suffix')):
+                output = stages.file_results([other], [png('blue')], 'restore')[0]
+            self.assertEqual(output.name, 'other_ai-2.png')
+            self.assertEqual(taken.read_bytes(), b'existing')
+            self.assertTrue(other.exists())
+
+    def test_non_stage_replace_keeps_backup_until_verified(self):
+        with TemporaryDirectory() as tmp:
+            photos = Path(tmp) / 'scans'
+            photos.mkdir()
+            source = photos / 'replace me & copy.jpg'
+            source.write_bytes(png())
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(replace_original=True)):
+                output = stages.file_results([source], [png('yellow')], 'restore')[0]
+            self.assertTrue(stages.same_path(output, source))
+            self.assertEqual(source.read_bytes(), png('yellow'))
+            backup = photos / stages.BACKUPS / source.name
+            self.assertTrue(backup.is_file())
+            self.assertEqual(backup.read_bytes(), original)
+
+            png_source = photos / 'keep original.png'
+            png_source.write_bytes(png('red'))
+            original_png = png_source.read_bytes()
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings(
+                    filename_template='{name}{ext}', replace_original=True)):
+                replaced = stages.file_results([png_source], [png('blue')], 'restore')[0]
+            self.assertTrue(stages.same_path(replaced, png_source))
+            self.assertEqual(png_source.read_bytes(), png('blue'))
+            png_backup = photos / stages.BACKUPS / png_source.name
+            self.assertTrue(png_backup.is_file())
+            self.assertEqual(png_backup.read_bytes(), original_png)
+
+    def test_non_stage_unwritable_output_fails_before_ai_call(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        folder = Path(self.folder.name) / 'scans'
+        dest = Path(self.folder.name) / 'locked-out'
+        folder.mkdir()
+        dest.mkdir()
+        source = folder / '[Scan]_20261027_0004 [B&W].jpg'
+        Image.new('RGB', (16, 16), 'gray').save(source)
+        calls = []
+
+        def edit(path, **kwargs):
+            calls.append(path)
+            return png('blue')
+
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': False,
+            'backup_originals': True,
+            'output_folder': str(dest),
+        })
+        dest.chmod(0o555)
+        try:
+            with patch.object(server, 'read_links', return_value=[]), \
+                 patch.object(server, 'edit_front', side_effect=edit):
+                status, body = self._json(http.server_port, '/api/chatgpt-generate', {
+                    'front_path': str(source), 'operation': 'restore',
+                })
+        finally:
+            dest.chmod(0o755)
+        self.assertEqual(status, 403)
+        self.assertEqual(body['code'], 'permission_denied')
+        self.assertIn('Choose another output folder', body['error'])
+        self.assertEqual(calls, [])
+        self.assertTrue(source.exists())
+        self.assertFalse(list(dest.glob('*.png')))
+
+    def test_non_stage_replace_http_keeps_backup_until_verified(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        folder = Path(self.folder.name) / 'scans'
+        folder.mkdir()
+        source = folder / 'replace me & copy.jpg'
+        Image.new('RGB', (16, 16), 'gray').save(source)
+        original = source.read_bytes()
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': True,
+            'backup_originals': True,
+            'output_folder': '',
+        })
+
+        def edit(path, **kwargs):
+            return png('yellow')
+
+        with patch.object(server, 'read_links', return_value=[]), \
+             patch.object(server, 'edit_front', side_effect=edit):
+            status, record = self._json(http.server_port, '/api/chatgpt-generate', {
+                'front_path': str(source), 'operation': 'restore',
+            }, tab=tab)
+            self.assertEqual(status, 200)
+            status, body = self._json(http.server_port, '/api/chatgpt-accept', {
+                'id': record['id'],
+            }, tab=tab)
+            self.assertEqual(status, 409)
+            self.assertEqual(body['code'], 'replace_confirmation_required')
+            status, accepted = self._json(http.server_port, '/api/chatgpt-accept', {
+                'id': record['id'],
+                'confirm_replace': True,
+                'confirmation_token': body['confirmation_token'],
+            }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertEqual(source.read_bytes(), png('yellow'))
+        backup = folder / stages.BACKUPS / source.name
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), original)
+
+    def test_restore_in_stage_folder_still_uses_flat_routing(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self.source(root)
+            original = source.read_bytes()
+            with patch.object(stages, '_settings', return_value={
+                'filename_template': '{name}{suffix}{ext}',
+                'conflict_policy': 'skip', 'replace_original': False,
+                'backup_originals': True, 'output_folder': '',
+            }):
+                output = stages.file_results([source], [png('blue')], 'restore')[0]
+            self.assertTrue(stages.same_path(output, root / stages.AI_QUEUE / 'photo_c_ai.png'))
+            self.assertEqual(output.read_bytes(), png('blue'))
+            self.assertEqual((root / stages.CROPPED / source.name).read_bytes(), original)
+            self.assertEqual((root / stages.SKIP_ENHANCE / source.name).read_bytes(), original)
+            self.assertFalse(source.exists())
+
+    def test_ai_restore_accepts_non_stage_photo_with_special_filename(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        folder = Path(self.folder.name) / 'scans'
+        folder.mkdir()
+        source = folder / '[Scan]_20261027_0004 [B&W].jpg'
+        Image.new('RGB', (16, 16), 'gray').save(source)
+        original = source.read_bytes()
+
+        def edit(path, **kwargs):
+            return png('blue')
+
+        with patch.object(server, 'read_links', return_value=[]), \
+             patch.object(server, 'edit_front', side_effect=edit), \
+             patch.object(stages, '_settings', return_value={
+                 'filename_template': '{name}{suffix}{ext}',
+                 'conflict_policy': 'skip', 'replace_original': False,
+                 'backup_originals': True, 'output_folder': '',
+             }):
+            status, record = self._json(http.server_port, '/api/chatgpt-generate', {
+                'front_path': str(source), 'operation': 'restore',
+            })
+            self.assertEqual(status, 200)
+            status, accepted = self._json(http.server_port, '/api/chatgpt-accept', {
+                'id': record['id'],
+            })
+        self.assertEqual(status, 200)
+        self.assertTrue(source.exists())
+        self.assertEqual(source.read_bytes(), original)
+        saved = folder / '[Scan]_20261027_0004 [B&W]_ai.png'
+        self.assertTrue(saved.is_file())
+        self.assertFalse((folder / stages.AI_QUEUE).exists())
+        self.assertFalse((folder / stages.CROPPED).exists())
 
     def test_next_free_index_counts_finish_snapshot_names(self):
         with TemporaryDirectory() as tmp:
