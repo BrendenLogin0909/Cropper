@@ -331,14 +331,33 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     source_for_name = back_path if name_source == "back" else front_path if name_source == "front" else None
     if source_for_name is None:
         raise ValueError("Choose whether to name the pair from the first or second image.")
-    if front_path.parent != back_path.parent or front_path.parent.name != stage_files.CROP_QUEUE:
-        raise ValueError('Merge flat-batch pairs from the same 1.5. TBP Cropped folder.')
+    if front_path.parent != back_path.parent:
+        raise ValueError('Choose two different images in the same folder.')
     stem = source_for_name.stem
-    if stem.endswith('_c'): stem = stem[:-2]
-    destination = front_path.parent / f'{stem}_front-back_c{source_for_name.suffix}'
-    # Keep the standalone cropped front/back: only add the merged version.
-    stage_files.commit([{'source': source_for_name.resolve(), 'snapshots':[source_for_name.resolve()], 'output':destination}],
-                       [rendered_bytes(merged, source_for_name.suffix, front_info)])
+    protected = False
+    if front_path.parent.name == stage_files.CROP_QUEUE:
+        if stem.endswith('_c'):
+            stem = stem[:-2]
+        destination = front_path.parent / f'{stem}_front-back_c{source_for_name.suffix}'
+        snapshots = [source_for_name.resolve()]
+    else:
+        file_settings = stage_files._settings()
+        custom = str(file_settings.get('output_folder') or '').strip()
+        root = Path(custom).expanduser().resolve() if custom else front_path.parent
+        policy = file_settings.get('conflict_policy') or 'skip'
+        destination = root / stage_files.windows_safe_filename(
+            f'{stem}_front-back{source_for_name.suffix}')
+        occupied = {front_path.resolve(), back_path.resolve()}
+        intended = destination
+        destination = stage_files.protect_original_output(destination, front_path, occupied, policy)
+        destination = stage_files.protect_original_output(
+            destination, back_path, occupied | {destination}, policy)
+        protected = not stage_files.same_path(destination, intended)
+        snapshots = []
+    plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
+            'keep_source': True, 'operation': 'crop', 'protected_original': protected}
+    stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
+    stage_files.remember_protected_outputs([plan])
     return destination, merged.size
 
 
@@ -370,7 +389,8 @@ def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, 
             approve_link(outputs[0], outputs[1], link['split'], link['layout'])
         except (OSError, ValueError) as error:
             warnings.warn(f'Images saved, but output pair link could not be carried forward: {error}')
-    return outputs[0], enhanced.size, changes, planned['snapshots'][0]
+    archived = planned['snapshots'][0] if planned.get('snapshots') else None
+    return outputs[0], enhanced.size, changes, archived
 
 
 def save_restored_image(source: Path, operation: str, strokes: list | None = None) -> tuple[Path | None, tuple[int, int], list[str], Path | None]:
@@ -383,7 +403,8 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
         if not useful_change(changes):
             return None, restored.size, changes, None
         destination = stage_files.file_results([source], [rendered_bytes(restored, source.suffix, info)], 'enhance')[0]
-    return destination, restored.size, changes, planned['snapshots'][0]
+    archived = planned['snapshots'][0] if planned.get('snapshots') else None
+    return destination, restored.size, changes, archived
 
 
 def reset_confirmations() -> None:
@@ -805,7 +826,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(409, refusal)
                     return
                 destination, size = save_image(path, data.get("points", []), data.get("settings", {}), int(data.get("rotation", 0)), data.get("aspect_ratio"))
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "source_moved": not path.exists()})
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "source_moved": not path.exists()}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, body)
                 return
             if self.path == "/api/crop-preview":
                 path = image_path(data.get("path", ""))
@@ -822,7 +847,11 @@ class Handler(BaseHTTPRequestHandler):
                 front_path = image_path(data.get("front_path", ""))
                 back_path = image_path(data.get("back_path", ""))
                 destination, size = save_merged_image(front_path, back_path, data.get("settings", {}), data.get("name_source", "back"), int(data.get("back_rotation", 0)))
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]})
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, body)
                 return
             if self.path == "/api/enhance":
                 path = image_path(data.get("path", ""))
@@ -836,7 +865,11 @@ class Handler(BaseHTTPRequestHandler):
                              if stage_files.same_path(path, item['front_path']) or stage_files.same_path(path, item['composite_path'])), None)
                 if link: source_paths = [link['front_path'],link['composite_path']]
                 destination, size, changes, archived_source = save_enhanced_image(path, requested)
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source), "source_paths":source_paths})
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source) if archived_source else None, "source_paths":source_paths}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, body)
                 return
             if self.path == "/api/restore-preview":
                 path = image_path(data.get("path", ""))
@@ -859,9 +892,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(409, refusal)
                     return
                 destination, size, changes, archived = save_restored_image(path, data.get("operation", ""), data.get("strokes"))
-                self.json(200, {"path": str(destination or path), "name": (destination or path).name,
+                saved = destination or path
+                body = {"path": str(saved), "name": saved.name,
                                 "width": size[0], "height": size[1], "changes": changes,
-                                "archived_path": str(archived) if archived else None, "skipped": destination is None})
+                                "archived_path": str(archived) if archived else None, "skipped": destination is None}
+                if destination is not None and stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, body)
                 return
             if self.path == '/api/colorization-candidates':
                 folder=clean_path(data.get('path',''))
@@ -1043,7 +1081,12 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                         remove_pending(ident)
                     stage_files.release_outputs(held)
-                    self.json(200, {"paths": [str(path) for path in outputs], 'removed_ids': removed})
+                    body = {"paths": [str(path) for path in outputs], 'removed_ids': removed}
+                    protected = [path for path in outputs if stage_files.saved_protected(path)]
+                    if protected:
+                        body['protected_original'] = True
+                        body['protected_message'] = stage_files.protected_original_message(protected[0].name)
+                    self.json(200, body)
                 return
             if self.path == "/api/chatgpt-recovered-keep":
                 self.json(200, keep_recovered(data.get("id", "")))

@@ -48,13 +48,17 @@ class CropperCoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'already exists'):
                 save_image(root/'1. Original'/'photo.jpg',[[10,10],[180,10],[180,130],[10,130]],{},0)
 
-    def test_nested_stage_input_rejected_without_creating_more_folders(self):
+    def test_nested_stage_input_uses_output_settings(self):
         with tempfile.TemporaryDirectory() as temporary:
             source=Path(temporary)/'1.5. TBP Cropped'/'old-output'/'photo.png'
             source.parent.mkdir(parents=True);Image.new('RGB',(50,50),'red').save(source)
-            with self.assertRaisesRegex(ValueError,'Nested stage'):
-                save_image(source,[[0,0],[49,0],[49,49],[0,49]],{},0)
-            self.assertEqual(list(source.parent.iterdir()),[source])
+            original=source.read_bytes()
+            result,_=save_image(source,[[0,0],[49,0],[49,49],[0,49]],{},0)
+            self.assertTrue(source.exists())
+            self.assertEqual(source.read_bytes(),original)
+            self.assertTrue(result.is_file())
+            self.assertEqual(result.parent, source.parent)
+            self.assertFalse((source.parent/'1.5. TBP Cropped').exists())
 
     def test_front_and_back_layout_and_back_filename(self):
         portrait = Image.new("RGB", (120, 200), "#24445b")
