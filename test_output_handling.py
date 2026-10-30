@@ -31,6 +31,23 @@ def png(color='red'):
     return stream.getvalue()
 
 
+def pick_via_dialog(port, folder, tab, extra=None):
+    headers = {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'}
+    with patch.object(server, 'choose_folder_dialog', return_value=Path(folder) if folder is not None else None):
+        request = Request(
+            f'http://127.0.0.1:{port}/api/pick-folder',
+            json.dumps(extra or {}).encode(),
+            headers,
+        )
+        try:
+            with urlopen(request) as response:
+                return response.status, json.load(response)
+        except HTTPError as exc:
+            payload = json.loads(exc.read().decode())
+            exc.close()
+            return exc.code, payload
+
+
 class OutputHandlingTests(unittest.TestCase):
     def setUp(self):
         self.folder = TemporaryDirectory()
@@ -140,12 +157,14 @@ class OutputHandlingTests(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        tab = self._tab()
         queue = Path(self.folder.name) / stages.CROP_QUEUE
         queue.mkdir()
         first = queue / 'photo1.jpg'
         second = queue / 'photo1.png'
         Image.new('RGB', (8, 8), 'gray').save(first)
         Image.new('RGB', (8, 8), 'gray').save(second)
+        self._open_folder(http.server_port, Path(self.folder.name), tab)
         calls = []
 
         def edit(path, **kwargs):
@@ -155,7 +174,7 @@ class OutputHandlingTests(unittest.TestCase):
         def post(payload):
             request = Request(f'http://127.0.0.1:{http.server_port}/api/chatgpt-generate',
                               json.dumps(payload).encode(),
-                              {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                              {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
             with urlopen(request) as response:
                 return json.load(response)
 
@@ -239,15 +258,15 @@ class OutputHandlingTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / 'fresh.png'
             with patch.object(os, 'replace', wraps=os.replace) as replaced:
-                created = stages._atomic_create(target, b'abc', overwrite=False)
+                created = stages._atomic_create(target, png(), overwrite=False)
             self.assertTrue(created)
-            self.assertEqual(target.read_bytes(), b'abc')
+            self.assertEqual(target.read_bytes(), png())
             replaced.assert_called()
             with self.assertRaises(FileExistsError):
-                stages._atomic_create(target, b'other', overwrite=False)
-            self.assertEqual(target.read_bytes(), b'abc')
-            stages._atomic_create(target, b'new', overwrite=True)
-            self.assertEqual(target.read_bytes(), b'new')
+                stages._atomic_create(target, png('blue'), overwrite=False)
+            self.assertEqual(target.read_bytes(), png())
+            stages._atomic_create(target, png('yellow'), overwrite=True)
+            self.assertEqual(target.read_bytes(), png('yellow'))
 
     def test_expired_pending_releases_reservations(self):
         root = Path(self.folder.name)
@@ -447,12 +466,14 @@ class OutputHandlingTests(unittest.TestCase):
             'backup_originals': True,
         })
         corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        tab = self._tab()
+        self._open_folder(http.server_port, root, tab)
 
         def crop(path):
             request = Request(
                 f'http://127.0.0.1:{http.server_port}/api/crop',
                 json.dumps({'path': str(path), 'points': corners, 'rotation': 0}).encode(),
-                {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'},
+                {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'},
             )
             with urlopen(request) as response:
                 return json.load(response)
@@ -623,12 +644,14 @@ class OutputHandlingTests(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        tab = self._tab()
         folder = Path(self.folder.name) / 'scans'
         dest = Path(self.folder.name) / 'locked-out'
         folder.mkdir()
         dest.mkdir()
         source = folder / '[Scan]_20261027_0004 [B&W].jpg'
         Image.new('RGB', (16, 16), 'gray').save(source)
+        self._open_folder(http.server_port, Path(self.folder.name), tab)
         calls = []
 
         def edit(path, **kwargs):
@@ -652,7 +675,7 @@ class OutputHandlingTests(unittest.TestCase):
              patch.object(stages, 'probe_folder_writable', side_effect=boom):
             status, body = self._json(http.server_port, '/api/chatgpt-generate', {
                 'front_path': str(source), 'operation': 'restore',
-            })
+            }, tab=tab)
         self.assertEqual(status, 403)
         self.assertEqual(body['code'], 'permission_denied')
         self.assertIn('Choose another output folder', body['error'])
@@ -670,6 +693,7 @@ class OutputHandlingTests(unittest.TestCase):
         folder.mkdir()
         source = folder / 'replace me & copy.jpg'
         Image.new('RGB', (16, 16), 'gray').save(source)
+        self._open_folder(http.server_port, folder, tab)
         original = source.read_bytes()
         app_settings.save_settings({
             'filename_template': '{name}{suffix}{ext}',
@@ -729,10 +753,12 @@ class OutputHandlingTests(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        tab = self._tab()
         folder = Path(self.folder.name) / 'scans'
         folder.mkdir()
         source = folder / '[Scan]_20261027_0004 [B&W].jpg'
         Image.new('RGB', (16, 16), 'gray').save(source)
+        self._open_folder(http.server_port, folder, tab)
         original = source.read_bytes()
 
         def edit(path, **kwargs):
@@ -747,11 +773,11 @@ class OutputHandlingTests(unittest.TestCase):
              }):
             status, record = self._json(http.server_port, '/api/chatgpt-generate', {
                 'front_path': str(source), 'operation': 'restore',
-            })
+            }, tab=tab)
             self.assertEqual(status, 200)
             status, accepted = self._json(http.server_port, '/api/chatgpt-accept', {
                 'id': record['id'],
-            })
+            }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue(source.exists())
         self.assertEqual(source.read_bytes(), original)
@@ -1201,14 +1227,16 @@ class OutputHandlingTests(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        tab = self._tab()
         queue = Path(self.folder.name) / stages.CROP_QUEUE
         queue.mkdir(parents=True)
         source = queue / 'photo_c.png'
         source.write_bytes(png())
+        self._open_folder(http.server_port, Path(self.folder.name), tab)
         with patch.object(server, 'edit_front', side_effect=RuntimeError('paid call failed')):
             status, body = self._json(http.server_port, '/api/chatgpt-generate', {
                 'front_path': str(source), 'operation': 'restore',
-            })
+            }, tab=tab)
         self.assertNotEqual(status, 200)
         self.assertFalse((Path(self.folder.name) / stages.AI_QUEUE).exists())
 
@@ -1251,10 +1279,12 @@ class OutputHandlingTests(unittest.TestCase):
         threading.Thread(target=http.serve_forever, daemon=True).start()
         self.addCleanup(http.server_close)
         self.addCleanup(http.shutdown)
+        tab = self._tab()
         folder = Path(self.folder.name) / 'scans'
         folder.mkdir()
         png_source = folder / 'keep original.png'
         png_source.write_bytes(png('red'))
+        self._open_folder(http.server_port, folder, tab)
         app_settings.save_settings({
             'filename_template': '{name}{ext}',
             'conflict_policy': 'overwrite',
@@ -1266,11 +1296,11 @@ class OutputHandlingTests(unittest.TestCase):
              patch.object(server, 'edit_front', return_value=png('blue')):
             status, record = self._json(http.server_port, '/api/chatgpt-generate', {
                 'front_path': str(png_source), 'operation': 'restore',
-            })
+            }, tab=tab)
             self.assertEqual(status, 200)
             status, accepted = self._json(http.server_port, '/api/chatgpt-accept', {
                 'id': record['id'],
-            })
+            }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue(accepted.get('protected_original'))
         self.assertEqual(accepted.get('protected_message'),
@@ -1315,19 +1345,21 @@ class OutputHandlingTests(unittest.TestCase):
             'backup_originals': True,
         })
         corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        tab = self._tab()
+        self._open_folder(http.server_port, root, tab)
         first = self._json(http.server_port, '/api/crop', {
             'path': str(photo1), 'points': corners, 'rotation': 0,
-        })[1]
+        }, tab=tab)[1]
         self.assertEqual(first['name'], 'scan_001.png')
         status, finished = self._json(http.server_port, '/api/stage-finish', {
             'paths': [first['path']], 'dry_run': False,
-        })
+        }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue((root / stages.CROPPED / 'scan_001.png').is_file())
         self.assertFalse((root / stages.CROP_QUEUE / 'scan_001.png').exists())
         status, second = self._json(http.server_port, '/api/crop', {
             'path': str(photo2), 'points': corners, 'rotation': 0,
-        })
+        }, tab=tab)
         self.assertEqual(status, 200)
         self.assertEqual(second['name'], 'scan_002.png')
         self.assertTrue((root / stages.CROP_QUEUE / 'scan_002.png').is_file())
@@ -1404,9 +1436,14 @@ class OutputHandlingTests(unittest.TestCase):
             exc.close()
             return exc.code, payload
 
+    def _pick(self, port, folder, tab, extra=None):
+        status, body = pick_via_dialog(port, folder, tab, extra)
+        return status, body
+
     def _open_folder(self, port, folder, tab):
-        status, body = self._get(port, f'/api/list?path={quote(str(folder))}', tab=tab)
+        status, body = self._pick(port, folder, tab)
         self.assertEqual(status, 200)
+        self.assertFalse(body.get('cancelled'))
         return body
 
     def _json(self, port, path, body, tab=None):
@@ -1456,13 +1493,16 @@ class OutputHandlingTests(unittest.TestCase):
         status, registered = self._json(http.server_port, '/api/tab-register', {'tab_id': tab}, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue(registered['registered'])
+        self._open_folder(http.server_port, Path(self.folder.name), tab)
+        self._open_folder(http.server_port, Path(self.folder.name), other_tab)
         status, preview = self._json(http.server_port, '/api/overwrite-preview',
                                      {'path': str(source), 'operation': 'restore'}, tab=tab)
         self.assertEqual(status, 200)
         self.assertGreaterEqual(preview['count'], 1)
         self.assertIn('photo_c_ai.png', preview['names'])
         self.assertTrue(preview['confirmation_token'])
-        self.assertNotIn('batch_id', preview)
+        self.assertTrue(preview.get('batch_id'))
+        self.assertNotEqual(preview['batch_id'], stages.batch_id_for([stages.plan(source, 'restore')]))
         self.assertEqual(preview.get('replace_count', 0), 0)
 
         with patch.object(stages, '_settings', return_value={
@@ -1558,9 +1598,17 @@ class OutputHandlingTests(unittest.TestCase):
         }, tab=tab)
         self.assertEqual(status, 200)
         self.assertEqual(result['name'], 'photo_c.png')
-        status, result = self._json(http.server_port, '/api/crop', {
+        batch_token = result['confirmation_token']
+        self.assertTrue(batch_token)
+        self.assertNotEqual(batch_token, crop_token)
+        status, reused = self._json(http.server_port, '/api/crop', {
             'path': str(other_crop), 'points': corners, 'rotation': 0,
             'skip_overwrite_prompt': True, 'confirmation_token': crop_token,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(other_crop), 'points': corners, 'rotation': 0,
+            'skip_overwrite_prompt': True, 'confirmation_token': batch_token,
         }, tab=tab)
         self.assertEqual(status, 200)
         self.assertEqual(result['name'], 'photo2_c.png')
@@ -1599,8 +1647,8 @@ class OutputHandlingTests(unittest.TestCase):
             'path': str(fourth), 'points': corners, 'rotation': 0,
             'skip_overwrite_prompt': True, 'confirmation_token': crop_token,
         }, tab='tabid-unregistered01')
-        self.assertEqual(status, 409)
-        self.assertEqual(unregistered['code'], 'overwrite_confirmation_required')
+        self.assertEqual(status, 400)
+        self.assertRegex(unregistered['error'], 'outside the allowed folder')
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(fourth), 'points': corners, 'rotation': 0,
             'confirm_overwrite': True, 'confirmation_token': photo4_token,
@@ -1619,6 +1667,7 @@ class OutputHandlingTests(unittest.TestCase):
         photo2 = root / 'keep_me_too.png'
         Image.new('RGB', (16, 16), 'red').save(photo1)
         Image.new('RGB', (16, 16), 'blue').save(photo2)
+        self._open_folder(http.server_port, root, tab)
         original1 = photo1.read_bytes()
         app_settings.save_settings({
             'filename_template': '{name}{suffix}{ext}',
@@ -1688,6 +1737,143 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue((root / stages.BACKUPS / photo2.name).is_file())
 
+    def test_dialog_pick_is_registered_and_cancel_list_browse_forged_path_are_not(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            chosen = Path(tmp) / 'picked'
+            other = Path(tmp) / 'other'
+            chosen.mkdir()
+            other.mkdir()
+            front = chosen / 'front.jpg'
+            back = other / 'back.jpg'
+            Image.new('RGB', (8, 8), 'red').save(front)
+            Image.new('RGB', (8, 8), 'blue').save(back)
+            status, body = self._pick(http.server_port, chosen, tab, extra={'path': str(other)})
+            self.assertEqual(status, 200)
+            self.assertFalse(body.get('cancelled'))
+            self.assertTrue(stages.same_path(body['path'], chosen))
+            listed = self._get(http.server_port, f'/api/list?path={quote(str(other))}', tab=tab)
+            self.assertEqual(listed[0], 200)
+            browsed = self._get(http.server_port, f'/api/folders?path={quote(str(other))}', tab=tab)
+            self.assertEqual(browsed[0], 200)
+            payload = {
+                'front_path': str(front), 'back_path': str(back),
+                'name_source': 'front', 'back_rotation': 0, 'settings': {},
+            }
+            status, body = self._json(http.server_port, '/api/merge', payload, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            status, cancelled = self._pick(http.server_port, None, tab)
+            self.assertEqual(status, 200)
+            self.assertTrue(cancelled.get('cancelled'))
+            status, body = self._json(http.server_port, '/api/merge', payload, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+            self._open_folder(http.server_port, other, tab)
+            with patch.object(stages, '_settings', return_value=self._non_stage_settings()):
+                status, body = self._json(http.server_port, '/api/merge', payload, tab=tab)
+            self.assertEqual(status, 200)
+
+    def test_drive_root_and_parent_of_root_are_refused(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            child = Path(tmp) / 'batch'
+            child.mkdir()
+            self._open_folder(http.server_port, child, tab)
+            status, body = self._pick(http.server_port, Path(tmp), tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'parent')
+            drive = Path(tmp)
+            while drive.parent != drive:
+                drive = drive.parent
+            status, body = self._pick(http.server_port, drive, tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'root')
+
+    def test_tab_registrations_are_capped_and_idle_tabs_expire(self):
+        folder = Path(self.folder.name)
+        server.register_allowed_root(folder, self._tab())
+        self.assertTrue(server.allowed_roots_for('tabid-test-000001'))
+        for index in range(31):
+            server.register_tab(f'tabid-cap-{index:08d}')
+        with self.assertRaisesRegex(ValueError, 'Too many'):
+            server.register_tab('tabid-cap-overflow01')
+        first = (server.TOKEN, 'tabid-test-000001')
+        server.TABS[first] = time.time() - server.TAB_IDLE_SECONDS - 1
+        server.register_tab('tabid-cap-overflow01')
+        self.assertFalse(server.tab_is_registered('tabid-test-000001'))
+        self.assertEqual(server.allowed_roots_for('tabid-test-000001'), [])
+
+    def test_atomic_create_reencodes_or_refuses_mismatched_bytes(self):
+        with TemporaryDirectory() as tmp:
+            jpg = Path(tmp) / 'photo.jpg'
+            stages._atomic_create(jpg, png('red'), overwrite=False)
+            self.assertTrue(jpg.read_bytes().startswith(b'\xff\xd8'))
+            with Image.open(jpg) as image:
+                self.assertEqual(image.format, 'JPEG')
+            alpha = io.BytesIO()
+            Image.new('RGBA', (8, 8), (0, 255, 0, 80)).save(alpha, 'PNG')
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                stages._atomic_create(Path(tmp) / 'alpha.jpg', alpha.getvalue(), overwrite=False)
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                stages._atomic_create(Path(tmp) / 'broken.jpg', b'not-an-image', overwrite=False)
+
+    def test_finish_overwrite_crop_and_enhance_reject_paths_outside_tab_roots(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        allowed = Path(self.folder.name) / 'allowed'
+        outside = Path(self.folder.name) / 'outside'
+        allowed.mkdir()
+        outside.mkdir()
+        inside = allowed / 'inside.png'
+        secret = outside / 'secret.png'
+        Image.new('RGB', (16, 16), 'red').save(inside)
+        Image.new('RGB', (16, 16), 'blue').save(secret)
+        self._open_folder(http.server_port, allowed, tab)
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        for endpoint, payload in (
+            ('/api/crop', {'path': str(secret), 'points': corners, 'rotation': 0}),
+            ('/api/enhance', {'path': str(secret), 'settings': {}}),
+            ('/api/overwrite-preview', {'path': str(secret), 'operation': 'crop'}),
+            ('/api/stage-finish', {'paths': [str(secret)], 'dry_run': True}),
+        ):
+            status, body = self._json(http.server_port, endpoint, payload, tab=tab)
+            self.assertEqual(status, 400, endpoint)
+            self.assertRegex(body['error'], 'outside the allowed folder')
+
+    def test_output_folder_setting_must_stay_inside_allowed_roots(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        allowed = Path(self.folder.name) / 'allowed'
+        outside = Path(self.folder.name) / 'outside'
+        allowed.mkdir()
+        outside.mkdir()
+        self._open_folder(http.server_port, allowed, tab)
+        status, body = self._json(http.server_port, '/api/settings', {
+            'output_folder': str(outside),
+        }, tab=tab)
+        self.assertEqual(status, 400)
+        self.assertRegex(body['error'], 'outside the allowed folder')
+        status, body = self._json(http.server_port, '/api/settings', {
+            'output_folder': str(allowed),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertTrue(stages.same_path(body['output_folder'], allowed))
+
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
 class WindowsIntegrationTests(unittest.TestCase):
@@ -1746,6 +1932,27 @@ class WindowsIntegrationTests(unittest.TestCase):
             path.write_bytes(b'device-safe')
             self.assertTrue(path.is_file())
             self.assertEqual(path.read_bytes(), b'device-safe')
+
+    def test_windows_junction_escape_is_refused(self):
+        import subprocess
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'allowed'
+            outside = Path(tmp) / 'outside'
+            allowed.mkdir()
+            outside.mkdir()
+            secret = outside / 'secret.jpg'
+            Image.new('RGB', (8, 8), 'red').save(secret)
+            link = allowed / 'escape'
+            completed = subprocess.run(
+                ['cmd', '/c', 'mklink', '/J', str(link), str(outside)],
+                capture_output=True, text=True,
+            )
+            if completed.returncode != 0:
+                self.skipTest(completed.stderr or 'could not create a junction')
+            self.assertTrue(link.is_junction())
+            self.assertTrue(stages.is_link(link))
+            with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
+                stages.resolve_in_root(link / 'secret.jpg', allowed, label='That image')
 
     def test_paths_with_spaces(self):
         with TemporaryDirectory() as tmp:
@@ -1824,8 +2031,13 @@ class RecoveredServerTests(unittest.TestCase):
             threading.Thread(target=http.serve_forever, daemon=True).start()
             self.addCleanup(http.server_close)
             self.addCleanup(http.shutdown)
+            tab = 'tabid-test-000001'
+            server.reset_tabs(); server.reset_confirmations()
+            server.register_tab(tab)
+            status, picked = pick_via_dialog(http.server_port, photos, tab)
+            self.assertEqual(status, 200)
             request = Request(f'http://127.0.0.1:{http.server_port}/api/chatgpt-pending?path={quote(str(photos))}',
-                              headers={'X-Cropper-Token': server.TOKEN})
+                              headers={'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab})
             with urlopen(request) as response:
                 body = json.load(response)
             self.assertEqual(body['items'], [])
@@ -1833,7 +2045,7 @@ class RecoveredServerTests(unittest.TestCase):
             self.assertTrue(body['recovered'][0]['can_keep'])
             keep = Request(f'http://127.0.0.1:{http.server_port}/api/chatgpt-recovered-keep',
                            json.dumps({'id': record['id']}).encode(),
-                           {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                           {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
             with urlopen(keep) as response:
                 kept = json.load(response)
             self.assertEqual(kept['id'], record['id'])

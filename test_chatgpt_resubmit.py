@@ -39,9 +39,17 @@ class ResubmitTests(unittest.TestCase):
                 threading.Thread(target=http.serve_forever, daemon=True).start()
                 stack.callback(http.server_close); stack.callback(http.shutdown)
 
+                tab = 'tabid-test-000001'
+                server.reset_tabs(); server.reset_confirmations()
+                server.register_tab(tab)
+                with patch.object(server, 'choose_folder_dialog', return_value=root):
+                    pick = Request(f'http://127.0.0.1:{http.server_port}/api/pick-folder', b'{}',
+                                   {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
+                    with urlopen(pick) as response: json.load(response)
+
                 def post(route, data):
                     request = Request(f'http://127.0.0.1:{http.server_port}{route}', json.dumps(data).encode(),
-                                      {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                                      {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
                     with urlopen(request) as response: return json.load(response)
 
                 with self.assertRaises(HTTPError): post('/api/chatgpt-resubmit', {'id': first['id'], 'comment': '  '})
