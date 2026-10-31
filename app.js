@@ -257,7 +257,20 @@ function askReplace(count, names) {
 }
 async function ensureOverwriteConfirmed(paths, operation) {
   if (!paths || !paths.length) return {};
-  const preview = await api('/api/overwrite-preview', { paths, operation });
+  const storedSkip = latestOverwriteSkip();
+  const storedReplace = latestReplaceToken();
+  const previewBody = { paths, operation };
+  if (storedSkip) {
+    previewBody.confirmation_token = storedSkip;
+    const skipBatch = batchPromptState.overwriteBatchIds[storedSkip];
+    if (skipBatch) previewBody.batch_id = skipBatch;
+  }
+  if (storedReplace) {
+    previewBody.replace_confirmation_token = storedReplace;
+    const replaceBatch = batchPromptState.replaceBatchIds[storedReplace];
+    if (replaceBatch) previewBody.replace_batch_id = replaceBatch;
+  }
+  const preview = await api('/api/overwrite-preview', previewBody);
   const extra = {};
   if (preview.replace_count) {
     const stored = latestReplaceToken();

@@ -181,6 +181,9 @@ test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(app, /X-Cropper-Tab/);
   assert.match(app, /\/api\/tab-register/);
   assert.match(app, /\/api\/confirm-overwrite-batch/);
+  assert.match(app, /replace_confirmation_token/);
+  assert.match(app, /replace_batch_id/);
+  assert.match(app, /previewBody\.confirmation_token = storedSkip/);
   assert.match(app, /URL\.createObjectURL/);
   assert.match(app, /assignImage/);
   assert.match(app, /requestHeaders\(\)/);
@@ -338,6 +341,12 @@ test('ticked skip covers a second photo in the same tab and batch', async () => 
       [path.join(batch, 'photo.png'), path.join(batch, 'photo2.png')],
       'crop',
     );
+    const again = await client.ensureOverwriteConfirmed(
+      [path.join(batch, 'photo.png'), path.join(batch, 'photo2.png')],
+      'crop',
+    );
+    assert.equal(again.confirmation_token, extra.confirmation_token);
+    assert.equal(again.batch_id, extra.batch_id);
     const first = await client.api('/api/crop', { ...cropPayload(batch, 'photo'), ...extra });
     const second = await client.api('/api/crop', { ...cropPayload(batch, 'photo2'), ...extra });
     assert.equal(first.name, 'photo_c.png');

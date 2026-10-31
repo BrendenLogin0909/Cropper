@@ -710,13 +710,40 @@ def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
     return record
 
 
+def _invalidate_tab_folder_tokens_locked(session: str, tab_id: str, batch: str) -> None:
+    """Drop overwrite and replace tokens for this tab and folder set. Caller holds the lock."""
+    tab_id = normalize_tab_id(tab_id)
+    stale = [
+        token for token, record in CONFIRMATIONS.items()
+        if record.get("batch") == batch
+        and record.get("kind") in {"overwrite", "replace"}
+        and _secret_matches(record.get("session") or "", session or "")
+        and _secret_matches(record.get("tab_id") or "", tab_id or "")
+    ]
+    for token in stale:
+        CONFIRMATIONS.pop(token, None)
+
+
+def _continuing_batch_token(kind: str, token: str, plans: list[dict],
+                            session: str, tab_id: str, batch_id: str = "") -> str | None:
+    """Return token when it is a live batch-scoped grant for this tab and folder set."""
+    record = _record_for_token(token, kind, plans, session, tab_id)
+    if record is None or record.get("scope") != "batch":
+        return None
+    if not _batch_id_matches(record, {"batch_id": batch_id}):
+        return None
+    return token
+
+
 def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
                        session: str | None = None, payload: dict | None = None,
-                       tab_id: str | None = None, scope: str | None = None) -> str:
+                       tab_id: str | None = None, scope: str | None = None,
+                       invalidate: bool = True) -> str:
     """Mint a random in-memory token bound to this session, tab, server batch id, and targets.
 
     Overwrite tokens start as file-scoped. Don't-ask-again calls
     confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
+    A new confirmation never inherits another token's batch_id, scope, or targets.
     """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
@@ -725,13 +752,6 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
     if scope in {"batch", "files"}:
         granted = scope
     batch_id = _new_batch_id()
-    previous = str((payload or {}).get("confirmation_token") or "")
-    inherited = _record_for_token(previous, kind, plans, session, tab_id)
-    if inherited:
-        covered |= set(inherited.get("targets") or ())
-        if inherited.get("scope") == "batch":
-            granted = "batch"
-        batch_id = inherited.get("batch_id") or batch_id
     token = secrets.token_urlsafe(32)
     record = {
         "kind": kind,
@@ -745,6 +765,8 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
     }
     with CONFIRMATIONS_LOCK:
         _purge_confirmations_locked()
+        if invalidate:
+            _invalidate_tab_folder_tokens_locked(session, tab_id, record["batch"])
         CONFIRMATIONS[token] = record
     return token
 
@@ -1118,12 +1140,35 @@ class Handler(BaseHTTPRequestHandler):
                     "replace_paths": [str(path) for path in replaces],
                 }
                 tab_id = self.request_tab_id()
+                overwrite_token = None
+                replace_token = None
                 if targets:
-                    token = issue_confirmation("overwrite", plans, targets, TOKEN, data, tab_id)
-                    body.update(_confirmation_public(token))
+                    overwrite_token = _continuing_batch_token(
+                        "overwrite",
+                        str(data.get("confirmation_token") or ""),
+                        plans, TOKEN, tab_id,
+                        str(data.get("batch_id") or ""),
+                    )
                 if replaces:
-                    replace_token = issue_confirmation(
-                        "replace", plans, replaces, TOKEN, data, tab_id)
+                    replace_token = _continuing_batch_token(
+                        "replace",
+                        str(data.get("replace_confirmation_token") or ""),
+                        plans, TOKEN, tab_id,
+                        str(data.get("replace_batch_id") or ""),
+                    )
+                if (targets and not overwrite_token) or (replaces and not replace_token):
+                    with CONFIRMATIONS_LOCK:
+                        _purge_confirmations_locked()
+                        _invalidate_tab_folder_tokens_locked(TOKEN, tab_id, _batch_key(plans))
+                    if targets:
+                        overwrite_token = issue_confirmation(
+                            "overwrite", plans, targets, TOKEN, data, tab_id, invalidate=False)
+                    if replaces:
+                        replace_token = issue_confirmation(
+                            "replace", plans, replaces, TOKEN, data, tab_id, invalidate=False)
+                if overwrite_token:
+                    body.update(_confirmation_public(overwrite_token))
+                if replace_token:
                     body["replace_confirmation_token"] = replace_token
                     public = _confirmation_public(replace_token)
                     if public.get("batch_id"):
