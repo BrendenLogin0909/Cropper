@@ -17,7 +17,7 @@ function generatorHarness(operation, concurrency, request) {
     $:id=>controls[id] ||= {}, renderImages:()=>{}, updateChatgptControls:()=>{},
     showChatgptPreview:()=>{}, toast:()=>{}, reviewChatgptItem:item=>{current.review=item;},
     offerChooseOutputFolder:()=>false,
-    api:async (route,body)=>request(body)};
+    api:async (route,body)=>route==='/api/begin-batch' ? {batch_id:'test-batch'} : request(body)};
   const generate = vm.runInNewContext(
     between('function chatgptReadyPaths(', 'function updateChatgptControls(') + queueSource +
     between('async function generateChatgpt(', 'async function finishChatgpt(') + '\ngenerateChatgpt', context);

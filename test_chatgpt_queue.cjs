@@ -169,7 +169,7 @@ test('photos selected during generation wait for the next paid batch', async () 
     $:()=>({textContent:''}),renderImages:()=>{},updateChatgptControls:()=>{},showChatgptPreview:()=>{},toast:()=>{},
     offerChooseOutputFolder:()=>false,
     reviewChatgptItem:item=>{current.review=item;},
-    api:async (endpoint,body)=>{calls.push(body.front_path);if(body.front_path==='a'){firstStarted();await firstGate;}return {id:body.front_path,front_path:body.front_path};},
+    api:async (endpoint,body)=>{if(endpoint==='/api/begin-batch') return {batch_id:'test-batch'};calls.push(body.front_path);if(body.front_path==='a'){firstStarted();await firstGate;}return {id:body.front_path,front_path:body.front_path};},
     runChatgptQueue:async (paths,batch,request,saved)=>{for(const path of paths)saved(await request(path),path);return '';}};
   const helper=source.slice(source.indexOf('function chatgptReadyPaths('),source.indexOf('function updateChatgptControls('));
   const generator=source.slice(source.indexOf('async function generateChatgpt('),source.indexOf('async function finishChatgpt('));

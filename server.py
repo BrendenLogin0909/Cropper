@@ -51,6 +51,8 @@ CONFIRMATIONS: dict[str, dict] = {}
 CONFIRMATIONS_LOCK = threading.Lock()
 TABS: dict[tuple[str, str], float] = {}
 ALLOWED_ROOTS: dict[tuple[str, str], set[str]] = {}
+TAB_IN_FLIGHT: dict[tuple[str, str], int] = {}
+TAB_BATCHES: dict[tuple[str, str], str] = {}
 TABS_LOCK = threading.Lock()
 TAB_ID_MIN_LEN = 16
 TAB_ID_MAX_LEN = 128
@@ -59,6 +61,24 @@ TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
 DIALOG_TIMEOUT_SECONDS = 300
 _DIALOG_LOCK = threading.Lock()
 _GRANTED = threading.local()
+
+
+class FolderDialogBusy(ValueError):
+    """The native folder dialog is still open. The UI shows this as dialog_still_open."""
+
+    code = "dialog_still_open"
+
+    def __init__(self, message: str = "The folder dialog is still open.") -> None:
+        super().__init__(message)
+
+
+class FolderDialogBusy(ValueError):
+    """The native folder dialog is still open. The UI shows this as dialog_still_open."""
+
+    code = "dialog_still_open"
+
+    def __init__(self, message: str = "The folder dialog is still open.") -> None:
+        super().__init__(message)
 
 
 class ConfirmationRequired(Exception):
@@ -446,6 +466,8 @@ def reset_tabs() -> None:
     with TABS_LOCK:
         TABS.clear()
         ALLOWED_ROOTS.clear()
+        TAB_IN_FLIGHT.clear()
+        TAB_BATCHES.clear()
 
 
 def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
@@ -488,25 +510,43 @@ def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> N
 def choose_folder_dialog() -> Path | None:
     """Open the native OS folder dialog. None if the user cancels. One dialog at a time."""
     if not _DIALOG_LOCK.acquire(blocking=False):
-        raise ValueError("A folder dialog is already open.")
+        raise FolderDialogBusy("A folder dialog is already open.")
     result: list = []
     errors: list = []
     cancel = threading.Event()
+    released = False
+
+    def release_lock() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _DIALOG_LOCK.release()
+
+    def release_when_done(worker: threading.Thread) -> None:
+        worker.join()
+        release_lock()
+
+    thread = threading.Thread(target=_run_folder_dialog, args=(result, errors, cancel), daemon=True)
     try:
-        thread = threading.Thread(target=_run_folder_dialog, args=(result, errors, cancel), daemon=True)
         thread.start()
         thread.join(timeout=DIALOG_TIMEOUT_SECONDS)
-        if thread.is_alive():
+        timed_out = thread.is_alive()
+        if timed_out:
             cancel.set()
-            thread.join(timeout=5)
-            raise ValueError("The folder dialog timed out.")
+            thread.join(timeout=0.5)
+        if thread.is_alive():
+            threading.Thread(target=release_when_done, args=(thread,), daemon=True).start()
+            raise FolderDialogBusy()
+        if timed_out:
+            raise FolderDialogBusy()
         if errors:
             raise ValueError("Could not open the folder dialog.") from errors[0]
         if not result or not result[0]:
             return None
         return Path(result[0])
     finally:
-        _DIALOG_LOCK.release()
+        if not thread.is_alive():
+            release_lock()
 
 
 def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path:
@@ -551,32 +591,74 @@ def normalize_tab_id(value: object) -> str:
     return text
 
 
+def _drop_tab_locked(key: tuple[str, str]) -> None:
+    TABS.pop(key, None)
+    ALLOWED_ROOTS.pop(key, None)
+    TAB_IN_FLIGHT.pop(key, None)
+    TAB_BATCHES.pop(key, None)
+
+
+def _tab_is_busy_locked(key: tuple[str, str]) -> bool:
+    return TAB_IN_FLIGHT.get(key, 0) > 0
+
+
 def _purge_tabs_locked(now: float | None = None) -> None:
     stamp = time.time() if now is None else now
-    expired = [key for key, seen in TABS.items() if seen + TAB_IDLE_SECONDS <= stamp]
+    expired = [
+        key for key, seen in TABS.items()
+        if seen + TAB_IDLE_SECONDS <= stamp and not _tab_is_busy_locked(key)
+    ]
     for key in expired:
-        TABS.pop(key, None)
-        ALLOWED_ROOTS.pop(key, None)
+        _drop_tab_locked(key)
 
 
-def _evict_lru_tab_locked(session: str) -> None:
+def _evict_lru_idle_tab_locked(session: str) -> bool:
     oldest_key = None
     oldest_seen = None
     for key, seen in TABS.items():
-        if key[0] != session:
+        if key[0] != session or _tab_is_busy_locked(key):
             continue
         if oldest_seen is None or seen < oldest_seen:
             oldest_seen = seen
             oldest_key = key
-    if oldest_key is not None:
-        TABS.pop(oldest_key, None)
-        ALLOWED_ROOTS.pop(oldest_key, None)
+    if oldest_key is None:
+        return False
+    _drop_tab_locked(oldest_key)
+    return True
+
+
+def tab_request_begin(tab_id: str, session: str | None = None) -> None:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return
+    with TABS_LOCK:
+        key = (session, tab_id)
+        if key not in TABS:
+            return
+        TAB_IN_FLIGHT[key] = TAB_IN_FLIGHT.get(key, 0) + 1
+        TABS[key] = time.time()
+
+
+def tab_request_end(tab_id: str, session: str | None = None) -> None:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return
+    with TABS_LOCK:
+        key = (session, tab_id)
+        remaining = TAB_IN_FLIGHT.get(key, 0) - 1
+        if remaining > 0:
+            TAB_IN_FLIGHT[key] = remaining
+        else:
+            TAB_IN_FLIGHT.pop(key, None)
 
 
 def register_tab(tab_id: str, session: str | None = None) -> str:
     """Remember this browser tab for the current app session. Cap is 32 live tabs.
 
-    A new tab is never locked out: the least-recently-used idle tab is evicted.
+    Only idle tabs are evicted. If every live tab has a request in flight, the
+    new registration is refused.
     """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
@@ -589,8 +671,10 @@ def register_tab(tab_id: str, session: str | None = None) -> str:
             TABS[key] = time.time()
             return tab_id
         live = sum(1 for sess, _tid in TABS if sess == session)
-        if live >= TAB_LIMIT:
-            _evict_lru_tab_locked(session)
+        if live >= TAB_LIMIT and not _evict_lru_idle_tab_locked(session):
+            raise ValueError(
+                "All browser tabs are busy. Finish a request or close a tab before opening another."
+            )
         TABS[key] = time.time()
     return tab_id
 
@@ -610,7 +694,7 @@ def tab_is_registered(tab_id: str, session: str | None = None) -> bool:
 
 
 def _purge_confirmations_locked(now: float | None = None) -> None:
-    stamp = time.time() if now is None else now
+    stamp = _now() if now is None else now
     expired = [token for token, record in CONFIRMATIONS.items() if record["expires"] <= stamp]
     for token in expired:
         CONFIRMATIONS.pop(token, None)
@@ -626,6 +710,10 @@ def _batch_key(plans: list[dict]) -> str:
 
 def _new_batch_id() -> str:
     return secrets.token_urlsafe(16)
+
+
+def _now() -> float:
+    return time.time()
 
 
 def _clear_granted() -> None:
@@ -665,7 +753,7 @@ def _live_record(token: str, kind: str, session: str, tab_id: str,
     tab_id = normalize_tab_id(tab_id)
     if not token or not tab_id or not tab_is_registered(tab_id, session):
         return None
-    stamp = time.time() if now is None else now
+    stamp = _now() if now is None else now
     with CONFIRMATIONS_LOCK:
         _purge_confirmations_locked(stamp)
         record = CONFIRMATIONS.get(token)
@@ -704,6 +792,44 @@ def _invalidate_tab_folder_tokens_locked(session: str, tab_id: str, batch: str) 
         CONFIRMATIONS.pop(token, None)
 
 
+def _invalidate_tab_tokens_locked(session: str, tab_id: str) -> None:
+    """Drop every overwrite and replace token for this tab. Caller holds the lock."""
+    tab_id = normalize_tab_id(tab_id)
+    stale = [
+        token for token, record in CONFIRMATIONS.items()
+        if record.get("kind") in {"overwrite", "replace"}
+        and _secret_matches(record.get("session") or "", session or "")
+        and _secret_matches(record.get("tab_id") or "", tab_id or "")
+    ]
+    for token in stale:
+        CONFIRMATIONS.pop(token, None)
+
+
+def begin_tab_batch(tab_id: str, session: str | None = None) -> str:
+    """Issue a new batch for this tab. Old overwrite and replace tokens are dropped."""
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        raise ValueError("This browser tab must register a random id first.")
+    batch_id = _new_batch_id()
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        _invalidate_tab_tokens_locked(session, tab_id)
+    with TABS_LOCK:
+        TAB_BATCHES[(session, tab_id)] = batch_id
+    return batch_id
+
+
+def current_batch_id(tab_id: str, session: str | None = None) -> str:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    with TABS_LOCK:
+        existing = TAB_BATCHES.get((session, tab_id))
+        if existing:
+            return existing
+    return begin_tab_batch(tab_id, session)
+
+
 def _continuing_batch_token(kind: str, token: str, plans: list[dict],
                             session: str, tab_id: str, batch_id: str = "") -> str | None:
     """Return token when it is a live batch-scoped grant for this tab and folder set."""
@@ -718,8 +844,8 @@ def _continuing_batch_token(kind: str, token: str, plans: list[dict],
 def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
                        session: str | None = None, payload: dict | None = None,
                        tab_id: str | None = None, scope: str | None = None,
-                       invalidate: bool = True) -> str:
-    """Mint a random in-memory token bound to this session, tab, server batch id, and targets.
+                       invalidate: bool = False) -> str:
+    """Mint a token for the tab's current batch. Crop and preview do not start a batch.
 
     Overwrite tokens start as file-scoped. Don't-ask-again calls
     confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
@@ -731,7 +857,7 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
     granted = "batch" if kind == "replace" else "files"
     if scope in {"batch", "files"}:
         granted = scope
-    batch_id = _new_batch_id()
+    batch_id = current_batch_id(tab_id, session)
     token = secrets.token_urlsafe(32)
     record = {
         "kind": kind,
@@ -741,7 +867,7 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
         "batch_id": batch_id,
         "scope": granted,
         "targets": frozenset(covered),
-        "expires": time.time() + CONFIRMATION_TTL_SECONDS,
+        "expires": _now() + CONFIRMATION_TTL_SECONDS,
     }
     with CONFIRMATIONS_LOCK:
         _purge_confirmations_locked()
@@ -770,8 +896,6 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
-        if kind == "overwrite" and not (_target_keys(targets) <= (record.get("targets") or frozenset())):
-            return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
         return True
@@ -806,7 +930,7 @@ def confirm_overwrite_batch(payload: dict, session: str | None = None,
         "batch_id": record["batch_id"],
         "scope": "batch",
         "targets": frozenset(record.get("targets") or ()),
-        "expires": time.time() + CONFIRMATION_TTL_SECONDS,
+        "expires": _now() + CONFIRMATION_TTL_SECONDS,
     }
     minted = secrets.token_urlsafe(32)
     with CONFIRMATIONS_LOCK:
@@ -1033,6 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {"width": width, "height": height})
                 return
             self.json(404, {"error": "Not found."})
+        except FolderDialogBusy as exc:
+            self.json(400, {"error": str(exc), "code": exc.code})
         except (ValueError, OSError, cv2.error) as exc:
             self.json(400, {"error": str(exc)})
 
@@ -1040,6 +1166,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             self.json(403, {"error": "Unauthorized request."})
             return
+        tab_id = self.request_tab_id()
+        in_flight = bool(tab_id) and tab_is_registered(tab_id, TOKEN)
+        if in_flight:
+            tab_request_begin(tab_id)
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 1 or length > 1_000_000:
@@ -1062,7 +1192,14 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(200, {"cancelled": True, "path": None})
                     return
                 path = register_allowed_root(chosen, tab_id)
+                begin_tab_batch(tab_id)
                 self.json(200, {"cancelled": False, "path": str(path)})
+                return
+            if self.path == "/api/begin-batch":
+                tab_id = self.request_tab_id()
+                if not tab_id or not tab_is_registered(tab_id, TOKEN):
+                    raise ValueError("This browser tab must register a random id first.")
+                self.json(200, {"batch_id": begin_tab_batch(tab_id)})
                 return
             if self.path == "/api/settings":
                 if not isinstance(data, dict):
@@ -1136,16 +1273,12 @@ class Handler(BaseHTTPRequestHandler):
                         plans, TOKEN, tab_id,
                         str(data.get("replace_batch_id") or ""),
                     )
-                if (targets and not overwrite_token) or (replaces and not replace_token):
-                    with CONFIRMATIONS_LOCK:
-                        _purge_confirmations_locked()
-                        _invalidate_tab_folder_tokens_locked(TOKEN, tab_id, _batch_key(plans))
-                    if targets:
-                        overwrite_token = issue_confirmation(
-                            "overwrite", plans, targets, TOKEN, data, tab_id, invalidate=False)
-                    if replaces:
-                        replace_token = issue_confirmation(
-                            "replace", plans, replaces, TOKEN, data, tab_id, invalidate=False)
+                if targets and not overwrite_token:
+                    overwrite_token = issue_confirmation(
+                        "overwrite", plans, targets, TOKEN, data, tab_id)
+                if replaces and not replace_token:
+                    replace_token = issue_confirmation(
+                        "replace", plans, replaces, TOKEN, data, tab_id)
                 if overwrite_token:
                     body.update(_confirmation_public(overwrite_token))
                 if replace_token:
@@ -1448,8 +1581,17 @@ class Handler(BaseHTTPRequestHandler):
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
             self.json(*stage_files.permission_error_response(exc))
+        except FolderDialogBusy as exc:
+            self.json(400, {"error": str(exc), "code": exc.code})
         except (ValueError, OSError, json.JSONDecodeError, cv2.error) as exc:
-            self.json(400, {"error": str(exc)})
+            payload = {"error": str(exc)}
+            code = getattr(exc, "code", None)
+            if code:
+                payload["code"] = code
+            self.json(400, payload)
+        finally:
+            if in_flight:
+                tab_request_end(tab_id)
 
 
 class LocalServer(ThreadingHTTPServer):
