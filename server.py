@@ -56,6 +56,7 @@ TAB_ID_MIN_LEN = 16
 TAB_ID_MAX_LEN = 128
 TAB_LIMIT = 32
 TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
+DIALOG_TIMEOUT_SECONDS = 300
 _DIALOG_LOCK = threading.Lock()
 _GRANTED = threading.local()
 
@@ -373,6 +374,8 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
             'keep_source': True, 'operation': 'merge', 'protected_original': protected,
             'root': output_root}
+    if roots:
+        stage_files.confine_plans([plan], roots)
     if confirm:
         refusal = confirm([plan])
         if refusal:
@@ -445,42 +448,65 @@ def reset_tabs() -> None:
         ALLOWED_ROOTS.clear()
 
 
+def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
+    """Open the native folder dialog. Tests monkeypatch this; production has no env stub."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+
+        def poll_cancel() -> None:
+            if cancel.is_set():
+                try:
+                    root.quit()
+                    root.destroy()
+                except tk.TclError:
+                    pass
+                return
+            try:
+                root.after(200, poll_cancel)
+            except tk.TclError:
+                pass
+
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        root.after(200, poll_cancel)
+        chosen = filedialog.askdirectory(title="Choose folder")
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        if not cancel.is_set():
+            result.append(chosen)
+    except Exception as exc:  # pragma: no cover - exercised via monkeypatch
+        errors.append(exc)
+
+
 def choose_folder_dialog() -> Path | None:
-    """Open the native OS folder dialog on its own thread. None if the user cancels."""
-    stub = os.environ.get("CROPPER_TEST_DIALOG_FOLDER", "").strip()
-    if stub:
-        return None if stub == "-" else Path(stub)
+    """Open the native OS folder dialog. None if the user cancels. One dialog at a time."""
+    if not _DIALOG_LOCK.acquire(blocking=False):
+        raise ValueError("A folder dialog is already open.")
     result: list = []
     errors: list = []
-
-    def run() -> None:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            try:
-                root.attributes("-topmost", True)
-            except tk.TclError:
-                pass
-            chosen = filedialog.askdirectory(title="Choose folder")
-            try:
-                root.destroy()
-            except tk.TclError:
-                pass
-            result.append(chosen)
-        except Exception as exc:  # pragma: no cover - exercised via monkeypatch
-            errors.append(exc)
-
-    with _DIALOG_LOCK:
-        thread = threading.Thread(target=run, daemon=True)
+    cancel = threading.Event()
+    try:
+        thread = threading.Thread(target=_run_folder_dialog, args=(result, errors, cancel), daemon=True)
         thread.start()
-        thread.join(timeout=300)
-    if errors:
-        raise ValueError("Could not open the folder dialog.") from errors[0]
-    if not result or not result[0]:
-        return None
-    return Path(result[0])
+        thread.join(timeout=DIALOG_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            cancel.set()
+            thread.join(timeout=5)
+            raise ValueError("The folder dialog timed out.")
+        if errors:
+            raise ValueError("Could not open the folder dialog.") from errors[0]
+        if not result or not result[0]:
+            return None
+        return Path(result[0])
+    finally:
+        _DIALOG_LOCK.release()
 
 
 def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path:
@@ -533,8 +559,25 @@ def _purge_tabs_locked(now: float | None = None) -> None:
         ALLOWED_ROOTS.pop(key, None)
 
 
+def _evict_lru_tab_locked(session: str) -> None:
+    oldest_key = None
+    oldest_seen = None
+    for key, seen in TABS.items():
+        if key[0] != session:
+            continue
+        if oldest_seen is None or seen < oldest_seen:
+            oldest_seen = seen
+            oldest_key = key
+    if oldest_key is not None:
+        TABS.pop(oldest_key, None)
+        ALLOWED_ROOTS.pop(oldest_key, None)
+
+
 def register_tab(tab_id: str, session: str | None = None) -> str:
-    """Remember this browser tab for the current app session. Cap is 32 live tabs."""
+    """Remember this browser tab for the current app session. Cap is 32 live tabs.
+
+    A new tab is never locked out: the least-recently-used idle tab is evicted.
+    """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     if not tab_id:
@@ -547,7 +590,7 @@ def register_tab(tab_id: str, session: str | None = None) -> str:
             return tab_id
         live = sum(1 for sess, _tid in TABS if sess == session)
         if live >= TAB_LIMIT:
-            raise ValueError("Too many browser tabs are registered. Close an idle tab and try again.")
+            _evict_lru_tab_locked(session)
         TABS[key] = time.time()
     return tab_id
 
@@ -844,6 +887,9 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Folder not found.")
         return path
 
+    def confine_writes(self, plans: list[dict]) -> None:
+        stage_files.confine_plans(plans, self.request_roots())
+
     def attach_granted(self, body: dict) -> dict:
         token, batch_id = granted_confirmation()
         if token:
@@ -986,11 +1032,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {"registered": True})
                 return
             if self.path == "/api/pick-folder":
+                tab_id = self.request_tab_id()
+                if not tab_id or not tab_is_registered(tab_id, TOKEN):
+                    raise ValueError("This browser tab must register a random id first.")
                 chosen = choose_folder_dialog()
                 if chosen is None:
                     self.json(200, {"cancelled": True, "path": None})
                     return
-                path = register_allowed_root(chosen, self.request_tab_id())
+                path = register_allowed_root(chosen, tab_id)
                 self.json(200, {"cancelled": False, "path": str(path)})
                 return
             if self.path == "/api/settings":
@@ -1002,7 +1051,8 @@ class Handler(BaseHTTPRequestHandler):
                 key = None
                 folder = str(data.get("output_folder") or "").strip()
                 if folder:
-                    data["output_folder"] = str(self.request_folder(folder, label="The output folder"))
+                    data["output_folder"] = str(stage_files.resolve_output_folder(
+                        folder, self.request_roots(), label="The output folder"))
                 app_settings.save_settings(data)
                 self.json(200, app_settings.public_settings())
                 return
@@ -1036,6 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Select photos to check.")
                 paths = [self.request_image(value) for value in raw_paths]
                 plans = stage_files.plan_many(paths, operation)
+                self.confine_writes(plans)
                 targets = stage_files.planned_overwrites(plans)
                 replaces = stage_files.planned_replaces(plans)
                 body = {
@@ -1068,7 +1119,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/crop":
                 path = self.request_image(data.get("path", ""))
-                refusal = self.confirm([stage_files.plan(path, "crop")], data)
+                plans = [stage_files.plan(path, "crop")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -1109,7 +1162,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/enhance":
                 path = self.request_image(data.get("path", ""))
-                refusal = self.confirm([stage_files.plan(path, "enhance")], data)
+                plans = [stage_files.plan(path, "enhance")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -1142,7 +1197,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/restore":
                 path = self.request_image(data.get("path", ""))
-                refusal = self.confirm([stage_files.plan(path, "enhance")], data)
+                plans = [stage_files.plan(path, "enhance")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
                 if refusal:
                     self.json(409, refusal)
                     return
@@ -1180,6 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
                            for path in paths) for item in pending):
                     raise ValueError('Review or reject pending results before finishing these photos.')
                 planned = [stage_files.plan(path, 'finish') for path in sorted(paths)]
+                self.confine_writes(planned)
                 if data.get('dry_run', True):
                     self.json(200, {'items': [{'source': str(item['source']), 'snapshots': [str(p) for p in item['snapshots']]} for item in planned]})
                     return
@@ -1219,17 +1277,18 @@ class Handler(BaseHTTPRequestHandler):
                 operation=data.get('operation','restore')
                 if operation not in {'restore','colorize'}: raise ValueError('Invalid image operation.')
                 front = self.request_image(data.get("front_path", ""), label="Front image")
-                stage_files.plan(front, operation)  # Fail before paying for a request.
+                self.confine_writes([stage_files.plan(front, operation)])  # Fail before paying.
                 links = read_links(front.parent)
                 if any(stage_files.same_path(item['composite_path'], front) for item in links):
                     raise ValueError('This is a linked combined image. Select its standalone front or use Generate selected pairs.')
                 link = next((item for item in links if stage_files.same_path(item['front_path'], front)), None)
                 composite = self.request_image(link['composite_path'], label='Back image') if link else None
                 if composite is not None:
-                    stage_files.plan(composite, operation)
+                    self.confine_writes([stage_files.plan(composite, operation)])
                 if any(stage_files.same_path(item["front_path"], front) for item in list_pending(front.parent)):
                     raise ValueError("This photo already has a pending AI result. Review it before generating another.")
                 plans = stage_files.prepare_ai_plans(front, operation, composite)
+                self.confine_writes(plans)
                 reserved = [item['output'] for item in plans if item.get('output') is not None]
                 try:
                     front_png = edit_front(front, operation=operation)
@@ -1265,6 +1324,7 @@ class Handler(BaseHTTPRequestHandler):
                     if record.get('link'):
                         composite = self.request_image(record['link']['composite_path'], label='Back image')
                         planned.append(stage_files.plan(composite, operation))
+                    self.confine_writes(planned)
                     stage_files.assert_plans_writable(planned)
                     comments = [*record.get('comments', []), comment.strip()]
                     if len(comments) > 20 or sum(map(len, comments)) > 12000:
@@ -1306,6 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
                                     bool(item.get("overwrite"))
                                     or (app_settings.load_settings().get("conflict_policy") == "overwrite")
                                 )
+                        self.confine_writes(plans)
                         refusal = self.confirm(plans, data)
                         if refusal:
                             self.json(409, refusal)
