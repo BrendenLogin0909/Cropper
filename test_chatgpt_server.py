@@ -104,6 +104,8 @@ class ServerPendingTests(unittest.TestCase):
             thread.start()
             base = f"http://127.0.0.1:{local_server.server_port}"
             tab = 'tabid-test-000001'
+            server.reset_tabs()
+            server.reset_confirmations()
             server.register_tab(tab)
             headers = {"X-Cropper-Token": server.TOKEN, "X-Cropper-Tab": tab}
 
