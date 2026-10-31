@@ -171,7 +171,7 @@ class StageFilesTests(unittest.TestCase):
             image=Image.new('RGB',(32,16),'green');image.paste(Image.new('RGB',(16,16),'red'),(0,0));image.save(composite)
             with patch.object(photo_pairs,'ROOT',root/'links'):
                 photo_pairs.approve_link(front,composite,50,'right',allowed_roots=[front.parent])
-                save_enhanced_image(composite,{'stage_routing':True})
+                save_enhanced_image(composite,{'stage_routing':True},allowed_roots=[front.parent])
                 links=photo_pairs.read_links(root/stages.ENHANCE_QUEUE)
                 self.assertEqual(len(links),1)
             output=root/stages.ENHANCE_QUEUE/'front-back_c_e.png'

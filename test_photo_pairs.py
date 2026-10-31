@@ -27,7 +27,7 @@ class PairTests(unittest.TestCase):
             staged=chatgpt_pending.save_pending(front,png.getvalue(),root/'pending')
             staged=chatgpt_pending.attach_link(staged['id'],link,root/'pending')
             with patch.object(photo_pairs,'ROOT',root/'store'):
-                outputs=photo_pairs.accept_linked(staged,png.getvalue())
+                outputs=photo_pairs.accept_linked(staged,png.getvalue(),allowed_roots=[root])
                 self.assertTrue(stages.same_path(photo_pairs.read_links(outputs[0].parent)[0]['front_path'], outputs[0]))
             self.assertEqual(len(outputs),2)
             with Image.open(outputs[1]) as result:
@@ -43,7 +43,7 @@ class PairTests(unittest.TestCase):
             Image.new('RGB',(40,20),'white').save(composite)
             out=root.parent/'1.7. TBP AI-Improved';out.mkdir();(out/'combined_ai.png').write_bytes(b'existing')
             record={'front_path':str(front),'link':{'composite_path':str(composite),'split':50,'layout':'right'}}
-            with self.assertRaises(ValueError):photo_pairs.accept_linked(record,front.read_bytes())
+            with self.assertRaises(ValueError):photo_pairs.accept_linked(record,front.read_bytes(),allowed_roots=[root])
             self.assertTrue(front.exists() and composite.exists())
 
 if __name__=='__main__':unittest.main()

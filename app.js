@@ -144,20 +144,49 @@ function tabId() {
 function requestHeaders(extra) {
   return { 'X-Cropper-Token': state.token, 'X-Cropper-Tab': tabId(), ...extra };
 }
-const batchPromptState = { overwriteSkip: [], replaceTokens: [] };
+const batchPromptState = { overwriteSkip: [], overwriteBatchIds: {}, replaceTokens: [], replaceBatchIds: {} };
 function hasOverwriteSkip(token) { return !!(token && batchPromptState.overwriteSkip.includes(token)); }
 function hasReplaceAck(token) { return !!(token && batchPromptState.replaceTokens.includes(token)); }
 function latestOverwriteSkip() { return batchPromptState.overwriteSkip[batchPromptState.overwriteSkip.length - 1] || ''; }
 function latestReplaceToken() { return batchPromptState.replaceTokens[batchPromptState.replaceTokens.length - 1] || ''; }
-function overwriteAckForBatch(token, skip) {
+function overwriteAckForBatch(token, skip, batchId) {
   if (!token) return { confirm_overwrite: true };
   if (skip && !batchPromptState.overwriteSkip.includes(token)) batchPromptState.overwriteSkip.push(token);
-  return { confirm_overwrite: true, skip_overwrite_prompt: !!skip, confirmation_token: token };
+  if (batchId) batchPromptState.overwriteBatchIds[token] = batchId;
+  const ack = { confirm_overwrite: true, skip_overwrite_prompt: !!skip, confirmation_token: token };
+  const id = batchId || batchPromptState.overwriteBatchIds[token];
+  if (id) ack.batch_id = id;
+  return ack;
 }
-function replaceAckForBatch(token) {
+function replaceAckForBatch(token, batchId) {
   if (!token) return { confirm_replace: true };
   if (!batchPromptState.replaceTokens.includes(token)) batchPromptState.replaceTokens.push(token);
-  return { confirm_replace: true, confirmation_token: token };
+  if (batchId) batchPromptState.replaceBatchIds[token] = batchId;
+  const ack = { confirm_replace: true, confirmation_token: token };
+  const id = batchId || batchPromptState.replaceBatchIds[token];
+  if (id) ack.batch_id = id;
+  return ack;
+}
+async function confirmOverwriteBatch(token, batchId) {
+  // Don't-ask-again is a separate server step. File tokens plus skip never widen.
+  if (!token || !batchId) throw new Error('That confirmation is no longer valid.');
+  const response = await fetch('/api/confirm-overwrite-batch', {
+    method: 'POST',
+    headers: requestHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      confirmation_token: token,
+      batch_id: batchId,
+      skip_overwrite_prompt: true,
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    const error = new Error(data.error || 'Could not confirm this batch.');
+    error.status = response.status;
+    throw error;
+  }
+  overwriteAckForBatch(data.confirmation_token, true, data.batch_id);
+  return data;
 }
 function askModal(dialogId, confirmValue, countId, namesId, skipId, count, names) {
   const dialog = $(dialogId);
@@ -193,7 +222,7 @@ async function ensureOverwriteConfirmed(paths, operation) {
     } else {
       const decision = await askReplace(preview.replace_count, preview.replace_names);
       if (!decision.ok) throw new Error('Replace original cancelled.');
-      Object.assign(extra, replaceAckForBatch(preview.replace_confirmation_token));
+      Object.assign(extra, replaceAckForBatch(preview.replace_confirmation_token, preview.replace_batch_id));
     }
   }
   if (preview.count) {
@@ -203,7 +232,12 @@ async function ensureOverwriteConfirmed(paths, operation) {
     } else {
       const decision = await askOverwrite(preview.count, preview.names);
       if (!decision.ok) throw new Error('Overwrite cancelled.');
-      Object.assign(extra, overwriteAckForBatch(preview.confirmation_token, decision.skip));
+      if (decision.skip) {
+        const upgraded = await confirmOverwriteBatch(preview.confirmation_token, preview.batch_id);
+        Object.assign(extra, overwriteAckForBatch(upgraded.confirmation_token, true, upgraded.batch_id));
+      } else {
+        Object.assign(extra, overwriteAckForBatch(preview.confirmation_token, false, preview.batch_id));
+      }
     }
   }
   return extra;
@@ -224,7 +258,7 @@ async function api(path, body) {
         throw error;
       }
       if (hasOverwriteSkip(token)) {
-        payload = { ...payload, ...overwriteAckForBatch(token, true) };
+        payload = { ...payload, ...overwriteAckForBatch(token, true, data.batch_id) };
         continue;
       }
       const storedSkip = latestOverwriteSkip();
@@ -238,7 +272,12 @@ async function api(path, body) {
         error.status = 409; error.code = data.code;
         throw error;
       }
-      payload = { ...payload, ...overwriteAckForBatch(token, decision.skip) };
+      if (decision.skip) {
+        const upgraded = await confirmOverwriteBatch(token, data.batch_id);
+        payload = { ...payload, ...overwriteAckForBatch(upgraded.confirmation_token, true, upgraded.batch_id) };
+      } else {
+        payload = { ...payload, ...overwriteAckForBatch(token, false, data.batch_id) };
+      }
       continue;
     }
     if (response.status === 409 && payload && typeof payload === 'object' && data.code === 'replace_confirmation_required') {
@@ -249,7 +288,7 @@ async function api(path, body) {
         throw error;
       }
       if (hasReplaceAck(token)) {
-        payload = { ...payload, ...replaceAckForBatch(token) };
+        payload = { ...payload, ...replaceAckForBatch(token, data.batch_id) };
         continue;
       }
       const storedReplace = latestReplaceToken();
@@ -263,13 +302,10 @@ async function api(path, body) {
         error.status = 409; error.code = data.code;
         throw error;
       }
-      payload = { ...payload, ...replaceAckForBatch(token) };
+      payload = { ...payload, ...replaceAckForBatch(token, data.batch_id) };
       continue;
     }
     if (!response.ok) { const error = new Error(data.error || 'Something went wrong.'); error.status = response.status; error.retryAfter = data.retry_after; error.code = data.code; error.type = data.type; error.requestId = data.request_id; error.path = data.path; error.count = data.count; error.names = data.names; throw error; }
-    if (data && data.confirmation_token && payload && payload.skip_overwrite_prompt) {
-      overwriteAckForBatch(data.confirmation_token, true);
-    }
     return data;
   }
 }
@@ -892,7 +928,7 @@ async function cropSave() {
   state.busy = true; updateControls();
   const sourceIndex = state.index;
   try {
-    const extra = await ensureOverwriteConfirmed([state.images[sourceIndex].path], 'crop');
+    const extra = await ensureOverwriteConfirmed(state.images.map(image => image.path), 'crop');
     const result = await api('/api/crop', { path: state.images[sourceIndex].path, points: state.points.map(p=>[p.x,p.y]), rotation: state.rotation, aspect_ratio: cropAspectRatio(), settings:{...settings,stage_routing:stageRoutingEnabled()}, ...extra });
     $('save-error').classList.add('hidden');
     toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
