@@ -181,6 +181,7 @@ test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(app, /X-Cropper-Tab/);
   assert.match(app, /\/api\/tab-register/);
   assert.match(app, /\/api\/confirm-overwrite-batch/);
+  assert.match(app, /\/api\/begin-batch/);
   assert.match(app, /replace_confirmation_token/);
   assert.match(app, /replace_batch_id/);
   assert.match(app, /previewBody\.confirmation_token = storedSkip/);

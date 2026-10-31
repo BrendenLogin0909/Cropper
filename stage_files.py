@@ -161,10 +161,16 @@ def allowed_root_paths(roots) -> list[Path]:
 
 
 def write_roots_for(roots) -> list[Path]:
-    """Tab roots plus known stage siblings so reserved AI outputs can be filed."""
+    """Tab roots plus stage siblings of those roots only.
+
+    A custom folder such as p/C2 does not unlock p/1.5. TBP Cropped. A tab
+    rooted at a known stage folder may still write into that folder's siblings.
+    """
     result = list(allowed_root_paths(roots))
     seen = {path_key(path) for path in result}
     for root in list(result):
+        if root.name not in FOLDERS:
+            continue
         parent = root.parent
         if is_filesystem_root(parent):
             continue
