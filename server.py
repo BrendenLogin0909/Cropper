@@ -10,6 +10,7 @@ import secrets
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 import warnings
 import app_settings
@@ -25,7 +26,10 @@ from PIL import Image, ImageOps
 from enhance import auto_enhance
 from chatgpt_restore import edit_front, file_accepted
 from image_api_errors import image_api_error
-from chatgpt_pending import get_pending, list_pending, remove_pending, save_pending, attach_link, set_operation
+from chatgpt_pending import (
+    attach_link, discard_recovered, get_pending, keep_recovered, list_pending,
+    list_recovered, remove_pending, reserved_from_record, save_pending, set_operation,
+)
 from colorize import candidates
 from photo_pairs import read_links, approve_link, suggestions, accept_linked
 from restore import OPERATIONS, preview_dust_marks, restore, useful_change
@@ -41,6 +45,48 @@ RESTORE_LOCK = threading.Lock()
 REVIEW_LOCKS = {}
 REVIEW_LOCKS_GUARD = threading.Lock()
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+GPS_IFD = 0x8825
+CONFIRMATION_TTL_SECONDS = 15 * 60
+CONFIRMATIONS: dict[str, dict] = {}
+CONFIRMATIONS_LOCK = threading.Lock()
+TABS: dict[tuple[str, str], float] = {}
+ALLOWED_ROOTS: dict[tuple[str, str], set[str]] = {}
+TAB_IN_FLIGHT: dict[tuple[str, str], int] = {}
+TAB_BATCHES: dict[tuple[str, str], str] = {}
+TABS_LOCK = threading.Lock()
+TAB_ID_MIN_LEN = 16
+TAB_ID_MAX_LEN = 128
+TAB_LIMIT = 32
+TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
+DIALOG_TIMEOUT_SECONDS = 300
+_DIALOG_LOCK = threading.Lock()
+_GRANTED = threading.local()
+
+
+class FolderDialogBusy(ValueError):
+    """The native folder dialog is still open. The UI shows this as dialog_still_open."""
+
+    code = "dialog_still_open"
+
+    def __init__(self, message: str = "The folder dialog is still open.") -> None:
+        super().__init__(message)
+
+
+class FolderDialogBusy(ValueError):
+    """The native folder dialog is still open. The UI shows this as dialog_still_open."""
+
+    code = "dialog_still_open"
+
+    def __init__(self, message: str = "The folder dialog is still open.") -> None:
+        super().__init__(message)
+
+
+class ConfirmationRequired(Exception):
+    """Raised when a write needs an overwrite/replace token before it can proceed."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("error") or "Confirmation required.")
+        self.payload = payload
 
 
 def hostname_of(host_header: str) -> str:
@@ -129,6 +175,18 @@ def image_path(value: str) -> Path:
     return path
 
 
+def pair_image(value, roots, role: str) -> Path:
+    label = f'{role.capitalize()} image'
+    if value is None or not str(value).strip():
+        raise ValueError(f'{label} not found.')
+    path = stage_files.resolve_in_allowed_roots(value, roots, label=label)
+    if not path.is_file():
+        raise ValueError(f'{label} not found.')
+    if path.suffix.lower() not in EXTENSIONS:
+        raise ValueError("That image is unavailable or its format is unsupported.")
+    return path
+
+
 def order_corners(points: list[list[float]]) -> np.ndarray:
     """Accept four clicks in any order; return TL, TR, BR, BL."""
     array = np.asarray(points, dtype=np.float32)
@@ -205,6 +263,30 @@ def rendered_bytes(image: Image.Image, extension: str, info: dict) -> bytes:
         return rendered.read_bytes()
 
 
+def _keep_gps_enabled() -> bool:
+    try:
+        return bool(app_settings.load_settings().get("keep_gps"))
+    except Exception:
+        return False
+
+
+def exif_bytes_for_save(info: dict, keep_gps: bool | None = None) -> bytes | None:
+    """Keep non-GPS EXIF; strip GPS unless keep_gps is on."""
+    if not info.get("exif"):
+        return None
+    if keep_gps is None:
+        keep_gps = _keep_gps_enabled()
+    try:
+        exif = Image.Exif()
+        exif.load(info["exif"])
+        exif[274] = 1
+        if not keep_gps:
+            exif.pop(GPS_IFD, None)
+        return exif.tobytes()
+    except (ValueError, TypeError, OSError, KeyError):
+        return None
+
+
 def save_rendered(image: Image.Image, destination: Path, info: dict) -> None:
     extension = destination.suffix.lower()
     format_name = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP", ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP"}[extension]
@@ -215,15 +297,10 @@ def save_rendered(image: Image.Image, destination: Path, info: dict) -> None:
         options.update(quality=95, method=6)
     if info.get("icc_profile"):
         options["icc_profile"] = info["icc_profile"]
-    # EXIF orientation is reset after the pixels are transposed; keep other metadata.
-    if info.get("exif"):
-        try:
-            exif = Image.Exif()
-            exif.load(info["exif"])
-            exif[274] = 1
-            options["exif"] = exif.tobytes()
-        except (ValueError, TypeError, OSError):
-            pass
+    # EXIF orientation is reset after the pixels are transposed; GPS is stripped unless opted in.
+    exif = exif_bytes_for_save(info)
+    if exif:
+        options["exif"] = exif
     handle, temp_name = tempfile.mkstemp(prefix=".cropper-", suffix=destination.suffix, dir=destination.parent)
     os.close(handle)
     temp = Path(temp_name)
@@ -271,41 +348,82 @@ def merge_front_and_back(front: Image.Image, back: Image.Image, back_rotation: i
     return output
 
 
-def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_source: str, back_rotation: int) -> tuple[Path, tuple[int, int]]:
-    if front_path.resolve() == back_path.resolve():
+def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_source: str, back_rotation: int,
+                      root: Path | None = None, allowed_roots=None, tab_id: str | None = None,
+                      confirm=None) -> tuple[Path, tuple[int, int]]:
+    if front_path is None or not str(front_path).strip():
+        raise ValueError('Front image not found.')
+    if back_path is None or not str(back_path).strip():
+        raise ValueError('Back image not found.')
+    roots = allowed_roots
+    if roots is None and tab_id:
+        roots = allowed_roots_for(tab_id)
+    front_path = pair_image(front_path, roots, 'front')
+    back_path = pair_image(back_path, roots, 'back')
+    if stage_files.same_path(front_path, back_path):
         raise ValueError("Choose two different images: the front first, then its back.")
-    front, front_info = load_image(front_path)
-    back, _ = load_image(back_path)
-    merged = merge_front_and_back(front, back, back_rotation)
     source_for_name = back_path if name_source == "back" else front_path if name_source == "front" else None
     if source_for_name is None:
         raise ValueError("Choose whether to name the pair from the first or second image.")
-    if front_path.parent != back_path.parent or front_path.parent.name != stage_files.CROP_QUEUE:
-        raise ValueError('Merge flat-batch pairs from the same 1.5. TBP Cropped folder.')
     stem = source_for_name.stem
-    if stem.endswith('_c'): stem = stem[:-2]
-    destination = front_path.parent / f'{stem}_front-back_c{source_for_name.suffix}'
-    # Keep the standalone cropped front/back: only add the merged version.
-    stage_files.commit([{'source': source_for_name.resolve(), 'snapshots':[source_for_name.resolve()], 'output':destination}],
-                       [rendered_bytes(merged, source_for_name.suffix, front_info)])
+    protected = False
+    file_settings = stage_files._settings()
+    custom = str(file_settings.get('output_folder') or '').strip()
+    if custom:
+        output_root = Path(custom).expanduser().resolve()
+    else:
+        output_root = front_path.parent
+    if front_path.parent.name == stage_files.CROP_QUEUE and not custom:
+        if stem.endswith('_c'):
+            stem = stem[:-2]
+        destination = front_path.parent / f'{stem}_front-back{source_for_name.suffix}'
+        snapshots = []
+    else:
+        policy = file_settings.get('conflict_policy') or 'skip'
+        named = source_for_name.with_stem(f'{stem}_front-back')
+        destination = output_root / stage_files.render_filename(named, 'merge')
+        occupied = {front_path.resolve(), back_path.resolve()}
+        intended = destination
+        destination = stage_files.protect_original_output(destination, front_path, occupied, policy)
+        destination = stage_files.protect_original_output(
+            destination, back_path, occupied | {destination}, policy)
+        protected = not stage_files.same_path(destination, intended)
+        snapshots = []
+    stage_files.assert_output_in_root(destination, output_root)
+    stage_files.probe_folder_writable(output_root)
+    plan = {'source': source_for_name.resolve(), 'snapshots': snapshots, 'output': destination,
+            'keep_source': True, 'operation': 'merge', 'protected_original': protected,
+            'root': output_root}
+    if roots:
+        stage_files.confine_plans([plan], roots)
+    if confirm:
+        refusal = confirm([plan])
+        if refusal:
+            raise ConfirmationRequired(refusal)
+    front, front_info = load_image(front_path)
+    back, _ = load_image(back_path)
+    merged = merge_front_and_back(front, back, back_rotation)
+    stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
+    stage_files.remember_protected_outputs([plan])
     return destination, merged.size
 
 
 
 
 
-def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, int], list[str], Path]:
+def save_enhanced_image(source: Path, settings: dict, allowed_roots=None) -> tuple[Path, tuple[int, int], list[str], Path]:
     stage_files.plan(source, 'enhance')
-    link = next((item for item in read_links(source.parent) if str(source) in {item['front_path'], item['composite_path']}), None)
+    link = next((item for item in read_links(source.parent)
+                 if stage_files.same_path(source, item['front_path']) or stage_files.same_path(source, item['composite_path'])), None)
     if link:
-        source = image_path(link['front_path'])
+        source = pair_image(link['front_path'], allowed_roots, 'front')
     image, info = load_image(source)
     enhanced, changes = auto_enhance(image)
     planned = stage_files.plan(source, 'enhance')
     sources, payloads = [source], [rendered_bytes(enhanced, source.suffix, info)]
     if link:
         from chatgpt_restore import reassemble
-        composite = image_path(link['composite_path'])
+        composite = pair_image(link['composite_path'], allowed_roots, 'back')
         stage_files.plan(composite, 'enhance')
         _, composite_info = load_image(composite)
         combined = reassemble(rendered_bytes(enhanced, '.png', info), composite, link['split'], link['layout'])
@@ -315,10 +433,12 @@ def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, 
     outputs = stage_files.file_results(sources, payloads, 'enhance')
     if link:
         try:
-            approve_link(outputs[0], outputs[1], link['split'], link['layout'])
+            approve_link(outputs[0], outputs[1], link['split'], link['layout'],
+                         allowed_roots=[outputs[0].parent, outputs[1].parent])
         except (OSError, ValueError) as error:
             warnings.warn(f'Images saved, but output pair link could not be carried forward: {error}')
-    return outputs[0], enhanced.size, changes, planned['snapshots'][0]
+    archived = planned['snapshots'][0] if planned.get('snapshots') else None
+    return outputs[0], enhanced.size, changes, archived
 
 
 def save_restored_image(source: Path, operation: str, strokes: list | None = None) -> tuple[Path | None, tuple[int, int], list[str], Path | None]:
@@ -331,14 +451,547 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
         if not useful_change(changes):
             return None, restored.size, changes, None
         destination = stage_files.file_results([source], [rendered_bytes(restored, source.suffix, info)], 'enhance')[0]
-    return destination, restored.size, changes, planned['snapshots'][0]
+    archived = planned['snapshots'][0] if planned.get('snapshots') else None
+    return destination, restored.size, changes, archived
+
+
+def reset_confirmations() -> None:
+    """Drop in-memory overwrite/replace tokens. Restarts empty this store."""
+    with CONFIRMATIONS_LOCK:
+        CONFIRMATIONS.clear()
+
+
+def reset_tabs() -> None:
+    """Drop registered browser tabs and their allowed roots. Restarts empty this store."""
+    with TABS_LOCK:
+        TABS.clear()
+        ALLOWED_ROOTS.clear()
+        TAB_IN_FLIGHT.clear()
+        TAB_BATCHES.clear()
+
+
+def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
+    """Open the native folder dialog. Tests monkeypatch this; production has no env stub."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+
+        def poll_cancel() -> None:
+            if cancel.is_set():
+                try:
+                    root.quit()
+                    root.destroy()
+                except tk.TclError:
+                    pass
+                return
+            try:
+                root.after(200, poll_cancel)
+            except tk.TclError:
+                pass
+
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        root.after(200, poll_cancel)
+        chosen = filedialog.askdirectory(title="Choose folder")
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        if not cancel.is_set():
+            result.append(chosen)
+    except Exception as exc:  # pragma: no cover - exercised via monkeypatch
+        errors.append(exc)
+
+
+def choose_folder_dialog() -> Path | None:
+    """Open the native OS folder dialog. None if the user cancels. One dialog at a time."""
+    if not _DIALOG_LOCK.acquire(blocking=False):
+        raise FolderDialogBusy("A folder dialog is already open.")
+    result: list = []
+    errors: list = []
+    cancel = threading.Event()
+    released = False
+
+    def release_lock() -> None:
+        nonlocal released
+        if not released:
+            released = True
+            _DIALOG_LOCK.release()
+
+    def release_when_done(worker: threading.Thread) -> None:
+        worker.join()
+        release_lock()
+
+    thread = threading.Thread(target=_run_folder_dialog, args=(result, errors, cancel), daemon=True)
+    try:
+        thread.start()
+        thread.join(timeout=DIALOG_TIMEOUT_SECONDS)
+        timed_out = thread.is_alive()
+        if timed_out:
+            cancel.set()
+            thread.join(timeout=0.5)
+        if thread.is_alive():
+            threading.Thread(target=release_when_done, args=(thread,), daemon=True).start()
+            raise FolderDialogBusy()
+        if timed_out:
+            raise FolderDialogBusy()
+        if errors:
+            raise ValueError("Could not open the folder dialog.") from errors[0]
+        if not result or not result[0]:
+            return None
+        return Path(result[0])
+    finally:
+        if not thread.is_alive():
+            release_lock()
+
+
+def register_allowed_root(folder, tab_id: str, session: str | None = None) -> Path:
+    """Register only a dialog-chosen folder for this session and tab. Drive roots and parents are refused."""
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id or not tab_is_registered(tab_id, session):
+        raise ValueError("This browser tab must register a random id first.")
+    try:
+        path = Path(folder).expanduser().resolve()
+    except OSError as exc:
+        raise ValueError("Folder not found.") from exc
+    if not path.is_dir():
+        raise ValueError("Folder not found.")
+    if stage_files.is_filesystem_root(path):
+        raise ValueError("A drive or filesystem root cannot be registered.")
+    with TABS_LOCK:
+        existing = [Path(key) for key in ALLOWED_ROOTS.get((session, tab_id), ())]
+        for root in existing:
+            if stage_files.contained_in(root, path) and not stage_files.same_path(root, path):
+                raise ValueError("A parent of an already opened folder cannot be registered.")
+        ALLOWED_ROOTS.setdefault((session, tab_id), set()).add(stage_files.path_key(path))
+    return path
+
+
+def allowed_roots_for(tab_id: str, session: str | None = None) -> list[Path]:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id or not tab_is_registered(tab_id, session):
+        return []
+    with TABS_LOCK:
+        keys = list(ALLOWED_ROOTS.get((session, tab_id), ()))
+    return [Path(key) for key in keys]
+
+
+def normalize_tab_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not TAB_ID_MIN_LEN <= len(text) <= TAB_ID_MAX_LEN:
+        return ""
+    if not all(char.isalnum() or char in "-_" for char in text):
+        return ""
+    return text
+
+
+def _drop_tab_locked(key: tuple[str, str]) -> None:
+    TABS.pop(key, None)
+    ALLOWED_ROOTS.pop(key, None)
+    TAB_IN_FLIGHT.pop(key, None)
+    TAB_BATCHES.pop(key, None)
+
+
+def _tab_is_busy_locked(key: tuple[str, str]) -> bool:
+    return TAB_IN_FLIGHT.get(key, 0) > 0
+
+
+def _purge_tabs_locked(now: float | None = None) -> None:
+    stamp = time.time() if now is None else now
+    expired = [
+        key for key, seen in TABS.items()
+        if seen + TAB_IDLE_SECONDS <= stamp and not _tab_is_busy_locked(key)
+    ]
+    for key in expired:
+        _drop_tab_locked(key)
+
+
+def _evict_lru_idle_tab_locked(session: str) -> bool:
+    oldest_key = None
+    oldest_seen = None
+    for key, seen in TABS.items():
+        if key[0] != session or _tab_is_busy_locked(key):
+            continue
+        if oldest_seen is None or seen < oldest_seen:
+            oldest_seen = seen
+            oldest_key = key
+    if oldest_key is None:
+        return False
+    _drop_tab_locked(oldest_key)
+    return True
+
+
+def tab_request_begin(tab_id: str, session: str | None = None) -> None:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return
+    with TABS_LOCK:
+        key = (session, tab_id)
+        if key not in TABS:
+            return
+        TAB_IN_FLIGHT[key] = TAB_IN_FLIGHT.get(key, 0) + 1
+        TABS[key] = time.time()
+
+
+def tab_request_end(tab_id: str, session: str | None = None) -> None:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return
+    with TABS_LOCK:
+        key = (session, tab_id)
+        remaining = TAB_IN_FLIGHT.get(key, 0) - 1
+        if remaining > 0:
+            TAB_IN_FLIGHT[key] = remaining
+        else:
+            TAB_IN_FLIGHT.pop(key, None)
+
+
+def register_tab(tab_id: str, session: str | None = None) -> str:
+    """Remember this browser tab for the current app session. Cap is 32 live tabs.
+
+    Only idle tabs are evicted. If every live tab has a request in flight, the
+    new registration is refused.
+    """
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        raise ValueError("This browser tab must register a random id first.")
+    with TABS_LOCK:
+        _purge_tabs_locked()
+        key = (session, tab_id)
+        if key in TABS:
+            TABS[key] = time.time()
+            return tab_id
+        live = sum(1 for sess, _tid in TABS if sess == session)
+        if live >= TAB_LIMIT and not _evict_lru_idle_tab_locked(session):
+            raise ValueError(
+                "All browser tabs are busy. Finish a request or close a tab before opening another."
+            )
+        TABS[key] = time.time()
+    return tab_id
+
+
+def tab_is_registered(tab_id: str, session: str | None = None) -> bool:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        return False
+    with TABS_LOCK:
+        _purge_tabs_locked()
+        key = (session, tab_id)
+        if key not in TABS:
+            return False
+        TABS[key] = time.time()
+        return True
+
+
+def _purge_confirmations_locked(now: float | None = None) -> None:
+    stamp = _now() if now is None else now
+    expired = [token for token, record in CONFIRMATIONS.items() if record["expires"] <= stamp]
+    for token in expired:
+        CONFIRMATIONS.pop(token, None)
+
+
+def _target_keys(paths: list[Path]) -> frozenset[str]:
+    return frozenset(stage_files.path_key(path) for path in paths)
+
+
+def _batch_key(plans: list[dict]) -> str:
+    return "\n".join(sorted({stage_files.path_key(stage_files.plan_root(item)) for item in plans}))
+
+
+def _new_batch_id() -> str:
+    return secrets.token_urlsafe(16)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _clear_granted() -> None:
+    _GRANTED.token = None
+    _GRANTED.batch_id = None
+
+
+def granted_confirmation() -> tuple[str | None, str | None]:
+    return getattr(_GRANTED, "token", None), getattr(_GRANTED, "batch_id", None)
+
+
+def _confirmation_public(token: str) -> dict:
+    with CONFIRMATIONS_LOCK:
+        record = CONFIRMATIONS.get(token) or {}
+        batch_id = record.get("batch_id") or ""
+    payload = {"confirmation_token": token}
+    if batch_id:
+        payload["batch_id"] = batch_id
+    return payload
+
+
+def _secret_matches(stored: str, given: str) -> bool:
+    if not stored or not given or len(stored) != len(given):
+        return False
+    return secrets.compare_digest(stored, given)
+
+
+def _batch_id_matches(record: dict, payload: dict | None) -> bool:
+    given = str((payload or {}).get("batch_id") or "")
+    stored = str(record.get("batch_id") or "")
+    return bool(given) and bool(stored) and _secret_matches(stored, given)
+
+
+def _live_record(token: str, kind: str, session: str, tab_id: str,
+                 now: float | None = None) -> dict | None:
+    """Return a live same-session, same-tab record, or None. Does not check batch or targets."""
+    tab_id = normalize_tab_id(tab_id)
+    if not token or not tab_id or not tab_is_registered(tab_id, session):
+        return None
+    stamp = _now() if now is None else now
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked(stamp)
+        record = CONFIRMATIONS.get(token)
+        if record is None:
+            return None
+        if record["kind"] != kind or not _secret_matches(record["session"], session):
+            return None
+        if not _secret_matches(record.get("tab_id") or "", tab_id):
+            return None
+        if record["expires"] <= stamp:
+            CONFIRMATIONS.pop(token, None)
+            return None
+        return record
+
+
+def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
+                      tab_id: str, now: float | None = None) -> dict | None:
+    """Return a live same-session, same-tab record, or None. Does not check target coverage."""
+    record = _live_record(token, kind, session, tab_id, now)
+    if record is None or record["batch"] != _batch_key(plans):
+        return None
+    return record
+
+
+def _invalidate_tab_folder_tokens_locked(session: str, tab_id: str, batch: str) -> None:
+    """Drop overwrite and replace tokens for this tab and folder set. Caller holds the lock."""
+    tab_id = normalize_tab_id(tab_id)
+    stale = [
+        token for token, record in CONFIRMATIONS.items()
+        if record.get("batch") == batch
+        and record.get("kind") in {"overwrite", "replace"}
+        and _secret_matches(record.get("session") or "", session or "")
+        and _secret_matches(record.get("tab_id") or "", tab_id or "")
+    ]
+    for token in stale:
+        CONFIRMATIONS.pop(token, None)
+
+
+def _invalidate_tab_tokens_locked(session: str, tab_id: str) -> None:
+    """Drop every overwrite and replace token for this tab. Caller holds the lock."""
+    tab_id = normalize_tab_id(tab_id)
+    stale = [
+        token for token, record in CONFIRMATIONS.items()
+        if record.get("kind") in {"overwrite", "replace"}
+        and _secret_matches(record.get("session") or "", session or "")
+        and _secret_matches(record.get("tab_id") or "", tab_id or "")
+    ]
+    for token in stale:
+        CONFIRMATIONS.pop(token, None)
+
+
+def begin_tab_batch(tab_id: str, session: str | None = None) -> str:
+    """Issue a new batch for this tab. Old overwrite and replace tokens are dropped."""
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not tab_id:
+        raise ValueError("This browser tab must register a random id first.")
+    batch_id = _new_batch_id()
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        _invalidate_tab_tokens_locked(session, tab_id)
+    with TABS_LOCK:
+        TAB_BATCHES[(session, tab_id)] = batch_id
+    return batch_id
+
+
+def current_batch_id(tab_id: str, session: str | None = None) -> str:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    with TABS_LOCK:
+        existing = TAB_BATCHES.get((session, tab_id))
+        if existing:
+            return existing
+    return begin_tab_batch(tab_id, session)
+
+
+def _continuing_batch_token(kind: str, token: str, plans: list[dict],
+                            session: str, tab_id: str, batch_id: str = "") -> str | None:
+    """Return token when it is a live batch-scoped grant for this tab and folder set."""
+    record = _record_for_token(token, kind, plans, session, tab_id)
+    if record is None or record.get("scope") != "batch":
+        return None
+    if not _batch_id_matches(record, {"batch_id": batch_id}):
+        return None
+    return token
+
+
+def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
+                       session: str | None = None, payload: dict | None = None,
+                       tab_id: str | None = None, scope: str | None = None,
+                       invalidate: bool = False) -> str:
+    """Mint a token for the tab's current batch. Crop and preview do not start a batch.
+
+    Overwrite tokens start as file-scoped. Don't-ask-again calls
+    confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
+    A new confirmation never inherits another token's batch_id, scope, or targets.
+    """
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    covered = set(_target_keys(targets))
+    granted = "batch" if kind == "replace" else "files"
+    if scope in {"batch", "files"}:
+        granted = scope
+    batch_id = current_batch_id(tab_id, session)
+    token = secrets.token_urlsafe(32)
+    record = {
+        "kind": kind,
+        "session": session,
+        "tab_id": tab_id,
+        "batch": _batch_key(plans),
+        "batch_id": batch_id,
+        "scope": granted,
+        "targets": frozenset(covered),
+        "expires": _now() + CONFIRMATION_TTL_SECONDS,
+    }
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        if invalidate:
+            _invalidate_tab_folder_tokens_locked(session, tab_id, record["batch"])
+        CONFIRMATIONS[token] = record
+    return token
+
+
+def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: list[Path],
+                        session: str | None = None, tab_id: str | None = None) -> bool:
+    """True only for a live registered-tab token whose batch_id matches.
+
+    File tokens are single-use. skip_overwrite_prompt and confirm_replace never
+    widen a file token; Don't-ask-again is POST /api/confirm-overwrite-batch.
+    Batch tokens stay reusable within their server-held batch (_batch_key).
+    """
+    _clear_granted()
+    flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
+    if not any(payload.get(flag) for flag in flags):
+        return False
+    token = str(payload.get("confirmation_token") or "")
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    record = _record_for_token(token, kind, plans, session, tab_id)
+    if record is None or not _batch_id_matches(record, payload):
+        return False
+    if record.get("scope") == "batch":
+        _GRANTED.token = token
+        _GRANTED.batch_id = record.get("batch_id")
+        return True
+    if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+        return False
+    with CONFIRMATIONS_LOCK:
+        CONFIRMATIONS.pop(token, None)
+    return True
+
+
+def confirm_overwrite_batch(payload: dict, session: str | None = None,
+                            tab_id: str | None = None) -> dict:
+    """Issue a batch-wide token for Don't-ask-again. The file token is left unchanged.
+
+    Requires a live overwrite token, the server-issued batch_id, and
+    skip_overwrite_prompt. The new token covers only the targets already stored
+    on that record for that batch_id. Crop/enhance/restore flags never do this.
+    """
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not payload.get("skip_overwrite_prompt"):
+        raise ValueError("Don't ask again requires confirmation of this batch.")
+    token = str(payload.get("confirmation_token") or "")
+    record = _live_record(token, "overwrite", session, tab_id)
+    if record is None or not _batch_id_matches(record, payload):
+        raise ValueError("That confirmation is no longer valid.")
+    granted = {
+        "kind": "overwrite",
+        "session": record["session"],
+        "tab_id": record["tab_id"],
+        "batch": record["batch"],
+        "batch_id": record["batch_id"],
+        "scope": "batch",
+        "targets": frozenset(record.get("targets") or ()),
+        "expires": _now() + CONFIRMATION_TTL_SECONDS,
+    }
+    minted = secrets.token_urlsafe(32)
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        CONFIRMATIONS[minted] = granted
+    return _confirmation_public(minted)
+
+
+def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None,
+                       tab_id: str | None = None) -> dict | None:
+    """Return a 409 payload when this batch would overwrite and has not been confirmed."""
+    payload = data if isinstance(data, dict) else {}
+    targets = stage_files.planned_overwrites(plans)
+    if not targets:
+        return None
+    session = session or TOKEN
+    if confirmation_allows("overwrite", payload, plans, targets, session, tab_id):
+        return None
+    token = issue_confirmation("overwrite", plans, targets, session, payload, tab_id)
+    return {
+        "code": "overwrite_confirmation_required",
+        "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
+        "count": len(targets),
+        "names": [path.name for path in targets],
+        **_confirmation_public(token),
+    }
+
+
+def replace_response(plans: list[dict], data: dict | None, session: str | None = None,
+                     tab_id: str | None = None) -> dict | None:
+    """Return a 409 payload when Replace original has not been confirmed for this batch."""
+    payload = data if isinstance(data, dict) else {}
+    targets = stage_files.planned_replaces(plans)
+    if not targets:
+        return None
+    session = session or TOKEN
+    if confirmation_allows("replace", payload, plans, targets, session, tab_id):
+        return None
+    token = issue_confirmation("replace", plans, targets, session, payload, tab_id)
+    return {
+        "code": "replace_confirmation_required",
+        "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
+        "count": len(targets),
+        "names": [path.name for path in targets],
+        **_confirmation_public(token),
+    }
+
+
+def confirmation_response(plans: list[dict], data: dict | None, session: str | None = None,
+                          tab_id: str | None = None) -> dict | None:
+    """Replace original is independent of Skip/Overwrite/Auto-suffix."""
+    session = session or TOKEN
+    return replace_response(plans, data, session, tab_id) or overwrite_response(
+        plans, data, session, tab_id)
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Cropper/1.0"
 
     def log_message(self, format: str, *args) -> None:
-        # Never log query strings or request bodies (keys, notes, settings).
+        # Never log query strings, request bodies, or confirmation tokens.
         path = urlparse(getattr(self, "path", "") or "").path or "-"
         command = getattr(self, "command", None) or "-"
         print("%s - \"%s %s\"" % (self.address_string(), command, path))
@@ -362,6 +1015,38 @@ class Handler(BaseHTTPRequestHandler):
         given = self.headers.get("X-Cropper-Token", "") or (query or {}).get("token", [""])[0]
         return secrets.compare_digest(given, TOKEN) and request_is_local(self)
 
+    def request_tab_id(self) -> str:
+        return normalize_tab_id(self.headers.get("X-Cropper-Tab", ""))
+
+    def request_roots(self) -> list[Path]:
+        return allowed_roots_for(self.request_tab_id())
+
+    def request_image(self, value, label: str = "That image") -> Path:
+        path = stage_files.resolve_in_allowed_roots(value, self.request_roots(), label=label)
+        if not path.is_file() or path.suffix.lower() not in EXTENSIONS:
+            raise ValueError("That image is unavailable or its format is unsupported.")
+        return path
+
+    def request_folder(self, value, label: str = "Folder") -> Path:
+        path = stage_files.resolve_in_allowed_roots(value, self.request_roots(), label=label)
+        if not path.is_dir():
+            raise ValueError("Folder not found.")
+        return path
+
+    def confine_writes(self, plans: list[dict]) -> None:
+        stage_files.confine_plans(plans, self.request_roots())
+
+    def attach_granted(self, body: dict) -> dict:
+        token, batch_id = granted_confirmation()
+        if token:
+            body["confirmation_token"] = token
+            if batch_id:
+                body["batch_id"] = batch_id
+        return body
+
+    def confirm(self, plans: list[dict], data: dict | None) -> dict | None:
+        return confirmation_response(plans, data, TOKEN, self.request_tab_id())
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -370,6 +1055,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not request_is_local(self):
                     self.json(403, {"error": "Session is only available on localhost."})
                     return
+                tab_id = self.request_tab_id()
+                if tab_id:
+                    register_tab(tab_id, TOKEN)
                 info = app_settings.public_settings()
                 self.json(200, {
                     "app": "Cropper",
@@ -410,18 +1098,17 @@ class Handler(BaseHTTPRequestHandler):
                 if query.get('part', [''])[0] == 'combined' and record.get('link'):
                     from chatgpt_restore import reassemble
                     link = record['link']
-                    png = reassemble(png, Path(link['composite_path']), link['split'], link['layout'])
+                    composite = self.request_image(link['composite_path'], label='Back image')
+                    png = reassemble(png, composite, link['split'], link['layout'])
                 self.reply(200, png, "image/png")
                 return
             if parsed.path == '/api/photo-links':
-                folder = clean_path(query.get('path', [''])[0])
+                folder = self.request_folder(query.get('path', [''])[0])
                 self.json(200, {'links': read_links(folder)})
                 return
             if parsed.path == "/api/chatgpt-pending":
-                folder = clean_path(query.get("path", [""])[0])
-                if not folder.is_dir():
-                    raise ValueError("Folder not found.")
-                self.json(200, {"items": list_pending(folder)})
+                folder = self.request_folder(query.get("path", [""])[0])
+                self.json(200, {"items": list_pending(folder), "recovered": list_recovered()})
                 return
             if parsed.path == "/api/folders":
                 self.json(200, folder_listing(query.get("path", [""])[0]))
@@ -434,7 +1121,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {**base, "images": images})
                 return
             if parsed.path in {"/api/image", "/api/thumb", "/api/enhance-original"}:
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 limit = 440 if parsed.path == "/api/thumb" else 1800 if parsed.path == "/api/enhance-original" else 7000
                 image, _ = load_image(path)
                 image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
@@ -443,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg")
                 return
             if parsed.path == "/api/enhance-preview":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 image, _ = load_image(path)
                 image.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 enhanced, changes = auto_enhance(image)
@@ -452,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
                 return
             if parsed.path == "/api/restore-preview":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 operation = query.get("operation", [""])[0]
                 image, _ = load_image(path)
                 restored, changes = restore(image, operation)
@@ -462,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, data.getvalue(), "image/jpeg", {"X-Cropper-Adjustments": ", ".join(changes)})
                 return
             if parsed.path == "/api/info":
-                path = image_path(query.get("path", [""])[0])
+                path = self.request_image(query.get("path", [""])[0])
                 with Image.open(path) as image:
                     width, height = image.size
                     if image.getexif().get(274) in {5, 6, 7, 8}:
@@ -470,6 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {"width": width, "height": height})
                 return
             self.json(404, {"error": "Not found."})
+        except FolderDialogBusy as exc:
+            self.json(400, {"error": str(exc), "code": exc.code})
         except (ValueError, OSError, cv2.error) as exc:
             self.json(400, {"error": str(exc)})
 
@@ -477,11 +1166,41 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             self.json(403, {"error": "Unauthorized request."})
             return
+        tab_id = self.request_tab_id()
+        in_flight = bool(tab_id) and tab_is_registered(tab_id, TOKEN)
+        if in_flight:
+            tab_request_begin(tab_id)
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 1 or length > 1_000_000:
                 raise ValueError("Invalid request size.")
             data = json.loads(self.rfile.read(length))
+            if self.path == "/api/tab-register":
+                payload = data if isinstance(data, dict) else {}
+                tab_id = normalize_tab_id(str(payload.get("tab_id") or "") or self.headers.get("X-Cropper-Tab", ""))
+                if not tab_id:
+                    raise ValueError("This browser tab must register a random id first.")
+                register_tab(tab_id, TOKEN)
+                self.json(200, {"registered": True})
+                return
+            if self.path == "/api/pick-folder":
+                tab_id = self.request_tab_id()
+                if not tab_id or not tab_is_registered(tab_id, TOKEN):
+                    raise ValueError("This browser tab must register a random id first.")
+                chosen = choose_folder_dialog()
+                if chosen is None:
+                    self.json(200, {"cancelled": True, "path": None})
+                    return
+                path = register_allowed_root(chosen, tab_id)
+                begin_tab_batch(tab_id)
+                self.json(200, {"cancelled": False, "path": str(path)})
+                return
+            if self.path == "/api/begin-batch":
+                tab_id = self.request_tab_id()
+                if not tab_id or not tab_is_registered(tab_id, TOKEN):
+                    raise ValueError("This browser tab must register a random id first.")
+                self.json(200, {"batch_id": begin_tab_batch(tab_id)})
+                return
             if self.path == "/api/settings":
                 if not isinstance(data, dict):
                     raise ValueError("Invalid settings.")
@@ -489,6 +1208,10 @@ class Handler(BaseHTTPRequestHandler):
                 if key is not None and str(key).strip():
                     app_settings.set_stored_api_key(str(key))
                 key = None
+                folder = str(data.get("output_folder") or "").strip()
+                if folder:
+                    data["output_folder"] = str(stage_files.resolve_output_folder(
+                        folder, self.request_roots(), label="The output folder"))
                 app_settings.save_settings(data)
                 self.json(200, app_settings.public_settings())
                 return
@@ -505,7 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, result)
                 return
             if self.path == '/api/crop-corners':
-                path = image_path(data.get('path', ''))
+                path = self.request_image(data.get('path', ''))
                 image, _ = load_image(path)
                 target = data.get('target')
                 if target is not None and (not isinstance(target, list) or len(target) != 2 or
@@ -513,13 +1236,82 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Invalid photo selection point.')
                 self.json(200, predict_corners(image, target))
                 return
+            if self.path == "/api/overwrite-preview":
+                operation = str(data.get("operation") or "crop")
+                raw_paths = data.get("paths") if isinstance(data.get("paths"), list) else []
+                if data.get("path"):
+                    raw_paths = [data.get("path"), *raw_paths]
+                if not raw_paths:
+                    raise ValueError("Select photos to check.")
+                paths = [self.request_image(value) for value in raw_paths]
+                plans = stage_files.plan_many(paths, operation)
+                self.confine_writes(plans)
+                targets = stage_files.planned_overwrites(plans)
+                replaces = stage_files.planned_replaces(plans)
+                body = {
+                    "count": len(targets),
+                    "names": [path.name for path in targets],
+                    "paths": [str(path) for path in targets],
+                    "replace_count": len(replaces),
+                    "replace_names": [path.name for path in replaces],
+                    "replace_paths": [str(path) for path in replaces],
+                }
+                tab_id = self.request_tab_id()
+                overwrite_token = None
+                replace_token = None
+                if targets:
+                    overwrite_token = _continuing_batch_token(
+                        "overwrite",
+                        str(data.get("confirmation_token") or ""),
+                        plans, TOKEN, tab_id,
+                        str(data.get("batch_id") or ""),
+                    )
+                if replaces:
+                    replace_token = _continuing_batch_token(
+                        "replace",
+                        str(data.get("replace_confirmation_token") or ""),
+                        plans, TOKEN, tab_id,
+                        str(data.get("replace_batch_id") or ""),
+                    )
+                if targets and not overwrite_token:
+                    overwrite_token = issue_confirmation(
+                        "overwrite", plans, targets, TOKEN, data, tab_id)
+                if replaces and not replace_token:
+                    replace_token = issue_confirmation(
+                        "replace", plans, replaces, TOKEN, data, tab_id)
+                if overwrite_token:
+                    body.update(_confirmation_public(overwrite_token))
+                if replace_token:
+                    body["replace_confirmation_token"] = replace_token
+                    public = _confirmation_public(replace_token)
+                    if public.get("batch_id"):
+                        body["replace_batch_id"] = public["batch_id"]
+                    if public.get("batch_id") and "batch_id" not in body:
+                        body["batch_id"] = public["batch_id"]
+                self.json(200, body)
+                return
+            if self.path == "/api/confirm-overwrite-batch":
+                if not isinstance(data, dict):
+                    raise ValueError("That confirmation is no longer valid.")
+                self.json(200, confirm_overwrite_batch(data, TOKEN, self.request_tab_id()))
+                return
             if self.path == "/api/crop":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
+                plans = [stage_files.plan(path, "crop")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 destination, size = save_image(path, data.get("points", []), data.get("settings", {}), int(data.get("rotation", 0)), data.get("aspect_ratio"))
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "source_moved": not path.exists()})
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "source_moved": not path.exists()}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/crop-preview":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 image, _ = load_image(path)
                 original_width, original_height = image.size
                 image.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
@@ -530,22 +1322,45 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, payload.getvalue(), "image/jpeg")
                 return
             if self.path == "/api/merge":
-                front_path = image_path(data.get("front_path", ""))
-                back_path = image_path(data.get("back_path", ""))
-                destination, size = save_merged_image(front_path, back_path, data.get("settings", {}), data.get("name_source", "back"), int(data.get("back_rotation", 0)))
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]})
+                try:
+                    destination, size = save_merged_image(
+                        data.get("front_path", ""), data.get("back_path", ""),
+                        data.get("settings", {}), data.get("name_source", "back"),
+                        int(data.get("back_rotation", 0)),
+                        allowed_roots=allowed_roots_for(self.request_tab_id()),
+                        confirm=lambda plans: self.confirm(plans, data))
+                except ConfirmationRequired as exc:
+                    self.json(409, exc.payload)
+                    return
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1]}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/enhance":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
+                plans = [stage_files.plan(path, "enhance")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 requested = data.get("settings", {})
                 source_paths = [str(path)]
-                link = next((item for item in read_links(path.parent) if str(path) in {item['front_path'],item['composite_path']}), None)
+                link = next((item for item in read_links(path.parent)
+                             if stage_files.same_path(path, item['front_path']) or stage_files.same_path(path, item['composite_path'])), None)
                 if link: source_paths = [link['front_path'],link['composite_path']]
-                destination, size, changes, archived_source = save_enhanced_image(path, requested)
-                self.json(200, {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source), "source_paths":source_paths})
+                destination, size, changes, archived_source = save_enhanced_image(
+                    path, requested, allowed_roots=self.request_roots())
+                body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source) if archived_source else None, "source_paths":source_paths}
+                if stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == "/api/restore-preview":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
                 operation = data.get("operation", "")
                 image, _ = load_image(path)
                 if data.get("show_marks") and operation == "dust":
@@ -559,40 +1374,55 @@ class Handler(BaseHTTPRequestHandler):
                                                                    "X-Cropper-Useful": str(useful_change(changes)).lower()})
                 return
             if self.path == "/api/restore":
-                path = image_path(data.get("path", ""))
+                path = self.request_image(data.get("path", ""))
+                plans = [stage_files.plan(path, "enhance")]
+                self.confine_writes(plans)
+                refusal = self.confirm(plans, data)
+                if refusal:
+                    self.json(409, refusal)
+                    return
                 destination, size, changes, archived = save_restored_image(path, data.get("operation", ""), data.get("strokes"))
-                self.json(200, {"path": str(destination or path), "name": (destination or path).name,
+                saved = destination or path
+                body = {"path": str(saved), "name": saved.name,
                                 "width": size[0], "height": size[1], "changes": changes,
-                                "archived_path": str(archived) if archived else None, "skipped": destination is None})
+                                "archived_path": str(archived) if archived else None, "skipped": destination is None}
+                if destination is not None and stage_files.saved_protected(destination):
+                    body['protected_original'] = True
+                    body['protected_message'] = stage_files.protected_original_message(destination.name)
+                self.json(200, self.attach_granted(body))
                 return
             if self.path == '/api/colorization-candidates':
-                folder=clean_path(data.get('path',''))
+                folder=self.request_folder(data.get('path',''))
                 self.json(200, {'items':candidates(folder,read_links(folder))})
                 return
             if self.path == '/api/stage-finish':
                 requested = data.get('paths', [])
                 if not isinstance(requested, list) or not 1 <= len(requested) <= 1000:
                     raise ValueError('Select between 1 and 1000 photos to finish.')
-                paths = {image_path(value) for value in requested}
+                paths = {self.request_image(value) for value in requested}
                 # Resolve either selected member to its complete approved pair.
                 links = []
                 for folder in {path.parent for path in paths}:
                     for link in read_links(folder):
-                        members = {Path(link['front_path']), Path(link['composite_path'])}
-                        if paths & members:
-                            paths.update(image_path(str(member)) for member in members)
+                        members = [self.request_image(link['front_path']), self.request_image(link['composite_path'])]
+                        if any(stage_files.same_path(path, member) for path in paths for member in members):
+                            paths.update(members)
                             links.append(link)
                 pending = [item for folder in {path.parent for path in paths} for item in list_pending(folder)]
-                if any(Path(item['front_path']) in paths or Path(item.get('link', {}).get('composite_path', '')) in paths for item in pending):
+                if any(any(stage_files.same_path(item['front_path'], path) or
+                           (item.get('link', {}).get('composite_path') and
+                            stage_files.same_path(item['link']['composite_path'], path))
+                           for path in paths) for item in pending):
                     raise ValueError('Review or reject pending results before finishing these photos.')
                 planned = [stage_files.plan(path, 'finish') for path in sorted(paths)]
+                self.confine_writes(planned)
                 if data.get('dry_run', True):
                     self.json(200, {'items': [{'source': str(item['source']), 'snapshots': [str(p) for p in item['snapshots']]} for item in planned]})
                     return
                 # Each pair is atomic; report partial batch success explicitly.
                 remaining = set(paths)
                 finished, errors = [], []
-                groups = [[Path(link['front_path']), Path(link['composite_path'])] for link in links]
+                groups = [[self.request_image(link['front_path']), self.request_image(link['composite_path'])] for link in links]
                 paired = {path for group in groups for path in group}
                 groups += [[path] for path in sorted(paths - paired)]
                 for group in groups:
@@ -607,39 +1437,51 @@ class Handler(BaseHTTPRequestHandler):
                 self.json(200, {'finished': finished, 'errors': errors})
                 return
             if self.path == '/api/photo-pair-suggestions':
-                self.json(200, {'items': suggestions(clean_path(data.get('path', '')))})
+                self.json(200, {'items': suggestions(self.request_folder(data.get('path', '')))})
                 return
             if self.path == '/api/photo-link':
-                front = image_path(data.get('front_path', ''))
-                composite = image_path(data.get('composite_path', ''))
-                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'))
+                roots = allowed_roots_for(self.request_tab_id())
+                front_raw = data.get('front_path', '')
+                composite_raw = data.get('composite_path', '')
+                front = pair_image(front_raw, roots, 'front')
+                composite = pair_image(composite_raw, roots, 'back')
+                link = approve_link(front, composite, data.get('split', 50), data.get('layout', 'right'),
+                                    allowed_roots=roots)
                 for pending in list_pending(front.parent):
-                    if pending['front_path'] == str(front): attach_link(pending['id'], link)
+                    if stage_files.same_path(pending['front_path'], front): attach_link(pending['id'], link)
                 self.json(200, link)
                 return
             if self.path == "/api/chatgpt-generate":
                 operation=data.get('operation','restore')
                 if operation not in {'restore','colorize'}: raise ValueError('Invalid image operation.')
-                front = image_path(data.get("front_path", ""))
-                stage_files.plan(front, operation)  # Fail before paying for a request.
+                front = self.request_image(data.get("front_path", ""), label="Front image")
+                self.confine_writes([stage_files.plan(front, operation)])  # Fail before paying.
                 links = read_links(front.parent)
-                if any(item['composite_path'] == str(front) for item in links):
+                if any(stage_files.same_path(item['composite_path'], front) for item in links):
                     raise ValueError('This is a linked combined image. Select its standalone front or use Generate selected pairs.')
-                link = next((item for item in links if item['front_path'] == str(front)), None)
-                if link:
-                    composite = image_path(link['composite_path'])
-                    stage_files.plan(composite, operation)
-                if any(item["front_path"] == str(front) for item in list_pending(front.parent)):
+                link = next((item for item in links if stage_files.same_path(item['front_path'], front)), None)
+                composite = self.request_image(link['composite_path'], label='Back image') if link else None
+                if composite is not None:
+                    self.confine_writes([stage_files.plan(composite, operation)])
+                if any(stage_files.same_path(item["front_path"], front) for item in list_pending(front.parent)):
                     raise ValueError("This photo already has a pending AI result. Review it before generating another.")
+                plans = stage_files.prepare_ai_plans(front, operation, composite)
+                self.confine_writes(plans)
+                reserved = [item['output'] for item in plans if item.get('output') is not None]
                 try:
-                    front_png = edit_front(front,operation=operation) if operation=='colorize' else edit_front(front)
+                    front_png = edit_front(front, operation=operation)
                 except Exception as exc:
+                    stage_files.release_outputs(reserved)
                     self.json(*image_api_error(exc))
                     return
-                staged = save_pending(front, front_png, stage_routing=True)
-                if operation=='colorize': staged=set_operation(staged['id'],operation)
-                link = next((item for item in read_links(front.parent) if item['front_path'] == str(front)), None)
-                if link: staged = attach_link(staged['id'], link)
+                try:
+                    staged = save_pending(front, front_png, stage_routing=True, operation=operation,
+                                          output_paths=reserved)
+                    if link:
+                        staged = attach_link(staged['id'], link)
+                except Exception:
+                    stage_files.release_outputs(reserved)
+                    raise
                 self.json(200, staged)
                 return
             if self.path == '/api/chatgpt-resubmit':
@@ -650,16 +1492,18 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(include_previous, bool):
                     raise ValueError('Invalid previous-image option.')
                 record, _ = get_pending(data.get('id', ''))
-                front = image_path(record['front_path'])
+                front = self.request_image(record['front_path'], label="Front image")
                 with review_lock(front):
                     record, previous = get_pending(record['id'])
                     operation = record.get('operation', 'restore')
                     if operation not in {'restore', 'colorize'}:
                         raise ValueError('Invalid image operation.')
-                    stage_files.plan(front, operation)
+                    planned = [stage_files.plan(front, operation)]
                     if record.get('link'):
-                        composite = image_path(record['link']['composite_path'])
-                        stage_files.plan(composite, operation)
+                        composite = self.request_image(record['link']['composite_path'], label='Back image')
+                        planned.append(stage_files.plan(composite, operation))
+                    self.confine_writes(planned)
+                    stage_files.assert_plans_writable(planned)
                     comments = [*record.get('comments', []), comment.strip()]
                     if len(comments) > 20 or sum(map(len, comments)) > 12000:
                         raise ValueError('Correction history is too long. Reject these attempts and start again.')
@@ -673,7 +1517,9 @@ class Handler(BaseHTTPRequestHandler):
                                 'attempt': record.get('attempt', 1) + 1, 'comments': comments,
                                 'included_previous': include_previous}
                     if record.get('link'): revision['link'] = record['link']
-                    staged = save_pending(front, result, stage_routing=True, revision=revision)
+                    if record.get('output_path'): revision['output_path'] = record['output_path']
+                    if record.get('output_paths'): revision['output_paths'] = record['output_paths']
+                    staged = save_pending(front, result, stage_routing=True, operation=operation, revision=revision)
                     self.json(200, staged)
                 return
             if self.path in {"/api/chatgpt-accept", "/api/chatgpt-reject"}:
@@ -681,20 +1527,71 @@ class Handler(BaseHTTPRequestHandler):
                 record, image = get_pending(stage_id)
                 with review_lock(Path(record['front_path'])):
                     record, image = get_pending(stage_id)
-                    outputs = accept_linked(record, image.read_bytes()) if self.path.endswith("accept") else []
+                    if self.path.endswith("accept"):
+                        operation = record.get("operation") or "restore"
+                        front = self.request_image(record["front_path"], label="Front image")
+                        plans = [stage_files.plan(front, operation)]
+                        roots = stage_files.write_roots_for(self.request_roots())
+                        dests = [stage_files.resolve_in_allowed_roots(value, roots, label='The output')
+                                 for value in (record.get("output_paths") or [])]
+                        if record.get("output_path"):
+                            dests = [stage_files.resolve_in_allowed_roots(
+                                record["output_path"], roots, label='The output'), *dests]
+                        if dests:
+                            for item, dest in zip(plans, dests):
+                                item["output"] = dest
+                                item["overwrite"] = dest.exists() and (
+                                    bool(item.get("overwrite"))
+                                    or (app_settings.load_settings().get("conflict_policy") == "overwrite")
+                                )
+                        self.confine_writes(plans)
+                        refusal = self.confirm(plans, data)
+                        if refusal:
+                            self.json(409, refusal)
+                            return
+                    outputs = (accept_linked(record, image.read_bytes(), allowed_roots=self.request_roots())
+                               if self.path.endswith("accept") else [])
                     removed = [stage_id]
                     if outputs:
                         # Only one attempt can be filed for a source; discard unchosen variants after success.
                         removed = [item['id'] for item in list_pending(Path(record['front_path']).parent)
                                    if item['front_path'] == record['front_path']]
-                    for ident in removed: remove_pending(ident)
-                    self.json(200, {"paths": [str(path) for path in outputs], 'removed_ids': removed})
+                    held = []
+                    for ident in removed:
+                        try:
+                            held.extend(reserved_from_record(get_pending(ident)[0]))
+                        except (ValueError, OSError, json.JSONDecodeError):
+                            pass
+                        remove_pending(ident)
+                    stage_files.release_outputs(held)
+                    body = {"paths": [str(path) for path in outputs], 'removed_ids': removed}
+                    protected = [path for path in outputs if stage_files.saved_protected(path)]
+                    if protected:
+                        body['protected_original'] = True
+                        body['protected_message'] = stage_files.protected_original_message(protected[0].name)
+                    self.json(200, self.attach_granted(body))
+                return
+            if self.path == "/api/chatgpt-recovered-keep":
+                self.json(200, keep_recovered(data.get("id", "")))
+                return
+            if self.path == "/api/chatgpt-recovered-discard":
+                discard_recovered(data.get("id", ""))
+                self.json(200, {"removed": True})
                 return
             self.json(404, {"error": "Not found."})
         except PermissionError as exc:
-            self.json(403, {"code": "permission_denied", "error": "Cropper cannot write to this location. Choose another output folder or check this folder's permissions.", "path": exc.filename})
+            self.json(*stage_files.permission_error_response(exc))
+        except FolderDialogBusy as exc:
+            self.json(400, {"error": str(exc), "code": exc.code})
         except (ValueError, OSError, json.JSONDecodeError, cv2.error) as exc:
-            self.json(400, {"error": str(exc)})
+            payload = {"error": str(exc)}
+            code = getattr(exc, "code", None)
+            if code:
+                payload["code"] = code
+            self.json(400, payload)
+        finally:
+            if in_flight:
+                tab_request_end(tab_id)
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -702,17 +1599,35 @@ class LocalServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
+def resolve_port(cli_port: int | None) -> int:
+    """CLI --port wins; otherwise CROPPER_PORT; otherwise 8765."""
+    if cli_port is not None:
+        return int(cli_port)
+    raw = os.environ.get("CROPPER_PORT", "").strip()
+    if not raw:
+        return 8765
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError("CROPPER_PORT must be an integer port.") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Cropper locally")
-    parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+    parser.add_argument("--port", type=int, default=None, help="Port (default: CROPPER_PORT or 8765)")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--data-dir", default=None, help="Per-user data folder (default: %%APPDATA%%/Cropper)")
     args = parser.parse_args()
     app_settings.configure_runtime(args.data_dir)
     try:
-        server = LocalServer(("127.0.0.1", args.port), Handler)
+        port = resolve_port(args.port)
+    except ValueError as exc:
+        print(str(exc), flush=True)
+        sys.exit(1)
+    try:
+        server = LocalServer(("127.0.0.1", port), Handler)
     except OSError:
-        address = f"http://127.0.0.1:{args.port}"
+        address = f"http://127.0.0.1:{port}"
         try:
             with urlopen(address + "/api/session", timeout=1) as response:
                 active = json.load(response).get("app") == "Cropper"
@@ -723,7 +1638,7 @@ def main() -> None:
             if not args.no_browser:
                 webbrowser.open(address)
             return
-        print(f"Port {args.port} is already in use by another program.", flush=True)
+        print(f"Port {port} is already in use by another program.", flush=True)
         sys.exit(1)
     address = f"http://127.0.0.1:{server.server_port}"
     print(f"Cropper is running at {address}", flush=True)

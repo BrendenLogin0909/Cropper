@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from PIL import Image
+import app_settings
 import server
 import chatgpt_pending as pending
 
@@ -18,6 +19,7 @@ class ResubmitTests(unittest.TestCase):
     def test_attempts_preserved_history_links_routing_and_accept_cleanup(self):
         for operation in ('restore', 'colorize'):
             with self.subTest(operation=operation), TemporaryDirectory() as directory, ExitStack() as stack:
+                app_settings.configure_runtime(directory)
                 root = Path(directory)/'1.5. TBP Cropped'; root.mkdir(); store = Path(directory) / 'pending'
                 source = root / 'front.png'; composite = root / 'front-back.png'
                 image = io.BytesIO(); Image.new('RGB', (10, 10), 'gray').save(image, 'PNG')
@@ -29,6 +31,7 @@ class ResubmitTests(unittest.TestCase):
                     'get_pending': lambda ident: pending.get_pending(ident, store),
                     'save_pending': lambda source, png, **kw: pending.save_pending(source, png, store, **kw),
                     'list_pending': lambda folder: pending.list_pending(folder, store),
+                    'list_recovered': lambda: pending.list_recovered(store),
                     'remove_pending': lambda ident: pending.remove_pending(ident, store),
                 }.items(): stack.enter_context(patch.object(server, name, side_effect=function))
                 edit = stack.enter_context(patch.object(server, 'edit_front', return_value=image.getvalue()))
@@ -36,9 +39,17 @@ class ResubmitTests(unittest.TestCase):
                 threading.Thread(target=http.serve_forever, daemon=True).start()
                 stack.callback(http.server_close); stack.callback(http.shutdown)
 
+                tab = 'tabid-test-000001'
+                server.reset_tabs(); server.reset_confirmations()
+                server.register_tab(tab)
+                with patch.object(server, 'choose_folder_dialog', return_value=root):
+                    pick = Request(f'http://127.0.0.1:{http.server_port}/api/pick-folder', b'{}',
+                                   {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
+                    with urlopen(pick) as response: json.load(response)
+
                 def post(route, data):
                     request = Request(f'http://127.0.0.1:{http.server_port}{route}', json.dumps(data).encode(),
-                                      {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                                      {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
                     with urlopen(request) as response: return json.load(response)
 
                 with self.assertRaises(HTTPError): post('/api/chatgpt-resubmit', {'id': first['id'], 'comment': '  '})

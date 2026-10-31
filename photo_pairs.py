@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
 from app_settings import default_data_dir
+from stage_files import path_key, resolve_in_allowed_roots, same_path, write_roots_for
 
 ROOT = default_data_dir()
 LOCK = threading.Lock()
@@ -15,20 +16,34 @@ LOCK = threading.Lock()
 def read_links(folder):
     path = ROOT / 'photo-links.json'
     records = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-    return [item for item in records.values() if Path(item['front_path']).parent == folder.resolve()]
+    folder_key = path_key(folder)
+    return [item for item in records.values()
+            if path_key(Path(item['front_path']).parent) == folder_key
+            or path_key(Path(item['composite_path']).parent) == folder_key]
 
-def approve_link(front, composite, split, layout):
-    if front == composite or front.parent != composite.parent:
-        raise ValueError('Choose two different images in the same folder.')
+def approve_link(front, composite, split, layout, allowed_roots=None, root=None):
+    if composite is None or not str(composite).strip():
+        raise ValueError('Back image not found.')
+    if front is None or not str(front).strip():
+        raise ValueError('Front image not found.')
+    roots = allowed_roots
+    front = resolve_in_allowed_roots(front, roots, label='Front image')
+    composite = resolve_in_allowed_roots(composite, roots, label='Back image')
+    if not front.is_file():
+        raise ValueError('Front image not found.')
+    if not composite.is_file():
+        raise ValueError('Back image not found.')
+    if same_path(front, composite):
+        raise ValueError('Choose two different images: the front first, then its back.')
     if not 10 <= int(split) <= 90 or layout not in ('right', 'below'):
         raise ValueError('Choose a valid split boundary and back position.')
     with LOCK:
         ROOT.mkdir(parents=True, exist_ok=True)
         path = ROOT / 'photo-links.json'
         records = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
-        if any(v['composite_path'] == str(front) or (v['front_path'] == str(composite)) for v in records.values()):
+        if any(same_path(v['composite_path'], front) or same_path(v['front_path'], composite) for v in records.values()):
             raise ValueError('A file cannot be both a standalone front and a combined image in different links.')
-        if any(v['composite_path'] == str(composite) and k != str(front) for k,v in records.items()):
+        if any(same_path(v['composite_path'], composite) and not same_path(k, front) for k,v in records.items()):
             raise ValueError('This combined image is already linked to another front.')
         record = dict(front_path=str(front), composite_path=str(composite), split=int(split), layout=layout)
         records[str(front)] = record
@@ -69,15 +84,22 @@ def suggestions(folder):
         if best: results.append(best)
     return sorted(results, key=lambda item: -item['score'])
 
-def accept_linked(record, png):
+def accept_linked(record, png, allowed_roots=None):
     link = record.get('link')
     operation=record.get('operation','restore')
-    if not link: return file_accepted(Path(record['front_path']), png, operation=operation)
-    composite = Path(link['composite_path'])
+    reserved = record.get('output_paths') or ([record['output_path']] if record.get('output_path') else None)
+    if reserved:
+        reserved = [resolve_in_allowed_roots(path, write_roots_for(allowed_roots), label='The output')
+                    for path in reserved]
+    front = resolve_in_allowed_roots(record['front_path'], allowed_roots, label='Front image')
+    if not link: return file_accepted(front, png, operation=operation, output_paths=reserved)
+    composite = resolve_in_allowed_roots(link['composite_path'], allowed_roots, label='Back image')
     combined = reassemble(png, composite, link['split'], link['layout'])
-    outputs = file_accepted(Path(record['front_path']), png, composite, combined, operation=operation)
+    outputs = file_accepted(front, png, composite, combined, operation=operation,
+                            output_paths=reserved)
     try:
-        approve_link(outputs[0], outputs[1], link['split'], link['layout'])
+        approve_link(outputs[0], outputs[1], link['split'], link['layout'],
+                     allowed_roots=[outputs[0].parent, outputs[1].parent])
     except (OSError, ValueError) as error:
         warnings.warn(f'Images saved, but output pair link could not be carried forward: {error}')
     return outputs

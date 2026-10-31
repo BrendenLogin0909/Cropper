@@ -55,6 +55,7 @@ def _defaults() -> dict:
         "conflict_policy": "skip",
         "replace_original": False,
         "backup_originals": True,
+        "keep_gps": False,
         "output_folder": "",
     }
 
@@ -73,6 +74,15 @@ def load_settings() -> dict:
     quality = str(data.get("quality") or DEFAULT_QUALITY).strip().lower()
     data["quality"] = quality if quality in VALID_QUALITIES else DEFAULT_QUALITY
     data["guide_seen"] = bool(data.get("guide_seen"))
+    data["filename_template"] = str(data.get("filename_template") or "{name}{suffix}{ext}")
+    policy = str(data.get("conflict_policy") or "skip").strip().lower()
+    data["conflict_policy"] = policy if policy in {"skip", "overwrite", "auto-suffix"} else "skip"
+    data["replace_original"] = bool(data.get("replace_original"))
+    data["backup_originals"] = bool(data.get("backup_originals", True))
+    data["keep_gps"] = bool(data.get("keep_gps"))
+    if data["replace_original"] and not data["backup_originals"]:
+        data["replace_original"] = False
+    data["output_folder"] = str(data.get("output_folder") or "")
     return data
 
 
@@ -91,7 +101,8 @@ def save_settings(updates: dict) -> dict:
     if "guide_seen" in updates:
         data["guide_seen"] = bool(updates["guide_seen"])
     if "filename_template" in updates:
-        data["filename_template"] = str(updates["filename_template"] or "").strip() or "{name}{suffix}{ext}"
+        from stage_files import validate_template
+        data["filename_template"] = validate_template(str(updates["filename_template"] or "").strip())
     if "conflict_policy" in updates:
         policy = str(updates["conflict_policy"] or "").strip().lower()
         if policy not in {"skip", "overwrite", "auto-suffix"}:
@@ -101,6 +112,10 @@ def save_settings(updates: dict) -> dict:
         data["replace_original"] = bool(updates["replace_original"])
     if "backup_originals" in updates:
         data["backup_originals"] = bool(updates["backup_originals"])
+    if data.get("replace_original") and not data.get("backup_originals", True):
+        raise ValueError("Replace original needs backups on. Cropper will not modify the original.")
+    if "keep_gps" in updates:
+        data["keep_gps"] = bool(updates["keep_gps"])
     if "output_folder" in updates:
         data["output_folder"] = str(updates["output_folder"] or "").strip()
     path = settings_path()
@@ -237,6 +252,7 @@ def public_settings() -> dict:
         "conflict_policy": data.get("conflict_policy", "skip"),
         "replace_original": bool(data.get("replace_original")),
         "backup_originals": bool(data.get("backup_originals", True)),
+        "keep_gps": bool(data.get("keep_gps")),
         "output_folder": data.get("output_folder") or "",
         "has_key": bool(key),
         "key_masked": mask_key(key),

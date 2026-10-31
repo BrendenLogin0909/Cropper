@@ -8,10 +8,10 @@ steps require no API calls.
 ## Start
 
 Run `python server.py` in this folder. Default address: http://127.0.0.1:8765/.
-Use `--port 8767` if desired. Use `--data-dir` to choose Cropper's per-user
-folder (default `%APPDATA%\Cropper` on Windows). Restart the backend after
-Python updates; refresh the browser after UI updates. Dependencies are pinned
-in `requirements.txt`.
+`--port` wins if passed; otherwise `CROPPER_PORT` is used; otherwise 8765.
+Use `--data-dir` to choose Cropper's per-user folder (default `%APPDATA%\Cropper`
+on Windows). Restart the backend after Python updates; refresh the browser after
+UI updates. Dependencies are pinned in `requirements.txt`.
 
 ## One mandatory flat batch workflow
 
@@ -31,10 +31,14 @@ custom output subfolder, or switch to disable flat routing.
 Example progression: photo.jpg -> photo_c.jpg -> photo_c_e.jpg ->
 photo_c_e_ai.png -> photo_c_e_ai_col.png.
 
-Skipped snapshots are unchanged bytes, not improvements. Existing destinations
-are never overwritten; conflicting names stop saving. Queue sources leave only
-after required snapshots and output have been saved and verified. Nested stage
-inputs are rejected rather than creating another stage tree.
+Skipped snapshots are unchanged bytes, not improvements. By default existing destinations are never overwritten; conflicting names stop
+saving. Settings can switch that to Overwrite or Auto-suffix, and can set a
+filename template (`{name}`, `{date}`, `{index}`, `{ext}`). Replace original
+requires backups. Queue sources leave only after required snapshots and output
+have been saved and verified. Nested stage inputs are rejected rather than
+creating another stage tree. Paid AI names are reserved before the API call so
+a result is never stuck pending. Incomplete pending files appear under Recovered
+results; readable images can be kept or discarded, damaged images discarded only.
 
 Finish selected — no further changes files unchanged stage snapshots and clears
 the selected queue sources. Rejecting a pending AI result does NOT finish or

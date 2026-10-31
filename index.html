@@ -19,7 +19,6 @@
           <button class="tool-tab" id="chatgpt-tab" role="tab" aria-selected="false">ChatGPT Image Restoration</button>
           <button class="tool-tab" id="colorize-tab" role="tab" aria-selected="false">ChatGPT Image Colorization</button>
         </div>
-        <span class="local-pill"><i></i> Runs on this computer</span>
         <button class="button button-quiet" id="open-settings" title="Settings">Settings</button>
         <button class="button button-quiet" id="open-folder-top"><span class="icon">▣</span> Open folder</button>
       </div>
@@ -51,7 +50,7 @@
       <main class="main">
         <div id="crop-workspace">
         <div class="editor-top">
-          <div class="editor-title"><div class="eyebrow">PERSPECTIVE CROP</div><h1 id="image-title">Ready when you are</h1><p id="image-subtitle">Open a folder, then double-click an image to begin.</p></div>
+          <div class="editor-title"><div class="eyebrow">PERSPECTIVE CROP</div><h1 id="image-title">Ready when you are</h1><p id="image-subtitle">Open a folder, then double-click an image to begin.</p><p class="processing-location" data-testid="processing-location-crop">Local</p></div>
           <div class="navigation"><button class="icon-button" id="prev" title="Previous image (left arrow)" aria-label="Previous image">←</button><span id="position">— / —</span><button class="icon-button" id="next" title="Next image (right arrow)" aria-label="Next image">→</button></div>
         </div>
         <div class="crop-stage">
@@ -66,7 +65,7 @@
             <img id="photo" alt="Image to crop" draggable="false">
             <svg id="overlay" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
           </div>
-          <div id="zoom-label" class="zoom-label hidden"><span>⌕</span> Precision zoom ×3 <kbd>CTRL</kbd></div>
+          <div id="zoom-label" class="zoom-label hidden"><span>⌕</span> Precision zoom ×3 <kbd>SHIFT</kbd></div>
           <div class="canvas-help" id="canvas-help">Click the four corners in any order</div>
         </div>
         <section class="live-crop-preview" aria-labelledby="live-preview-title">
@@ -77,23 +76,23 @@
         </div>
         <div class="editor-bottom">
           <div class="progress-group"><div class="progress-dots" id="progress-dots"><span></span><span></span><span></span><span></span></div><div><strong id="step-title">Select four corners</strong><small id="step-detail">Click once for each corner, or drag a point to refine it.</small></div></div>
-          <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point (Ctrl+Z)">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Ctrl+Q or Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="predict-corners" title="Predict the photo corners locally (Ctrl+A)">✦ <span>Predict corners</span></button><button class="tool-button" id="select-whole" title="Select the full image boundary">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
+          <div class="editor-tools"><button class="tool-button" id="undo" title="Undo last point">↶ <span>Undo</span></button><button class="tool-button" id="reset" title="Clear all points (Backspace)">⌫ <span>Reset</span></button><button class="tool-button" id="predict-corners" title="Predict the photo corners locally">✦ <span>Predict corners</span></button><button class="tool-button" id="select-whole" title="Select the full image boundary">▣ <span>Whole image</span></button><span class="tool-divider"></span><button class="tool-button" id="rotate-left" title="Rotate crop left">↶ <span>Rotate</span></button><button class="tool-button" id="rotate-right" title="Rotate crop right">↷ <span>Rotate</span></button></div>
         </div>
-        <div class="shortcut-strip"><span><kbd>CTRL</kbd> hold to zoom</span><span><kbd>CTRL+A</kbd> predict corners</span><span><kbd>CTRL+Q</kbd> clear points</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
+        <div class="shortcut-strip"><span><kbd>SHIFT</kbd> hold to zoom</span><span><kbd>Ctrl</kbd><kbd>Z</kbd> undo point</span><span><kbd>Ctrl</kbd><kbd>Q</kbd> clear points</span><span><kbd>←</kbd><kbd>→</kbd> images</span><span><kbd>ENTER</kbd> save &amp; next</span></div>
         </div>
         <section id="merge-workspace" class="merge-workspace hidden" aria-labelledby="merge-title">
           <div class="editor-top merge-top">
-            <div class="editor-title"><div class="eyebrow">PHOTO PAIRING</div><h1 id="merge-title">Front + Back</h1><p>Click the front photo first, then the back photo in the Explorer.</p></div>
+            <div class="editor-title"><div class="eyebrow">PHOTO PAIRING</div><h1 id="merge-title">Front + Back</h1><p>Click the front photo first, then the back photo in the Explorer. Use Choose back… to open a folder of backs.</p><p class="processing-location" data-testid="processing-location-merge">Local</p></div>
           </div>
           <div class="merge-canvas">
             <div class="merge-instructions" id="merge-instructions"><span class="merge-step-number">1</span><strong>Select the front</strong><small>Its shape decides whether the back goes beside or below it.</small></div>
             <div id="merge-preview" class="merge-preview hidden" aria-live="polite"></div>
           </div>
-          <div class="merge-bottom"><p id="merge-summary">Choose the front photo, then the back photo.</p><button class="button button-quiet" id="merge-clear">Clear pair</button></div>
+          <div class="merge-bottom"><p id="merge-summary">Choose the front photo, then the back photo.</p><div class="merge-bottom-actions"><button class="button button-quiet" id="merge-choose-back">Choose back…</button><button class="button button-quiet" id="merge-clear">Clear pair</button></div></div>
         </section>
         <section id="enhance-workspace" class="enhance-workspace hidden" aria-labelledby="enhance-title">
           <div class="editor-top">
-            <div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="enhance-title">Auto improve</h1><p id="enhance-subtitle">Open any folder, then select photos to preview and improve.</p></div>
+            <div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="enhance-title">Auto improve</h1><p id="enhance-subtitle">Open any folder, then select photos to preview and improve.</p><p class="processing-location" data-testid="processing-location-enhance">Local</p></div>
           </div>
           <div class="enhance-toolbar"><span id="enhance-selection-count">0 selected</span><div><button id="enhance-select-all" class="button button-quiet">Select all</button><button id="enhance-clear" class="button button-quiet">Clear</button><button id="enhance-stop" class="button button-quiet hidden">Stop after current</button></div></div>
           <div class="enhance-preview-shell">
@@ -103,7 +102,7 @@
           <div class="enhance-bottom"><p id="enhance-changes">Each image is analysed separately. Review the preview before saving.</p><p id="enhance-progress" role="status" aria-live="polite"></p></div>
         </section>
         <section id="restore-workspace" class="enhance-workspace hidden" aria-labelledby="restore-title">
-          <div class="editor-top"><div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="restore-title">Dust repair</h1><p id="restore-subtitle">Open a folder, then select photos to preview.</p></div></div>
+          <div class="editor-top"><div class="editor-title"><div class="eyebrow">PHOTO RESTORATION</div><h1 id="restore-title">Dust repair</h1><p id="restore-subtitle">Open a folder, then select photos to preview.</p><p class="processing-location" data-testid="processing-location-restore">Local</p></div></div>
           <div class="enhance-toolbar"><span id="restore-selection-count">0 selected</span><div><button id="restore-mark-scratch" class="button button-quiet hidden" aria-pressed="false">Mark a scratch</button><button id="restore-clear-marks" class="button button-quiet hidden">Clear marks</button><button id="restore-show-marks" class="button button-quiet hidden" aria-pressed="false">Show repair marks</button><button id="restore-select-all" class="button button-quiet">Select all</button><button id="restore-clear" class="button button-quiet">Clear</button><button id="restore-stop" class="button button-quiet hidden">Stop after current</button></div></div>
           <div class="enhance-preview-shell">
             <div id="restore-empty" class="empty-state"><div class="empty-symbol">✦</div><h2>Preview this restoration</h2><p>Click a photo in the Explorer. Click more photos to include them in a batch.</p></div>
@@ -112,7 +111,7 @@
           <div class="enhance-bottom"><p id="restore-changes">Each image is analysed separately. Review the preview before saving.</p><p id="restore-progress" role="status" aria-live="polite"></p></div>
         </section>
         <section id="chatgpt-workspace" class="enhance-workspace hidden" aria-labelledby="chatgpt-title">
-          <div class="editor-top"><div class="editor-title"><div class="eyebrow">OPENAI API · PAID PER EDIT</div><h1 id="chatgpt-title">ChatGPT Image Restoration</h1><p>Restore standalone photos or approved linked pairs. Only the front goes to AI; the back is preserved locally.</p></div></div>
+          <div class="editor-top"><div class="editor-title"><div class="eyebrow">OPENAI API · PAID PER EDIT</div><h1 id="chatgpt-title">ChatGPT Image Restoration</h1><p>Restore standalone photos or approved linked pairs. Only the front goes to AI; the back is preserved locally.</p><p class="processing-location" data-testid="processing-location-chatgpt">OpenAI, uses your API key</p></div></div>
           <div class="enhance-toolbar"><span id="chatgpt-selection">0 selected · 0 queued · 0 pending review</span><div><button id="chatgpt-select-all" class="button button-quiet">Select all available</button><button id="chatgpt-clear" class="button button-quiet">Clear selection</button><button id="chatgpt-clear-queued" class="button button-quiet hidden">Clear queued</button><button id="chatgpt-stop" class="button button-quiet hidden">Stop after current</button></div></div>
           <div id="colorize-toolbar" class="enhance-toolbar hidden"><div><button id="colorize-scan" class="button button-quiet">Find B&amp;W / sepia (free)</button><button id="colorize-select" class="button button-quiet">Select suggested fronts</button><label><input type="checkbox" id="colorize-filter" checked> Show suggested only</label><label><input type="checkbox" id="colorize-manual"> Allow uncertain images manually</label></div><span id="colorize-status" role="status">Suggestions are estimates. Scanning makes no paid API calls.</span></div>
           <div class="enhance-preview-shell">
@@ -135,7 +134,7 @@
         <div class="settings-spacer"></div>
         <label class="toggle-line"><input type="checkbox" id="auto-next" checked><span class="switch"></span><span>Move to next image after saving</span></label>
         <button class="button button-primary save-button" id="save" disabled><span>Crop &amp; save</span><span>↗</span></button>
-        <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p></div>
+        <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p><button id="save-choose-output" class="button button-quiet">Choose another output folder</button></div>
         <div class="save-hint" id="save-hint">Select four corners to enable saving</div>
       </aside>
       <aside class="settings panel hidden" id="enhance-settings">
@@ -192,6 +191,11 @@
         <div class="settings-spacer"></div>
         <button class="button button-primary save-button" id="chatgpt-generate" disabled><span>Generate selected photos (paid)</span><span>✦</span></button>
         <button class="button button-quiet stage-finish-button" id="chatgpt-finish" disabled>Finish selected — no further changes</button>
+        <section id="chatgpt-recovered" class="settings-group hidden" aria-label="Recovered results">
+          <div class="section-label">RECOVERED RESULTS <span id="chatgpt-recovered-count">0</span></div>
+          <p class="aspect-note">These files were found on disk and were not deleted. Readable images can be kept or discarded. Damaged images can only be discarded. Guidance notes stay with Keep and are deleted with Discard.</p>
+          <div id="chatgpt-recovered-list" class="chatgpt-pending-list"></div>
+        </section>
         <div id="chatgpt-review-actions" class="hidden">
           <button class="button button-primary hidden" id="chatgpt-accept">Accept and file result</button>
           <div class="chatgpt-secondary-actions">
@@ -247,8 +251,44 @@
           <option value="high">High — about 20c per photo</option>
         </select>
       </label>
+      <label class="field"><span>Filename template</span><input id="settings-filename-template" spellcheck="false" value="{name}{suffix}{ext}"></label>
+      <p id="settings-filename-preview" class="aspect-note">Preview: photo_c.png</p>
+      <p class="aspect-note">Tokens: {name}, {date}, {index}, {ext}. Suffixes stay _c, _e, _ai, _col. Invalid characters are rejected.</p>
+      <label class="field"><span>If the output name already exists</span>
+        <select id="settings-conflict-policy">
+          <option value="skip" selected>Skip — keep the existing file</option>
+          <option value="overwrite">Overwrite</option>
+          <option value="auto-suffix">Auto-suffix</option>
+        </select>
+      </label>
+      <label class="toggle-line"><input type="checkbox" id="settings-backup-originals" checked><span class="switch"></span><span>Backup originals before Replace original</span></label>
+      <label class="toggle-line"><input type="checkbox" id="settings-replace-original"><span class="switch"></span><span>Replace original (requires backups)</span></label>
+      <label class="toggle-line"><input type="checkbox" id="settings-keep-gps"><span class="switch"></span><span>Keep GPS location in saved photos</span></label>
+      <p class="aspect-note">GPS is stripped by default. Turn this on only if you need location metadata in the output.</p>
+      <label class="field"><span>Output folder override</span>
+        <span class="browse-field"><input id="settings-output-folder" spellcheck="false" placeholder="Leave blank to use the batch stage folders"><button type="button" id="settings-output-browse" class="button button-quiet">Browse…</button></span>
+      </label>
     </div>
     <div class="chatgpt-zoom-tools"><button id="settings-save" class="button button-primary">Save settings</button></div>
+  </dialog>
+  <dialog id="overwrite-dialog" class="app-settings-dialog" aria-labelledby="overwrite-dialog-title">
+    <div class="chatgpt-preview-head"><h2 id="overwrite-dialog-title">Overwrite existing files?</h2></div>
+    <p>This batch would overwrite <strong id="overwrite-dialog-count">0</strong> existing file(s).</p>
+    <p id="overwrite-dialog-names" class="aspect-note"></p>
+    <label class="toggle-line"><input type="checkbox" id="overwrite-skip-batch"><span class="switch"></span><span>Don't ask again this batch</span></label>
+    <form method="dialog" class="chatgpt-zoom-tools" style="margin-top:12px">
+      <button class="button button-quiet" value="cancel" data-testid="overwrite-cancel">Cancel</button>
+      <button class="button button-primary" value="overwrite" data-testid="overwrite-confirm">Overwrite</button>
+    </form>
+  </dialog>
+  <dialog id="replace-dialog" class="app-settings-dialog" aria-labelledby="replace-dialog-title">
+    <div class="chatgpt-preview-head"><h2 id="replace-dialog-title">Replace original files?</h2></div>
+    <p>This batch would replace <strong id="replace-dialog-count">0</strong> original file(s). A backup is kept in 0. Backups until the new file is verified.</p>
+    <p id="replace-dialog-names" class="aspect-note"></p>
+    <form method="dialog" class="chatgpt-zoom-tools" style="margin-top:12px">
+      <button class="button button-quiet" value="cancel" data-testid="replace-cancel">Cancel</button>
+      <button class="button button-primary" value="replace" data-testid="replace-confirm">Replace</button>
+    </form>
   </dialog>
   <dialog id="first-run-dialog" aria-labelledby="first-run-title">
     <h2 id="first-run-title">Welcome to Cropper</h2>
@@ -257,6 +297,11 @@
     <p>3. Saves use the flat stage folders next to your batch.</p>
     <form method="dialog"><button class="button button-quiet" value="skip">Skip</button><button class="button button-primary" id="first-run-settings" value="settings">Open Settings</button></form>
   </dialog>
+  <div id="output-permission" class="save-error hidden" role="alert" style="position:fixed;right:18px;bottom:18px;z-index:25;max-width:360px">
+    <strong>Could not write files</strong>
+    <p id="output-permission-detail"></p>
+    <button id="choose-output-folder" class="button button-quiet">Choose another output folder</button>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>

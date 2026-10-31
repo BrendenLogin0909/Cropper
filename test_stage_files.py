@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -17,6 +18,13 @@ def png(colour='red'):
 
 
 class StageFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.data = TemporaryDirectory()
+        self.addCleanup(self.data.cleanup)
+        import app_settings
+        app_settings.configure_runtime(self.data.name)
+        self.addCleanup(lambda: setattr(app_settings, '_data_dir', None))
+
     def source(self, root, folder, name='photo_c.png'):
         source = root / folder / name
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -28,19 +36,19 @@ class StageFilesTests(unittest.TestCase):
             root = Path(tmp)
             source = root/'photo.png'; source.write_bytes(png())
             cropped, _ = save_image(source, [[0,0],[15,0],[15,15],[0,15]], {'stage_routing':True}, 0)
-            self.assertEqual(cropped,root/stages.CROP_QUEUE/'photo_c.png')
+            self.assertTrue(stages.same_path(cropped, root/stages.CROP_QUEUE/'photo_c.png'))
             self.assertFalse(source.exists())
             self.assertEqual((root/stages.ORIGINAL/'photo.png').read_bytes(),png())
             crop_bytes=cropped.read_bytes()
             enhanced,_,_,archive=save_enhanced_image(cropped,{'stage_routing':True})
-            self.assertEqual(enhanced,root/stages.ENHANCE_QUEUE/'photo_c_e.png')
+            self.assertTrue(stages.same_path(enhanced, root/stages.ENHANCE_QUEUE/'photo_c_e.png'))
             self.assertEqual(archive.read_bytes(),crop_bytes)
             enhanced_bytes=enhanced.read_bytes()
             ai=file_accepted(enhanced,png('blue'),stage_routing=True)[0]
-            self.assertEqual(ai,root/stages.AI_QUEUE/'photo_c_e_ai.png')
+            self.assertTrue(stages.same_path(ai, root/stages.AI_QUEUE/'photo_c_e_ai.png'))
             self.assertEqual((root/stages.ENHANCED/enhanced.name).read_bytes(),enhanced_bytes)
             colour=file_accepted(ai,png('green'),operation='colorize',stage_routing=True)[0]
-            self.assertEqual(colour,root/stages.COLOR/'photo_c_e_ai_col.png')
+            self.assertTrue(stages.same_path(colour, root/stages.COLOR/'photo_c_e_ai_col.png'))
             self.assertEqual((root/stages.AI/ai.name).read_bytes(),png('blue'))
             for folder in stages.STAGES:
                 self.assertFalse(list((root/folder).iterdir()))
@@ -103,12 +111,13 @@ class StageFilesTests(unittest.TestCase):
     def test_write_failure_removes_partial_outputs_and_keeps_sources(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);source=self.source(root,stages.CROP_QUEUE)
-            original_open=Path.open
-            def fail_output(path,*args,**kwargs):
-                if path.parent.name==stages.AI_QUEUE and args and args[0]=='xb':
+            original_replace=os.replace
+            def fail_output(src, dst, *args, **kwargs):
+                dest=Path(dst)
+                if dest.parent.name==stages.AI_QUEUE:
                     raise OSError('simulated disk error')
-                return original_open(path,*args,**kwargs)
-            with patch.object(Path,'open',fail_output):
+                return original_replace(src, dst, *args, **kwargs)
+            with patch.object(os,'replace',fail_output):
                 with self.assertRaises(OSError): file_accepted(source,png('blue'),stage_routing=True)
             self.assertTrue(source.exists())
             self.assertFalse((root/stages.CROPPED/source.name).exists())
@@ -123,17 +132,25 @@ class StageFilesTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root=Path(tmp);front=self.source(root,stages.CROP_QUEUE,'front_c.png')
             back=self.source(root,stages.CROP_QUEUE,'back_c.png')
-            output,_=save_merged_image(front,back,{'stage_routing':True},'front',0)
-            self.assertEqual(output.name,'front_front-back_c.png')
-            self.assertEqual(output.parent,front.parent)
+            output,_=save_merged_image(front,back,{'stage_routing':True},'front',0,allowed_roots=[front.parent])
+            self.assertEqual(output.name,'front_front-back.png')
+            self.assertTrue(stages.same_path(output.parent, front.parent))
             self.assertTrue(front.exists());self.assertTrue(back.exists())
 
     def test_invalid_stage_refused(self):
         with TemporaryDirectory() as tmp:
-            root=Path(tmp);source=self.source(root,'unrecognised')
-            with self.assertRaisesRegex(ValueError,'TBP stage'): stages.plan(source,'restore')
+            root=Path(tmp)
+            source=self.source(root,'unrecognised')
+            planned=stages.plan(source,'restore')
+            self.assertTrue(stages.same_path(planned['output'], source.parent/'photo_c_ai.png'))
+            self.assertTrue(planned.get('keep_source'))
+            finished=stages.plan(source,'finish')
+            self.assertTrue(finished.get('keep_source'))
+            self.assertIsNone(finished.get('output'))
             source=self.source(root,stages.AI_QUEUE)
-            with self.assertRaisesRegex(ValueError,'already completed'): stages.plan(source,'restore')
+            again=stages.plan(source,'restore')
+            self.assertTrue(again.get('keep_source'))
+            self.assertTrue(stages.same_path(again['output'], source.parent/'photo_c_ai.png'))
 
     def test_comment_cannot_replace_archive_filename(self):
         with TemporaryDirectory() as tmp:
@@ -153,8 +170,8 @@ class StageFilesTests(unittest.TestCase):
             composite=self.source(root,stages.CROP_QUEUE,'front-back_c.png')
             image=Image.new('RGB',(32,16),'green');image.paste(Image.new('RGB',(16,16),'red'),(0,0));image.save(composite)
             with patch.object(photo_pairs,'ROOT',root/'links'):
-                photo_pairs.approve_link(front,composite,50,'right')
-                save_enhanced_image(composite,{'stage_routing':True})
+                photo_pairs.approve_link(front,composite,50,'right',allowed_roots=[front.parent])
+                save_enhanced_image(composite,{'stage_routing':True},allowed_roots=[front.parent])
                 links=photo_pairs.read_links(root/stages.ENHANCE_QUEUE)
                 self.assertEqual(len(links),1)
             output=root/stages.ENHANCE_QUEUE/'front-back_c_e.png'

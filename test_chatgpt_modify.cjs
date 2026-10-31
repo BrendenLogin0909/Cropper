@@ -19,7 +19,7 @@ function harness() {
     stageRoutingEnabled:()=>false,chatgptReadyPaths:()=>[],updateColorizeToolbarControls:()=>{},
     chatgptOperation:'restore',colorScanning:false,colorScanFolder:'photos',selectedPairs:new Set(),
     combinedReview:false,chatgptCommentDrafts:new Map(),renderPhotoLinks:()=>{},renderImages:()=>{},
-    showChatgptPreview:()=>{},toast:()=>{},confirmChatgptResubmit:async()=>true,
+    showChatgptPreview:()=>{},toast:()=>{},confirmChatgptResubmit:async()=>true,offerChooseOutputFolder:()=>false,
     api:async(route,body)=>{
       requests.push({route,body});
       if(route==='/api/chatgpt-resubmit') {const pending=deferred();paid.push(pending);return pending.promise;}
@@ -102,6 +102,20 @@ test('separate modifications can finish independently without releasing each oth
   assert.equal(h.controls['chatgpt-accept'].disabled,true);
   h.paid[1].resolve({id:'second-corrected',front_path:'second.png',attempt:2});await second;
   assert.equal(h.current.resubmissions.size,0);assert.equal(h.current.review.id,'second-corrected');
+});
+
+test('accept label names the other attempt count', () => {
+  const h=harness();
+  h.current.pending.push({id:'alt',front_path:'first.png'});
+  h.current.pending.push({id:'alt2',front_path:'first.png'});
+  h.updateChatgptControls();
+  assert.equal(h.controls['chatgpt-accept'].textContent,'Accept this version and discard the other 2 attempts');
+  h.current.pending=h.current.pending.filter(item=>item.id!=='alt2');
+  h.updateChatgptControls();
+  assert.equal(h.controls['chatgpt-accept'].textContent,'Accept this version and discard the other 1 attempt');
+  h.reviewChatgptItem(h.second);
+  h.updateChatgptControls();
+  assert.equal(h.controls['chatgpt-accept'].textContent,'Accept and file result');
 });
 
 test('failed modification preserves the previous attempt and reports its error without overwriting another review', async () => {

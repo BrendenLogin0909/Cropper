@@ -16,7 +16,8 @@ function generatorHarness(operation, concurrency, request) {
     stageRoutingEnabled:()=>true, setTimeout, Date,
     $:id=>controls[id] ||= {}, renderImages:()=>{}, updateChatgptControls:()=>{},
     showChatgptPreview:()=>{}, toast:()=>{}, reviewChatgptItem:item=>{current.review=item;},
-    api:async (route,body)=>request(body)};
+    offerChooseOutputFolder:()=>false,
+    api:async (route,body)=>route==='/api/begin-batch' ? {batch_id:'test-batch'} : request(body)};
   const generate = vm.runInNewContext(
     between('function chatgptReadyPaths(', 'function updateChatgptControls(') + queueSource +
     between('async function generateChatgpt(', 'async function finishChatgpt(') + '\ngenerateChatgpt', context);
@@ -101,7 +102,7 @@ function reviewHarness(items,selectedId,accept,arriving=[]) {
   const context={state:{chatgpt:current,images:items.map(item=>({path:item.front_path}))},
     api:async()=>{current.pending.push(...arriving);},$:()=>({}),selectedPairs:new Set(),
     renderPhotoLinks:()=>{},renderImages:()=>{},updateChatgptControls:()=>{},showChatgptPreview:()=>{},
-    reviewChatgptItem:item=>{current.review=item;},toast:()=>{}};
+    reviewChatgptItem:item=>{current.review=item;},toast:()=>{},offerChooseOutputFolder:()=>false};
   const finish=vm.runInNewContext(between('async function finishChatgpt(', 'function confirmChatgptResubmit(')+'\nfinishChatgpt',context);
   return finish(accept).then(()=>current);
 }
