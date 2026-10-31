@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image, ImageOps
 from chatgpt_restore import reassemble, file_accepted
 from app_settings import default_data_dir
-from stage_files import path_key, resolve_in_allowed_roots, same_path
+from stage_files import path_key, resolve_in_allowed_roots, same_path, write_roots_for
 
 ROOT = default_data_dir()
 LOCK = threading.Lock()
@@ -84,16 +84,18 @@ def suggestions(folder):
         if best: results.append(best)
     return sorted(results, key=lambda item: -item['score'])
 
-def accept_linked(record, png):
+def accept_linked(record, png, allowed_roots=None):
     link = record.get('link')
     operation=record.get('operation','restore')
     reserved = record.get('output_paths') or ([record['output_path']] if record.get('output_path') else None)
     if reserved:
-        reserved = [Path(path) for path in reserved]
-    if not link: return file_accepted(Path(record['front_path']), png, operation=operation, output_paths=reserved)
-    composite = Path(link['composite_path'])
+        reserved = [resolve_in_allowed_roots(path, write_roots_for(allowed_roots), label='The output')
+                    for path in reserved]
+    front = resolve_in_allowed_roots(record['front_path'], allowed_roots, label='Front image')
+    if not link: return file_accepted(front, png, operation=operation, output_paths=reserved)
+    composite = resolve_in_allowed_roots(link['composite_path'], allowed_roots, label='Back image')
     combined = reassemble(png, composite, link['split'], link['layout'])
-    outputs = file_accepted(Path(record['front_path']), png, composite, combined, operation=operation,
+    outputs = file_accepted(front, png, composite, combined, operation=operation,
                             output_paths=reserved)
     try:
         approve_link(outputs[0], outputs[1], link['split'], link['layout'],

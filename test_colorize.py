@@ -61,7 +61,7 @@ class ColorizationTests(unittest.TestCase):
             combined=Image.new('RGB',(40,30),'ivory');combined.save(composite)
             record={'front_path':str(front),'operation':'colorize','link':{'composite_path':str(composite),'split':50,'layout':'right'}}
             with patch.object(photo_pairs,'ROOT',root/'store'):
-                outputs=photo_pairs.accept_linked(record,png(Image.new('RGB',(20,30),'red')))
+                outputs=photo_pairs.accept_linked(record,png(Image.new('RGB',(20,30),'red')),allowed_roots=[root])
                 self.assertTrue(stages.same_path(photo_pairs.read_links(outputs[0].parent)[0]['composite_path'], outputs[1]))
             self.assertTrue(all(path.parent.name=='4.1.1. AI Colourised' for path in outputs))
             self.assertTrue((root.parent/'2. Cropped'/'front.png').exists())

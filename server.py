@@ -408,19 +408,19 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
 
 
 
-def save_enhanced_image(source: Path, settings: dict) -> tuple[Path, tuple[int, int], list[str], Path]:
+def save_enhanced_image(source: Path, settings: dict, allowed_roots=None) -> tuple[Path, tuple[int, int], list[str], Path]:
     stage_files.plan(source, 'enhance')
     link = next((item for item in read_links(source.parent)
                  if stage_files.same_path(source, item['front_path']) or stage_files.same_path(source, item['composite_path'])), None)
     if link:
-        source = image_path(link['front_path'])
+        source = pair_image(link['front_path'], allowed_roots, 'front')
     image, info = load_image(source)
     enhanced, changes = auto_enhance(image)
     planned = stage_files.plan(source, 'enhance')
     sources, payloads = [source], [rendered_bytes(enhanced, source.suffix, info)]
     if link:
         from chatgpt_restore import reassemble
-        composite = image_path(link['composite_path'])
+        composite = pair_image(link['composite_path'], allowed_roots, 'back')
         stage_files.plan(composite, 'enhance')
         _, composite_info = load_image(composite)
         combined = reassemble(rendered_bytes(enhanced, '.png', info), composite, link['split'], link['layout'])
@@ -630,9 +630,15 @@ def _secret_matches(stored: str, given: str) -> bool:
     return secrets.compare_digest(stored, given)
 
 
-def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
-                      tab_id: str, now: float | None = None) -> dict | None:
-    """Return a live same-session, same-tab record, or None. Does not check target coverage."""
+def _batch_id_matches(record: dict, payload: dict | None) -> bool:
+    given = str((payload or {}).get("batch_id") or "")
+    stored = str(record.get("batch_id") or "")
+    return bool(given) and bool(stored) and _secret_matches(stored, given)
+
+
+def _live_record(token: str, kind: str, session: str, tab_id: str,
+                 now: float | None = None) -> dict | None:
+    """Return a live same-session, same-tab record, or None. Does not check batch or targets."""
     tab_id = normalize_tab_id(tab_id)
     if not token or not tab_id or not tab_is_registered(tab_id, session):
         return None
@@ -649,15 +655,26 @@ def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
         if record["expires"] <= stamp:
             CONFIRMATIONS.pop(token, None)
             return None
-        if record["batch"] != _batch_key(plans):
-            return None
         return record
+
+
+def _record_for_token(token: str, kind: str, plans: list[dict], session: str,
+                      tab_id: str, now: float | None = None) -> dict | None:
+    """Return a live same-session, same-tab record, or None. Does not check target coverage."""
+    record = _live_record(token, kind, session, tab_id, now)
+    if record is None or record["batch"] != _batch_key(plans):
+        return None
+    return record
 
 
 def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
                        session: str | None = None, payload: dict | None = None,
                        tab_id: str | None = None, scope: str | None = None) -> str:
-    """Mint a random in-memory token bound to this session, tab, server batch id, and targets."""
+    """Mint a random in-memory token bound to this session, tab, server batch id, and targets.
+
+    Overwrite tokens start as file-scoped. Don't-ask-again calls
+    confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
+    """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     covered = set(_target_keys(targets))
@@ -691,7 +708,12 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
 
 def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: list[Path],
                         session: str | None = None, tab_id: str | None = None) -> bool:
-    """True only for a live registered-tab token. File tokens are single-use; flags never widen them."""
+    """True only for a live registered-tab token whose batch_id matches.
+
+    File tokens are single-use. skip_overwrite_prompt and confirm_replace never
+    widen a file token; Don't-ask-again is POST /api/confirm-overwrite-batch.
+    Batch tokens stay reusable within their server-held batch (_batch_key).
+    """
     _clear_granted()
     flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
     if not any(payload.get(flag) for flag in flags):
@@ -700,26 +722,52 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     record = _record_for_token(token, kind, plans, session, tab_id)
-    if record is None:
+    if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
+        if kind == "overwrite" and not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+            return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
         return True
     if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
         return False
-    promoted = None
-    if kind == "overwrite" and payload.get("skip_overwrite_prompt"):
-        promoted = issue_confirmation(kind, plans, targets, session, payload, tab_id, scope="batch")
     with CONFIRMATIONS_LOCK:
         CONFIRMATIONS.pop(token, None)
-    if promoted:
-        with CONFIRMATIONS_LOCK:
-            live = CONFIRMATIONS.get(promoted) or {}
-            batch_id = live.get("batch_id")
-        _GRANTED.token = promoted
-        _GRANTED.batch_id = batch_id
     return True
+
+
+def confirm_overwrite_batch(payload: dict, session: str | None = None,
+                            tab_id: str | None = None) -> dict:
+    """Issue a batch-wide token for Don't-ask-again. The file token is left unchanged.
+
+    Requires a live overwrite token, the server-issued batch_id, and
+    skip_overwrite_prompt. The new token covers only the targets already stored
+    on that record for that batch_id. Crop/enhance/restore flags never do this.
+    """
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    if not payload.get("skip_overwrite_prompt"):
+        raise ValueError("Don't ask again requires confirmation of this batch.")
+    token = str(payload.get("confirmation_token") or "")
+    record = _live_record(token, "overwrite", session, tab_id)
+    if record is None or not _batch_id_matches(record, payload):
+        raise ValueError("That confirmation is no longer valid.")
+    granted = {
+        "kind": "overwrite",
+        "session": record["session"],
+        "tab_id": record["tab_id"],
+        "batch": record["batch"],
+        "batch_id": record["batch_id"],
+        "scope": "batch",
+        "targets": frozenset(record.get("targets") or ()),
+        "expires": time.time() + CONFIRMATION_TTL_SECONDS,
+    }
+    minted = secrets.token_urlsafe(32)
+    with CONFIRMATIONS_LOCK:
+        _purge_confirmations_locked()
+        CONFIRMATIONS[minted] = granted
+    return _confirmation_public(minted)
 
 
 def overwrite_response(plans: list[dict], data: dict | None, session: str | None = None,
@@ -1027,9 +1075,16 @@ class Handler(BaseHTTPRequestHandler):
                         "replace", plans, replaces, TOKEN, data, tab_id)
                     body["replace_confirmation_token"] = replace_token
                     public = _confirmation_public(replace_token)
+                    if public.get("batch_id"):
+                        body["replace_batch_id"] = public["batch_id"]
                     if public.get("batch_id") and "batch_id" not in body:
                         body["batch_id"] = public["batch_id"]
                 self.json(200, body)
+                return
+            if self.path == "/api/confirm-overwrite-batch":
+                if not isinstance(data, dict):
+                    raise ValueError("That confirmation is no longer valid.")
+                self.json(200, confirm_overwrite_batch(data, TOKEN, self.request_tab_id()))
                 return
             if self.path == "/api/crop":
                 path = self.request_image(data.get("path", ""))
@@ -1083,7 +1138,8 @@ class Handler(BaseHTTPRequestHandler):
                 link = next((item for item in read_links(path.parent)
                              if stage_files.same_path(path, item['front_path']) or stage_files.same_path(path, item['composite_path'])), None)
                 if link: source_paths = [link['front_path'],link['composite_path']]
-                destination, size, changes, archived_source = save_enhanced_image(path, requested)
+                destination, size, changes, archived_source = save_enhanced_image(
+                    path, requested, allowed_roots=self.request_roots())
                 body = {"path": str(destination), "name": destination.name, "width": size[0], "height": size[1], "changes": changes, "archived_path": str(archived_source) if archived_source else None, "source_paths":source_paths}
                 if stage_files.saved_protected(destination):
                     body['protected_original'] = True
@@ -1276,9 +1332,12 @@ class Handler(BaseHTTPRequestHandler):
                         operation = record.get("operation") or "restore"
                         front = self.request_image(record["front_path"], label="Front image")
                         plans = [stage_files.plan(front, operation)]
-                        dests = [Path(value) for value in (record.get("output_paths") or [])]
+                        roots = stage_files.write_roots_for(self.request_roots())
+                        dests = [stage_files.resolve_in_allowed_roots(value, roots, label='The output')
+                                 for value in (record.get("output_paths") or [])]
                         if record.get("output_path"):
-                            dests = [Path(record["output_path"]), *dests]
+                            dests = [stage_files.resolve_in_allowed_roots(
+                                record["output_path"], roots, label='The output'), *dests]
                         if dests:
                             for item, dest in zip(plans, dests):
                                 item["output"] = dest
@@ -1290,7 +1349,8 @@ class Handler(BaseHTTPRequestHandler):
                         if refusal:
                             self.json(409, refusal)
                             return
-                    outputs = accept_linked(record, image.read_bytes()) if self.path.endswith("accept") else []
+                    outputs = (accept_linked(record, image.read_bytes(), allowed_roots=self.request_roots())
+                               if self.path.endswith("accept") else [])
                     removed = [stage_id]
                     if outputs:
                         # Only one attempt can be filed for a source; discard unchosen variants after success.

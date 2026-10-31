@@ -721,6 +721,7 @@ class OutputHandlingTests(unittest.TestCase):
                 'id': record['id'],
                 'confirm_replace': True,
                 'confirmation_token': body['confirmation_token'],
+                'batch_id': body['batch_id'],
             }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue(source.read_bytes().startswith(b'\xff\xd8'))
@@ -1198,11 +1199,13 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertEqual(status, 409)
             self.assertEqual(body['code'], 'overwrite_confirmation_required')
             token = body['confirmation_token']
+            batch_id = body['batch_id']
             with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
                 status, other_body = self._json(http.server_port, '/api/merge', {
                     'front_path': str(front), 'back_path': str(back),
                     'name_source': 'front', 'back_rotation': 0, 'settings': {},
                     'confirm_overwrite': True, 'confirmation_token': token,
+                    'batch_id': batch_id,
                 }, tab=other)
             self.assertEqual(status, 409)
             with patch.object(stages, '_settings', return_value=self._non_stage_settings(conflict_policy='overwrite')):
@@ -1210,6 +1213,7 @@ class OutputHandlingTests(unittest.TestCase):
                     'front_path': str(front), 'back_path': str(back),
                     'name_source': 'front', 'back_rotation': 0, 'settings': {},
                     'confirm_overwrite': True, 'confirmation_token': token,
+                    'batch_id': batch_id,
                 }, tab=tab)
             self.assertEqual(status, 200)
             self.assertEqual(body['name'], 'front_front-back.jpg')
@@ -1423,6 +1427,14 @@ class OutputHandlingTests(unittest.TestCase):
         server.register_tab(tab_id)
         return tab_id
 
+    def _ack(self, body, **flags):
+        ack = {
+            'confirmation_token': body['confirmation_token'],
+            'batch_id': body['batch_id'],
+        }
+        ack.update(flags)
+        return ack
+
     def _get(self, port, path, tab=None):
         headers = {'X-Cropper-Token': server.TOKEN}
         if tab:
@@ -1536,8 +1548,12 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertIsNotNone(server.overwrite_response(plans, {
                 'skip_overwrite_prompt': True, 'confirmation_token': token,
             }, tab_id='tabid-unregistered01'))
+            self.assertIsNotNone(server.overwrite_response(plans, {
+                'skip_overwrite_prompt': True, 'confirmation_token': token,
+            }, tab_id=tab))
             self.assertIsNone(server.overwrite_response(plans, {
                 'skip_overwrite_prompt': True, 'confirmation_token': token,
+                'batch_id': refusal['batch_id'],
             }, tab_id=tab))
             other_refusal = server.overwrite_response(other_plans, {
                 'skip_overwrite_prompt': True, 'confirmation_token': token,
@@ -1576,13 +1592,13 @@ class OutputHandlingTests(unittest.TestCase):
         })
         stdout = io.StringIO()
         with patch('sys.stdout', stdout):
-            status, body = self._json(http.server_port, '/api/crop', {
+            status, first_409 = self._json(http.server_port, '/api/crop', {
                 'path': str(crop_source), 'points': corners, 'rotation': 0,
                 'skip_overwrite_prompt': True,
             }, tab=tab)
         self.assertEqual(status, 409)
-        self.assertEqual(body['code'], 'overwrite_confirmation_required')
-        crop_token = body['confirmation_token']
+        self.assertEqual(first_409['code'], 'overwrite_confirmation_required')
+        crop_token = first_409['confirmation_token']
         self.assertNotIn(crop_token, stdout.getvalue())
         computed = hashlib.sha256(
             stages.path_key(Path(self.folder.name)).encode('utf-8')
@@ -1594,24 +1610,17 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 409)
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(crop_source), 'points': corners, 'rotation': 0,
-            'skip_overwrite_prompt': True, 'confirmation_token': crop_token,
+            **self._ack(first_409, skip_overwrite_prompt=True),
         }, tab=tab)
         self.assertEqual(status, 200)
         self.assertEqual(result['name'], 'photo_c.png')
-        batch_token = result['confirmation_token']
-        self.assertTrue(batch_token)
-        self.assertNotEqual(batch_token, crop_token)
+        self.assertFalse(result.get('confirmation_token'))
         status, reused = self._json(http.server_port, '/api/crop', {
             'path': str(other_crop), 'points': corners, 'rotation': 0,
             'skip_overwrite_prompt': True, 'confirmation_token': crop_token,
+            'batch_id': first_409['batch_id'],
         }, tab=tab)
         self.assertEqual(status, 409)
-        status, result = self._json(http.server_port, '/api/crop', {
-            'path': str(other_crop), 'points': corners, 'rotation': 0,
-            'skip_overwrite_prompt': True, 'confirmation_token': batch_token,
-        }, tab=tab)
-        self.assertEqual(status, 200)
-        self.assertEqual(result['name'], 'photo2_c.png')
 
         third = Path(self.folder.name) / 'photo3.png'
         fourth = Path(self.folder.name) / 'photo4.png'
@@ -1625,14 +1634,16 @@ class OutputHandlingTests(unittest.TestCase):
         }, tab=tab)
         self.assertEqual(status, 409)
         file_token = body['confirmation_token']
+        file_batch = body['batch_id']
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(third), 'points': corners, 'rotation': 0,
-            'confirm_overwrite': True, 'confirmation_token': file_token,
+            **self._ack(body, confirm_overwrite=True),
         }, tab=tab)
         self.assertEqual(status, 200)
         status, body = self._json(http.server_port, '/api/crop', {
             'path': str(fourth), 'points': corners, 'rotation': 0,
             'confirm_overwrite': True, 'confirmation_token': file_token,
+            'batch_id': file_batch,
         }, tab=tab)
         self.assertEqual(status, 409)
         self.assertEqual(body['code'], 'overwrite_confirmation_required')
@@ -1651,7 +1662,7 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertRegex(unregistered['error'], 'outside the allowed folder')
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(fourth), 'points': corners, 'rotation': 0,
-            'confirm_overwrite': True, 'confirmation_token': photo4_token,
+            **self._ack(body, confirm_overwrite=True),
         }, tab=tab)
         self.assertEqual(status, 200)
 
@@ -1695,8 +1706,12 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertIsNotNone(server.replace_response(plans, {
                 'confirm_replace': True, 'confirmation_token': token,
             }, tab_id=other_tab))
+            self.assertIsNotNone(server.replace_response(plans, {
+                'confirm_replace': True, 'confirmation_token': token,
+            }, tab_id=tab))
             self.assertIsNone(server.replace_response(plans, {
                 'confirm_replace': True, 'confirmation_token': token,
+                'batch_id': refusal['batch_id'],
             }, tab_id=tab))
             other_dir = TemporaryDirectory()
             self.addCleanup(other_dir.cleanup)
@@ -1705,6 +1720,7 @@ class OutputHandlingTests(unittest.TestCase):
             other_plans = [stages.plan(other_photo, 'crop')]
             second = server.replace_response(other_plans, {
                 'confirm_replace': True, 'confirmation_token': token,
+                'batch_id': refusal['batch_id'],
             }, tab_id=tab)
             self.assertIsNotNone(second)
             self.assertEqual(second['code'], 'replace_confirmation_required')
@@ -1716,15 +1732,18 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body['code'], 'replace_confirmation_required')
         token = body['confirmation_token']
-        status, body = self._json(http.server_port, '/api/crop', {
+        replace_batch = body['batch_id']
+        status, skipped = self._json(http.server_port, '/api/crop', {
             'path': str(photo1), 'points': corners, 'rotation': 0,
             'skip_overwrite_prompt': True, 'confirmation_token': token,
+            'batch_id': replace_batch,
         }, tab=tab)
         self.assertEqual(status, 409)
-        self.assertEqual(body['code'], 'replace_confirmation_required')
+        self.assertEqual(skipped['code'], 'replace_confirmation_required')
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(photo1), 'points': corners, 'rotation': 0,
             'confirm_replace': True, 'confirmation_token': token,
+            'batch_id': replace_batch,
         }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue(photo1.exists())
@@ -1733,9 +1752,271 @@ class OutputHandlingTests(unittest.TestCase):
         status, result = self._json(http.server_port, '/api/crop', {
             'path': str(photo2), 'points': corners, 'rotation': 0,
             'confirm_replace': True, 'confirmation_token': token,
+            'batch_id': replace_batch,
         }, tab=tab)
         self.assertEqual(status, 200)
         self.assertTrue((root / stages.BACKUPS / photo2.name).is_file())
+
+    def test_confirm_overwrite_batch_issues_batch_token(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo1 = root / 'photo.png'
+        photo2 = root / 'photo2.png'
+        Image.new('RGB', (16, 16), 'red').save(photo1)
+        Image.new('RGB', (16, 16), 'blue').save(photo2)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        (queue / 'photo2_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        status, preview = self._json(http.server_port, '/api/overwrite-preview', {
+            'paths': [str(photo1), str(photo2)], 'operation': 'crop',
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(preview['count'], 2)
+        status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+            **self._ack(preview, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertTrue(confirmed['confirmation_token'])
+        self.assertNotEqual(confirmed['confirmation_token'], preview['confirmation_token'])
+        self.assertEqual(confirmed['batch_id'], preview['batch_id'])
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, first = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertEqual(first['name'], 'photo_c.png')
+        status, second = self._json(http.server_port, '/api/crop', {
+            'path': str(photo2), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertEqual(second['name'], 'photo2_c.png')
+
+    def test_batch_token_rejected_for_unlisted_file(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        listed = root / 'listed.png'
+        extra = root / 'extra.png'
+        Image.new('RGB', (16, 16), 'red').save(listed)
+        Image.new('RGB', (16, 16), 'blue').save(extra)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'listed_c.png').write_bytes(png('gray'))
+        (queue / 'extra_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, refusal = self._json(http.server_port, '/api/crop', {
+            'path': str(listed), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+            **self._ack(refusal, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(extra), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'overwrite_confirmation_required')
+
+    def test_file_token_plus_skip_never_widens(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo1 = root / 'photo.png'
+        photo2 = root / 'photo2.png'
+        Image.new('RGB', (16, 16), 'red').save(photo1)
+        Image.new('RGB', (16, 16), 'blue').save(photo2)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        (queue / 'photo2_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, refusal = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(photo1), 'points': corners, 'rotation': 0,
+            **self._ack(refusal, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertFalse(result.get('confirmation_token'))
+        status, second = self._json(http.server_port, '/api/crop', {
+            'path': str(photo2), 'points': corners, 'rotation': 0,
+            **self._ack(refusal, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(second['code'], 'overwrite_confirmation_required')
+
+    def test_bogus_batch_id_is_rejected(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, refusal = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        computed = stages.batch_id_for([stages.plan(photo, 'crop')])
+        for bogus in ('', 'forged-batch', computed, refusal['confirmation_token']):
+            status, body = self._json(http.server_port, '/api/crop', {
+                'path': str(photo), 'points': corners, 'rotation': 0,
+                'skip_overwrite_prompt': True,
+                'confirmation_token': refusal['confirmation_token'],
+                'batch_id': bogus,
+            }, tab=tab)
+            self.assertEqual(status, 409, bogus)
+            self.assertEqual(body['code'], 'overwrite_confirmation_required')
+            status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+                'skip_overwrite_prompt': True,
+                'confirmation_token': refusal['confirmation_token'],
+                'batch_id': bogus,
+            }, tab=tab)
+            self.assertEqual(status, 400, bogus)
+
+    def test_file_token_cannot_be_replayed(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        existing = queue / 'photo_c.png'
+        existing.write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, refusal = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+            **self._ack(refusal, confirm_overwrite=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        existing.write_bytes(png('gray'))
+        status, replay = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+            **self._ack(refusal, confirm_overwrite=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(replay['code'], 'overwrite_confirmation_required')
+
+    def test_enhance_rejects_stored_link_outside_tab_roots(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        allowed = Path(self.folder.name) / 'allowed'
+        outside = Path(self.folder.name) / 'outside'
+        allowed.mkdir()
+        outside.mkdir()
+        front = allowed / 'front.png'
+        secret = outside / 'secret.png'
+        Image.new('RGB', (16, 16), 'red').save(front)
+        Image.new('RGB', (32, 16), 'blue').save(secret)
+        self._open_folder(http.server_port, allowed, tab)
+        store = Path(self.folder.name) / 'links'
+        store.mkdir()
+        (store / 'photo-links.json').write_text(json.dumps({
+            str(front): {
+                'front_path': str(front),
+                'composite_path': str(secret),
+                'split': 50,
+                'layout': 'right',
+            },
+        }), encoding='utf-8')
+        with patch.object(photo_pairs, 'ROOT', store):
+            status, body = self._json(http.server_port, '/api/enhance', {
+                'path': str(front), 'settings': {},
+            }, tab=tab)
+        self.assertEqual(status, 400)
+        self.assertRegex(body['error'], 'outside the allowed folder')
+
+    def test_accept_rejects_stored_link_outside_tab_roots(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        allowed = Path(self.folder.name) / 'allowed'
+        outside = Path(self.folder.name) / 'outside'
+        allowed.mkdir()
+        outside.mkdir()
+        front = allowed / 'front.png'
+        secret = outside / 'secret.png'
+        Image.new('RGB', (16, 16), 'red').save(front)
+        Image.new('RGB', (32, 16), 'blue').save(secret)
+        self._open_folder(http.server_port, allowed, tab)
+        record = chatgpt_pending.save_pending(front, png('yellow'))
+        chatgpt_pending.attach_link(record['id'], {
+            'front_path': str(front),
+            'composite_path': str(secret),
+            'split': 50,
+            'layout': 'right',
+        })
+        status, body = self._json(http.server_port, '/api/chatgpt-accept', {
+            'id': record['id'],
+        }, tab=tab)
+        self.assertEqual(status, 400)
+        self.assertRegex(body['error'], 'outside the allowed folder')
 
     def test_dialog_pick_is_registered_and_cancel_list_browse_forged_path_are_not(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)

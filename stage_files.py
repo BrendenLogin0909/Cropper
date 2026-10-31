@@ -160,6 +160,23 @@ def allowed_root_paths(roots) -> list[Path]:
     return result
 
 
+def write_roots_for(roots) -> list[Path]:
+    """Tab roots plus known stage siblings so reserved AI outputs can be filed."""
+    result = list(allowed_root_paths(roots))
+    seen = {path_key(path) for path in result}
+    for root in list(result):
+        parent = root.parent
+        if is_filesystem_root(parent):
+            continue
+        for name in FOLDERS:
+            extra = parent / name
+            key = path_key(extra)
+            if key not in seen:
+                seen.add(key)
+                result.append(extra)
+    return result
+
+
 def resolve_in_allowed_roots(value: Path | str, roots, *, label: str = 'That image') -> Path:
     """Resolve a user path inside any registered root. Client-supplied folder is not used."""
     allowed = allowed_root_paths(roots)
