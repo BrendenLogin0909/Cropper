@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from enhance import auto_enhance
-from chatgpt_restore import edit_front, file_accepted
+from chatgpt_restore import edit_front, file_accepted, sanitize_guidance
 from image_api_errors import image_api_error
 from chatgpt_pending import (
     attach_link, discard_recovered, get_pending, keep_recovered, list_pending,
@@ -87,6 +87,26 @@ class ConfirmationRequired(Exception):
     def __init__(self, payload: dict):
         super().__init__(payload.get("error") or "Confirmation required.")
         self.payload = payload
+
+
+def request_guidance(data, record=None):
+    """Read optional first-run notes from the request, falling back to a pending record."""
+    def pick(key):
+        if isinstance(data, dict) and key in data:
+            return data.get(key)
+        if isinstance(record, dict):
+            return record.get(key)
+        return None
+    return sanitize_guidance(pick("batch_context")), sanitize_guidance(pick("photo_note"))
+
+
+def guidance_fields(batch_context, photo_note):
+    fields = {}
+    if batch_context:
+        fields["batch_context"] = batch_context
+    if photo_note:
+        fields["photo_note"] = photo_note
+    return fields
 
 
 def hostname_of(host_header: str) -> str:
@@ -1465,20 +1485,32 @@ class Handler(BaseHTTPRequestHandler):
                     self.confine_writes([stage_files.plan(composite, operation)])
                 if any(stage_files.same_path(item["front_path"], front) for item in list_pending(front.parent)):
                     raise ValueError("This photo already has a pending AI result. Review it before generating another.")
+                batch_context, photo_note = request_guidance(data)
+                has_guidance = bool(batch_context or photo_note)
+                if data.get('dry_run'):
+                    self.json(200, {'front_path': str(front), 'operation': operation,
+                                    'has_guidance': has_guidance})
+                    return
                 plans = stage_files.prepare_ai_plans(front, operation, composite)
                 self.confine_writes(plans)
                 reserved = [item['output'] for item in plans if item.get('output') is not None]
                 try:
-                    front_png = edit_front(front, operation=operation)
+                    edit_kwargs = {'operation': operation}
+                    if batch_context:
+                        edit_kwargs['batch_context'] = batch_context
+                    if photo_note:
+                        edit_kwargs['photo_note'] = photo_note
+                    front_png = edit_front(front, **edit_kwargs)
                 except Exception as exc:
                     stage_files.release_outputs(reserved)
                     self.json(*image_api_error(exc))
                     return
                 try:
                     staged = save_pending(front, front_png, stage_routing=True, operation=operation,
-                                          output_paths=reserved)
+                                          output_paths=reserved, revision=guidance_fields(batch_context, photo_note) or None)
                     if link:
                         staged = attach_link(staged['id'], link)
+                    staged['has_guidance'] = has_guidance
                 except Exception:
                     stage_files.release_outputs(reserved)
                     raise
@@ -1507,15 +1539,22 @@ class Handler(BaseHTTPRequestHandler):
                     comments = [*record.get('comments', []), comment.strip()]
                     if len(comments) > 20 or sum(map(len, comments)) > 12000:
                         raise ValueError('Correction history is too long. Reject these attempts and start again.')
+                    batch_context, photo_note = request_guidance(data, record)
                     try:
-                        result = edit_front(front, operation=operation, comments=comments,
-                                            previous=previous if include_previous else None)
+                        edit_kwargs = {'operation': operation, 'comments': comments,
+                                       'previous': previous if include_previous else None}
+                        if batch_context:
+                            edit_kwargs['batch_context'] = batch_context
+                        if photo_note:
+                            edit_kwargs['photo_note'] = photo_note
+                        result = edit_front(front, **edit_kwargs)
                     except Exception as exc:
                         self.json(*image_api_error(exc))
                         return
                     revision = {'operation': operation, 'parent_id': record['id'],
                                 'attempt': record.get('attempt', 1) + 1, 'comments': comments,
-                                'included_previous': include_previous}
+                                'included_previous': include_previous,
+                                **guidance_fields(batch_context, photo_note)}
                     if record.get('link'): revision['link'] = record['link']
                     if record.get('output_path'): revision['output_path'] = record['output_path']
                     if record.get('output_paths'): revision['output_paths'] = record['output_paths']

@@ -83,7 +83,20 @@
 .chatgpt-secondary-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 .chatgpt-secondary-actions .button{min-width:0;min-height:48px;white-space:normal;font-size:12px}
 #chatgpt-correction{flex-shrink:0;margin-top:24px;padding-top:20px;border-top:1px solid #34464f}
-#chatgpt-comment{width:100%;box-sizing:border-box;resize:vertical;min-height:100px;padding:10px;background:#18262c;color:inherit;border:1px solid #34464f;border-radius:8px;font:inherit}
+#chatgpt-comment,.chatgpt-guidance textarea,.guidance-used textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:100px;padding:10px;background:#18262c;color:inherit;border:1px solid #34464f;border-radius:8px;font:inherit}
+.chatgpt-guidance{margin:0 18px 16px;padding:10px 12px;border:1px solid #33434b;border-radius:8px;background:#19262c;color:#a8bbc2;font-size:11px;line-height:1.45;flex-shrink:0}
+.chatgpt-guidance summary{cursor:pointer;color:#8ee6d4;font-weight:700}
+.guidance-field-meta{display:flex;justify-content:flex-end;margin:-6px 0 8px;color:#8aa0a8;font-size:10px}
+.guidance-truncation{margin:0 0 10px;color:#e9c18e;font-size:10px;line-height:1.45}
+.guidance-notes-count{margin:8px 0 0;color:#91a4ad;font-size:10px}
+.guidance-photo-list{display:grid;gap:8px;max-height:440px;overflow-y:auto;margin-top:8px}
+.guidance-photo-row{display:grid;grid-template-columns:48px minmax(0,1fr);gap:8px;align-items:start}
+.guidance-photo-row img{width:48px;height:48px;object-fit:cover;border-radius:5px;background:#0b1115}
+.guidance-photo-row .field{margin-bottom:0}
+.guidance-photo-row textarea{min-height:64px}
+.guidance-used{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #34464f}
+.guidance-used-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;color:#dceae9;font-size:12px;font-weight:700}
+.guidance-used textarea[readonly]{opacity:.85}
 #chatgpt-resubmit{min-height:52px;margin-top:12px;white-space:normal}
 #chatgpt-resubmit-status{white-space:pre-wrap;overflow-wrap:anywhere}
 .editor-tools{flex-wrap:wrap;justify-content:flex-end}
