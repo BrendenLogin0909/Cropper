@@ -1904,7 +1904,7 @@ class OutputHandlingTests(unittest.TestCase):
         }, tab=tab)
         self.assertEqual(status, 409)
         computed = stages.batch_id_for([stages.plan(photo, 'crop')])
-        for bogus in ('', 'forged-batch', computed, refusal['confirmation_token']):
+        for bogus in ('', 'WRONG', 'forged-batch', computed, refusal['confirmation_token']):
             status, body = self._json(http.server_port, '/api/crop', {
                 'path': str(photo), 'points': corners, 'rotation': 0,
                 'skip_overwrite_prompt': True,
@@ -2081,18 +2081,24 @@ class OutputHandlingTests(unittest.TestCase):
 
     def test_tab_registrations_are_capped_and_idle_tabs_expire(self):
         folder = Path(self.folder.name)
-        server.register_allowed_root(folder, self._tab())
+        first_tab = self._tab()
+        server.register_allowed_root(folder, first_tab)
         self.addCleanup(server.reset_tabs)
-        self.assertTrue(server.allowed_roots_for('tabid-test-000001'))
+        self.assertTrue(server.allowed_roots_for(first_tab))
+        now = time.time()
+        first = (server.TOKEN, first_tab)
+        server.TABS[first] = now - 100
         for index in range(31):
-            server.register_tab(f'tabid-cap-{index:08d}')
-        with self.assertRaisesRegex(ValueError, 'Too many'):
-            server.register_tab('tabid-cap-overflow01')
-        first = (server.TOKEN, 'tabid-test-000001')
-        server.TABS[first] = time.time() - server.TAB_IDLE_SECONDS - 1
+            tid = f'tabid-cap-{index:08d}'
+            server.register_tab(tid)
+            server.TABS[(server.TOKEN, tid)] = now - 50 + index
         server.register_tab('tabid-cap-overflow01')
-        self.assertFalse(server.tab_is_registered('tabid-test-000001'))
-        self.assertEqual(server.allowed_roots_for('tabid-test-000001'), [])
+        self.assertTrue(server.tab_is_registered('tabid-cap-overflow01'))
+        self.assertFalse(server.tab_is_registered(first_tab))
+        self.assertEqual(server.allowed_roots_for(first_tab), [])
+        expired = (server.TOKEN, 'tabid-cap-00000000')
+        server.TABS[expired] = time.time() - server.TAB_IDLE_SECONDS - 1
+        self.assertFalse(server.tab_is_registered('tabid-cap-00000000'))
 
     def test_atomic_create_reencodes_or_refuses_mismatched_bytes(self):
         with TemporaryDirectory() as tmp:
@@ -2156,6 +2162,231 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(stages.same_path(body['output_folder'], allowed))
 
+    def test_production_dialog_has_no_env_stub(self):
+        text = Path(server.__file__).read_text(encoding='utf-8')
+        self.assertNotIn('CROPPER_TEST_DIALOG_FOLDER', text)
+
+    def test_request_log_drops_query_strings(self):
+        printed = []
+
+        def capturing(*args, **kwargs):
+            printed.append(' '.join(str(item) for item in args))
+
+        dummy = type('Dummy', (), {
+            'path': '/api/image?path=/secret/photo.png&token=leak-token&tab=raw-tab-id',
+            'command': 'GET',
+            'address_string': lambda self: '127.0.0.1',
+        })()
+        with patch('builtins.print', capturing):
+            server.Handler.log_message(dummy, '%s', 'should-not-appear')
+        blob = '\n'.join(printed)
+        self.assertIn('/api/image', blob)
+        self.assertNotIn('?', blob)
+        self.assertNotIn('path=', blob)
+        self.assertNotIn('token=', blob)
+        self.assertNotIn('secret', blob)
+        self.assertNotIn('leak-token', blob)
+        self.assertNotIn('raw-tab-id', blob)
+        self.assertNotIn('should-not-appear', blob)
+
+    def _bytes(self, port, path, tab=None, token=True):
+        headers = {}
+        if token:
+            headers['X-Cropper-Token'] = server.TOKEN
+        if tab:
+            headers['X-Cropper-Tab'] = tab
+        request = Request(f'http://127.0.0.1:{port}{path}', headers=headers)
+        try:
+            with urlopen(request) as response:
+                return response.status, response.read(), response.headers.get('Content-Type', '')
+        except HTTPError as exc:
+            payload = exc.read()
+            ctype = exc.headers.get('Content-Type', '') if exc.headers else ''
+            exc.close()
+            return exc.code, payload, ctype
+
+    def test_images_require_tab_header_and_render(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        folder = Path(self.folder.name) / 'photos'
+        folder.mkdir()
+        photo = folder / 'tile.png'
+        Image.new('RGB', (32, 32), 'red').save(photo)
+        self._open_folder(http.server_port, folder, tab)
+        quoted = quote(str(photo))
+        status, body, ctype = self._bytes(http.server_port, f'/api/thumb?path={quoted}', tab=tab)
+        self.assertEqual(status, 200)
+        self.assertIn('image/jpeg', ctype)
+        self.assertTrue(body.startswith(b'\xff\xd8'))
+        Image.open(io.BytesIO(body)).verify()
+        status, body, ctype = self._bytes(http.server_port, f'/api/image?path={quoted}', tab=tab)
+        self.assertEqual(status, 200)
+        self.assertIn('image/jpeg', ctype)
+        self.assertTrue(body.startswith(b'\xff\xd8'))
+        Image.open(io.BytesIO(body)).verify()
+        status, body, _ = self._bytes(http.server_port, f'/api/image?path={quoted}')
+        self.assertEqual(status, 400)
+        status, body, _ = self._bytes(
+            http.server_port, f'/api/image?path={quoted}&tab={tab}')
+        self.assertEqual(status, 400)
+
+    def test_foreign_tab_output_folder_is_refused_before_write(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab_a = self._tab('tabid-test-root-aaa1')
+        tab_c = self._tab('tabid-test-root-ccc1')
+        root = Path(self.folder.name)
+        folder_a = root / 'A'
+        folder_c = root / 'C'
+        out = folder_a / 'out'
+        folder_a.mkdir()
+        folder_c.mkdir()
+        out.mkdir()
+        photo_c = folder_c / 'photo9.jpg'
+        Image.new('RGB', (16, 16), 'red').save(photo_c)
+        original = photo_c.read_bytes()
+        self._open_folder(http.server_port, folder_a, tab_a)
+        status, body = self._json(http.server_port, '/api/settings', {
+            'output_folder': str(out),
+        }, tab=tab_a)
+        self.assertEqual(status, 200)
+        self._open_folder(http.server_port, folder_c, tab_c)
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_c), 'points': corners, 'rotation': 0,
+        }, tab=tab_c)
+        self.assertEqual(status, 400)
+        self.assertRegex(body['error'], 'outside')
+        self.assertEqual(photo_c.read_bytes(), original)
+        self.assertEqual(list(out.iterdir()), [])
+
+    def test_new_output_subfolder_is_created_on_first_write(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        folder = Path(self.folder.name) / 'A'
+        folder.mkdir()
+        photo = folder / 'photo.jpg'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        dest = folder / 'new-out'
+        self.assertFalse(dest.exists())
+        self._open_folder(http.server_port, folder, tab)
+        status, body = self._json(http.server_port, '/api/settings', {
+            'output_folder': str(dest),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertFalse(dest.exists())
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, body = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(dest.is_dir())
+        self.assertTrue(Path(body['path']).is_file())
+        self.assertTrue(stages.contained_in(body['path'], dest))
+
+    def test_pick_folder_validates_session_and_tab_before_dialog(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        opened = []
+
+        def fake():
+            opened.append(True)
+            return Path(self.folder.name)
+
+        with patch.object(server, 'choose_folder_dialog', side_effect=fake):
+            request = Request(
+                f'http://127.0.0.1:{http.server_port}/api/pick-folder',
+                b'{}',
+                {'Content-Type': 'application/json', 'X-Cropper-Tab': 'tabid-test-000001'},
+            )
+            try:
+                with urlopen(request) as response:
+                    status = response.status
+            except HTTPError as exc:
+                status = exc.code
+                exc.close()
+            self.assertEqual(status, 403)
+            self.assertEqual(opened, [])
+            status, body = self._json(http.server_port, '/api/pick-folder', {})
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'register')
+            self.assertEqual(opened, [])
+            status, body = self._json(
+                http.server_port, '/api/pick-folder', {}, tab='tabid-unregistered01')
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'register')
+            self.assertEqual(opened, [])
+
+    def test_pick_folder_refuses_second_dialog_while_open(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        started = threading.Event()
+        release = threading.Event()
+
+        def hang(result, errors, cancel):
+            started.set()
+            release.wait(10)
+            result.append(str(Path(self.folder.name)))
+
+        with patch.object(server, '_run_folder_dialog', side_effect=hang):
+            first = {}
+
+            def opener():
+                first['status'], first['body'] = self._json(
+                    http.server_port, '/api/pick-folder', {}, tab=tab)
+
+            thread = threading.Thread(target=opener)
+            thread.start()
+            self.assertTrue(started.wait(5))
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'already open')
+            release.set()
+            thread.join(10)
+        self.assertEqual(first.get('status'), 200)
+
+    def test_pick_folder_timeout_cancels_and_does_not_open_another(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        cancel_seen = []
+
+        def hang(result, errors, cancel):
+            if not cancel.wait(5):
+                errors.append(RuntimeError('cancel was not set'))
+                return
+            cancel_seen.append(True)
+
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 0.2), \
+             patch.object(server, '_run_folder_dialog', side_effect=hang):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400)
+        self.assertRegex(body['error'], 'timed out')
+        self.assertEqual(cancel_seen, [True])
+
+        def quick(result, errors, cancel):
+            result.append(str(Path(self.folder.name)))
+
+        with patch.object(server, '_run_folder_dialog', side_effect=quick):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertFalse(body.get('cancelled'))
+
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
 class WindowsIntegrationTests(unittest.TestCase):
@@ -2216,7 +2447,6 @@ class WindowsIntegrationTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b'device-safe')
 
     def test_windows_junction_escape_is_refused(self):
-        import subprocess
         with TemporaryDirectory() as tmp:
             allowed = Path(tmp) / 'allowed'
             outside = Path(tmp) / 'outside'
@@ -2225,12 +2455,7 @@ class WindowsIntegrationTests(unittest.TestCase):
             secret = outside / 'secret.jpg'
             Image.new('RGB', (8, 8), 'red').save(secret)
             link = allowed / 'escape'
-            completed = subprocess.run(
-                ['cmd', '/c', 'mklink', '/J', str(link), str(outside)],
-                capture_output=True, text=True,
-            )
-            if completed.returncode != 0:
-                self.skipTest(completed.stderr or 'could not create a junction')
+            _create_windows_junction(link, outside)
             self.assertTrue(link.is_junction())
             self.assertTrue(stages.is_link(link))
             with self.assertRaisesRegex(ValueError, 'outside the allowed folder'):
@@ -2271,6 +2496,23 @@ class WindowsIntegrationTests(unittest.TestCase):
             self.assertEqual(body['code'], 'file_locked')
             self.assertIn('Close the file', body['error'])
             self.assertEqual(target.read_bytes(), b'original')
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    import subprocess
+    completed = subprocess.run(
+        ['cmd', '/c', 'mklink', '/J', str(link), str(target)],
+        capture_output=True, text=True,
+    )
+    if completed.returncode == 0:
+        return
+    try:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    except Exception as exc:
+        raise AssertionError(
+            f'could not create a junction ({completed.stderr or completed.stdout or exc})'
+        ) from exc
 
 
 def _windows_exclusive_handle(path: Path):

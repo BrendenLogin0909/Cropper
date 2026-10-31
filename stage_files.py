@@ -197,6 +197,68 @@ def assert_output_in_root(path: Path | str, root: Path | str) -> Path:
     return resolve_in_root(path, root, label='The output')
 
 
+def resolve_output_folder(value: Path | str, roots, *, label: str = 'The output folder') -> Path:
+    """Resolve an output folder inside allowed roots without creating it.
+
+    A folder that does not exist yet is allowed when it stays under a
+    registered root or a known stage sibling. The folder is created later,
+    on the first write.
+    """
+    if value is None or not str(value).strip():
+        raise ValueError(f'{label} is missing.')
+    allowed = allowed_root_paths(roots)
+    if not allowed:
+        raise ValueError(f'{label} is outside the allowed folder.')
+    raw = Path(str(value).strip()).expanduser()
+    try:
+        candidate = raw.resolve()
+    except OSError as exc:
+        raise ValueError(f'{label} is unavailable.') from exc
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError(f'{label} is not a folder.')
+    last_error = None
+    for root in allowed:
+        try:
+            if candidate.exists():
+                return resolve_in_root(candidate, root, label=label)
+            if contained_in(candidate, root) and not _link_escapes(candidate, root):
+                return candidate
+        except ValueError as exc:
+            last_error = exc
+            continue
+    existing = candidate
+    while True:
+        try:
+            present = existing.exists()
+        except OSError:
+            present = False
+        if present or existing.parent == existing:
+            break
+        existing = existing.parent
+    if existing.exists() and existing.is_dir():
+        for root in allowed:
+            try:
+                resolve_in_root(existing, root, label=label)
+                return resolve_in_root(candidate, root, label=label)
+            except ValueError as exc:
+                last_error = exc
+                continue
+    raise last_error or ValueError(f'{label} is outside the allowed folder.')
+
+
+def confine_plans(plans, roots) -> None:
+    """Refuse before any write if a planned output leaves the tab's roots."""
+    allowed = write_roots_for(roots)
+    for item in plans or ():
+        folders = []
+        if item.get('output') is not None:
+            folders.append(Path(item['output']).parent)
+        for snap in item.get('snapshots') or ():
+            folders.append(Path(snap).parent)
+        for folder in folders:
+            resolve_output_folder(folder, allowed, label='The output folder')
+
+
 def _is_windows() -> bool:
     return os.name == 'nt'
 

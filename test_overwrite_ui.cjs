@@ -64,7 +64,7 @@ function startServer(python, dataDir, extras = {}) {
   return new Promise((resolve, reject) => {
     const env = { ...process.env, PYTHONUNBUFFERED: '1' };
     if (extras.dialogFolder) env.CROPPER_TEST_DIALOG_FOLDER = extras.dialogFolder;
-    const child = spawn(python, ['server.py', '--no-browser', '--data-dir', dataDir, '--port', '0'], {
+    const child = spawn(python, ['e2e_server.py', '--no-browser', '--data-dir', dataDir, '--port', '0'], {
       cwd: __dirname,
       env,
     });
@@ -181,8 +181,14 @@ test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(app, /X-Cropper-Tab/);
   assert.match(app, /\/api\/tab-register/);
   assert.match(app, /\/api\/confirm-overwrite-batch/);
+  assert.match(app, /URL\.createObjectURL/);
+  assert.match(app, /assignImage/);
+  assert.match(app, /requestHeaders\(\)/);
   assert.doesNotMatch(app, /overwriteSession/);
   assert.doesNotMatch(app, /skip_overwrite_prompt: true \}/);
+  assert.doesNotMatch(app, /url\('\/api\/(image|thumb)/);
+  assert.doesNotMatch(app, /[&?]tab=/);
+  assert.doesNotMatch(app, /X-Cropper-Tab=\$\{/);
 });
 
 test('GPS keep is an opt-in setting stripped by default', () => {
@@ -354,6 +360,60 @@ test('without skip the second photo in the same batch asks again', async () => {
     await client.api('/api/crop', cropPayload(batch, 'photo'));
     await client.api('/api/crop', cropPayload(batch, 'photo2'));
     assert.equal(client.dialogOpens.overwrite, 2);
+  } finally {
+    child.kill();
+  }
+});
+
+test('tiles fetch images with the tab header and double-click opens crop view', async () => {
+  assert.match(app, /tile\.addEventListener\('dblclick'/);
+  assert.match(app, /if \(state\.view === 'crop'\) openImage/);
+  assert.match(app, /await assignImage\(photo,/);
+  assert.match(app, /assignImageLater\(thumbnail, imagePath\('\/api\/thumb'/);
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-img-'));
+  const batch = path.join(dataDir, 'batch');
+  writeBatchPhotos(python, batch, ['photo']);
+  const { child, base, client } = await startCropSession(python, dataDir, {
+    skipChecked: false, tab: 'e2e-tab-image-render1',
+  });
+  try {
+    const listed = await client.api(`/api/list?path=${encodeURIComponent(batch)}`);
+    assert.ok(listed.images?.length);
+    const photoPath = listed.images.find(item => item.name === 'photo.png').path;
+    const session = await (await fetch(`${base}/api/session`, {
+      headers: { 'X-Cropper-Tab': 'e2e-tab-image-render1' },
+    })).json();
+    const sessionHeaders = {
+      'X-Cropper-Token': session.token,
+      'X-Cropper-Tab': 'e2e-tab-image-render1',
+    };
+    const thumb = await fetch(`${base}/api/thumb?path=${encodeURIComponent(photoPath)}`, {
+      headers: sessionHeaders,
+    });
+    assert.equal(thumb.status, 200);
+    assert.match(thumb.headers.get('content-type') || '', /image\/jpeg/);
+    const thumbBytes = Buffer.from(await thumb.arrayBuffer());
+    assert.equal(thumbBytes[0], 0xff);
+    assert.equal(thumbBytes[1], 0xd8);
+    assert.ok(thumbBytes.length > 80);
+    const image = await fetch(`${base}/api/image?path=${encodeURIComponent(photoPath)}`, {
+      headers: sessionHeaders,
+    });
+    assert.equal(image.status, 200);
+    const imageBytes = Buffer.from(await image.arrayBuffer());
+    assert.equal(imageBytes[0], 0xff);
+    assert.equal(imageBytes[1], 0xd8);
+    assert.ok(imageBytes.length > 80);
+    const noTab = await fetch(`${base}/api/image?path=${encodeURIComponent(photoPath)}`, {
+      headers: { 'X-Cropper-Token': sessionHeaders['X-Cropper-Token'] },
+    });
+    assert.equal(noTab.status, 400);
+    const queryTab = await fetch(
+      `${base}/api/image?path=${encodeURIComponent(photoPath)}&tab=e2e-tab-image-render1`,
+      { headers: { 'X-Cropper-Token': sessionHeaders['X-Cropper-Token'] } },
+    );
+    assert.equal(queryTab.status, 400);
   } finally {
     child.kill();
   }

@@ -128,7 +128,6 @@ async function setOutputFolder(path) {
   } catch (error) { toast(error.message, true); }
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
-function url(path, filePath) { return `${path}?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(state.token)}`; }
 function tabId() {
   const key = 'cropper-tab-id';
   try {
@@ -143,6 +142,51 @@ function tabId() {
 }
 function requestHeaders(extra) {
   return { 'X-Cropper-Token': state.token, 'X-Cropper-Tab': tabId(), ...extra };
+}
+function imagePath(endpoint, filePath, extra) {
+  const params = new URLSearchParams({ path: filePath });
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (value != null && value !== '') params.set(key, String(value));
+    }
+  }
+  return `${endpoint}?${params}`;
+}
+async function fetchBlob(resource) {
+  const response = await fetch(resource, { headers: requestHeaders() });
+  if (!response.ok) {
+    let message = 'Could not load this image.';
+    try { const data = await response.json(); if (data.error) message = data.error; } catch (_) {}
+    throw new Error(message);
+  }
+  return response.blob();
+}
+function revokeDatasetUrl(img) {
+  const previous = img?.dataset?.objectUrl;
+  if (previous) {
+    URL.revokeObjectURL(previous);
+    delete img.dataset.objectUrl;
+  }
+}
+async function assignImage(img, resource) {
+  const blob = await fetchBlob(resource);
+  const objectUrl = URL.createObjectURL(blob);
+  const previous = img.dataset.objectUrl;
+  const priorLoad = img.onload;
+  await new Promise((resolve, reject) => {
+    img.onload = event => {
+      if (typeof priorLoad === 'function') priorLoad.call(img, event);
+      resolve();
+    };
+    img.onerror = () => reject(new Error('Could not display this image.'));
+    img.src = objectUrl;
+  });
+  if (previous && previous !== objectUrl) URL.revokeObjectURL(previous);
+  img.dataset.objectUrl = objectUrl;
+  return objectUrl;
+}
+function assignImageLater(img, resource) {
+  assignImage(img, resource).catch(() => { img.removeAttribute('src'); });
 }
 const batchPromptState = { overwriteSkip: [], overwriteBatchIds: {}, replaceTokens: [], replaceBatchIds: {} };
 function hasOverwriteSkip(token) { return !!(token && batchPromptState.overwriteSkip.includes(token)); }
@@ -386,7 +430,8 @@ function setView(view) {
 function selectionCard(label, image) {
   const card = document.createElement('div'); card.className = 'merge-card';
   const tag = document.createElement('span'); tag.textContent = label;
-  const picture = document.createElement('img'); picture.alt = `${label}: ${image.name}`; picture.src = url('/api/image', image.path) + `&v=${image.modified}`;
+  const picture = document.createElement('img'); picture.alt = `${label}: ${image.name}`;
+  assignImageLater(picture, imagePath('/api/image', image.path, { v: image.modified }));
   card.append(tag, picture); return card;
 }
 function emptyMerge() {
@@ -465,7 +510,7 @@ async function previewEnhance(index) {
   if (state.enhance.preview !== index) resetEnhanceZoom();
   state.enhance.preview = index;
   $('enhance-empty').classList.add('hidden'); $('enhance-comparison').classList.remove('hidden');
-  $('enhance-before').src = url('/api/enhance-original', item.path) + `&v=${item.modified}`;
+  assignImageLater($('enhance-before'), imagePath('/api/enhance-original', item.path, { v: item.modified }));
   $('enhance-after').removeAttribute('src');
   $('enhance-subtitle').textContent = item.name;
   $('enhance-changes').textContent = 'Analysing this photo…';
@@ -566,7 +611,7 @@ async function previewRestoration(index) {
   state.restore.preview = index;
   $('restore-empty').classList.add('hidden'); $('restore-comparison').classList.remove('hidden');
   $('restore-before').onload = drawBrushCanvas;
-  $('restore-before').src = url('/api/enhance-original', item.path) + `&v=${item.modified}`;
+  assignImageLater($('restore-before'), imagePath('/api/enhance-original', item.path, { v: item.modified }));
   $('restore-after').removeAttribute('src'); $('restore-subtitle').textContent = item.name;
   $('restore-changes').textContent = 'Analysing this photo…'; refreshRestorationTiles();
   $('restore-after-label').textContent = state.restore.showMarks && operation === 'dust' ? 'DETECTED MARKS' : 'AFTER';
@@ -765,12 +810,15 @@ function renderFolders() {
   }
 }
 function renderImages() {
-  const host = $('images'); const previousScroll = host.scrollTop; host.replaceChildren();
+  const host = $('images'); const previousScroll = host.scrollTop;
+  host.querySelectorAll('img[data-object-url]').forEach(revokeDatasetUrl);
+  host.replaceChildren();
   for (const [index, image] of state.images.entries()) {
     if(!colorImageVisible(image.path)) continue;
     const tile = document.createElement('button'); tile.className = 'image-tile'; tile.title = state.view === 'chatgpt' ? `${image.name} — click, Shift-click or Ctrl-click to select` : state.view === 'enhance' || RESTORE_INFO[state.view] ? `${image.name} — select and preview` : state.view === 'merge' ? `${image.name} — choose as front or back` : `${image.name} — double-click to open`;
     const picture = document.createElement('div'); picture.className = 'tile-photo';
-    const thumbnail = document.createElement('img'); thumbnail.loading = 'lazy'; thumbnail.alt = ''; thumbnail.src = url('/api/thumb', image.path); picture.append(thumbnail);
+    const thumbnail = document.createElement('img'); thumbnail.loading = 'lazy'; thumbnail.alt = '';
+    assignImageLater(thumbnail, imagePath('/api/thumb', image.path)); picture.append(thumbnail);
     const name = document.createElement('div'); name.className = 'tile-name'; name.textContent = image.name;
     const meta = document.createElement('div'); meta.className = 'tile-meta'; meta.textContent = state.view==='chatgpt' && chatgptOperation==='colorize' ? (colorCandidates.get(image.path)?.kind || 'Not scanned') : formatBytes(image.bytes);
     tile.append(picture, name, meta); tile.addEventListener('dblclick', () => { if (state.view === 'crop') openImage(index); });
@@ -808,7 +856,7 @@ async function openImage(index) {
     if (ticket !== state.requestId) return;
     state.width = info.width; state.height = info.height;
     const photo = $('photo');
-    await new Promise((resolve, reject) => { photo.onload = resolve; photo.onerror = () => reject(new Error('Could not display this image.')); photo.src = url('/api/image', item.path) + `&v=${item.modified}`; });
+    await assignImage(photo, imagePath('/api/image', item.path, { v: item.modified }));
     if (ticket !== state.requestId) return;
     $('empty-state').classList.add('hidden'); $('image-layer').classList.remove('hidden');
     $('image-subtitle').textContent = `${info.width.toLocaleString()} × ${info.height.toLocaleString()} px  ·  ${formatBytes(item.bytes)}`;
@@ -1368,11 +1416,11 @@ function showChatgptPreview() {
   const zoomKey = `${current.preview || ''}:${current.review?.id || ''}`;
   if (zoomKey !== chatgptZoomKey) { chatgptZoomKey = zoomKey; resetChatgptZoom(); }
   if (!current.preview) { clearChatgptPreview(); return; }
-  $('chatgpt-original').src = url('/api/image', combinedReview && current.review?.link ? current.review.link.composite_path : current.preview);
+  assignImageLater($('chatgpt-original'), imagePath('/api/image', combinedReview && current.review?.link ? current.review.link.composite_path : current.preview));
   $('chatgpt-preview-label').textContent = current.review ? `ORIGINAL ←  DRAG TO COMPARE  → AI ${chatgptOperation==='colorize'?'COLORIZED':'RESTORED'} · ${current.preview.split(/[\\/]/).pop()}` : `ORIGINAL · ${current.preview.split(/[\\/]/).pop()}`;
   const comparing = !!current.review;
-  if (comparing) $('chatgpt-result').src = `/api/chatgpt-preview?id=${encodeURIComponent(current.review.id)}&part=${combinedReview ? 'combined' : 'front'}&token=${encodeURIComponent(state.token)}`;
-  else $('chatgpt-result').removeAttribute('src');
+  if (comparing) assignImageLater($('chatgpt-result'), `/api/chatgpt-preview?id=${encodeURIComponent(current.review.id)}&part=${combinedReview ? 'combined' : 'front'}`);
+  else { revokeDatasetUrl($('chatgpt-result')); $('chatgpt-result').removeAttribute('src'); }
   $('chatgpt-result').classList.toggle('hidden', !comparing);
   $('chatgpt-divider').classList.toggle('hidden', !comparing);
   $('chatgpt-slider').classList.toggle('hidden', !comparing);
@@ -1675,7 +1723,8 @@ function renderManualPairGallery() {
   for (const image of state.images) {
     const tile = document.createElement('button'); tile.type = 'button'; tile.className = 'photo-pair-thumb';
     tile.dataset.path = image.path; tile.title = image.name;
-    const picture = document.createElement('img'); picture.loading = 'lazy'; picture.alt = ''; picture.src = url('/api/thumb', image.path);
+    const picture = document.createElement('img'); picture.loading = 'lazy'; picture.alt = '';
+    assignImageLater(picture, imagePath('/api/thumb', image.path));
     const role = document.createElement('span'); role.className = 'photo-pair-role';
     const name = document.createElement('span'); name.className = 'photo-pair-thumb-name'; name.textContent = image.name;
     tile.append(picture, role, name); tile.addEventListener('click', () => selectManualPairImage(image.path)); gallery.append(tile);
@@ -1712,7 +1761,7 @@ function photoPairCard(item, target, onApproved) {
   for (const [path, title] of [[item.front_path, 'Standalone front — sent to AI'], [item.composite_path, 'Combined — rebuilt locally, NOT sent to AI']]) {
     const panel = document.createElement('div'), heading = document.createElement('p'), frame = document.createElement('div'), image = document.createElement('img');
     heading.textContent = `${title}: ${path.split(/[\\/]/).pop()}`;
-    image.src = url('/api/image', path); image.alt = title; frame.append(image); panel.append(heading, frame); pictures.append(panel);
+    assignImageLater(image, imagePath('/api/image', path)); image.alt = title; frame.append(image); panel.append(heading, frame); pictures.append(panel);
     if (path === item.composite_path) { combined = frame; frame.className = 'photo-pair-composite'; boundary = document.createElement('div'); boundary.className = 'photo-pair-boundary'; frame.append(boundary); }
   }
   const controls = document.createElement('div'); controls.className = 'photo-pair-controls';
