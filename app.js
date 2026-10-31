@@ -1277,7 +1277,7 @@ function guidancePhotoRow(path, store) {
   row.className = 'guidance-photo-row';
   const thumb = document.createElement('img');
   thumb.alt = '';
-  thumb.src = typeof url === 'function' ? url('/api/thumb', path) : '';
+  assignImageLater(thumb, imagePath('/api/thumb', path));
   const fieldWrap = document.createElement('div');
   const label = document.createElement('label');
   label.className = 'field';
