@@ -226,6 +226,9 @@ class GuidanceServerTests(unittest.TestCase):
         self.folder = TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         app_settings.configure_runtime(self.folder.name)
+        self.addCleanup(lambda: setattr(app_settings, '_data_dir', None))
+        self.addCleanup(server.reset_tabs)
+        self.addCleanup(server.reset_confirmations)
         self.root = Path(self.folder.name) / '1.5. TBP Cropped'
         self.root.mkdir()
         self.store = Path(self.folder.name) / 'pending'
