@@ -109,7 +109,7 @@ test('Generate sends the frozen batch context and per-photo note on the comments
     $:()=>({}), renderImages:()=>{}, updateChatgptControls:()=>{},
     showChatgptPreview:()=>{}, toast:()=>{}, reviewChatgptItem:item=>{current.review=item;},
     offerChooseOutputFolder:()=>false,
-    api:async (route,body)=>{ sent.push(body); return {id:body.front_path,front_path:body.front_path}; }};
+    api:async (route,body)=>{ if(route==='/api/begin-batch') return {batch_id:'test-batch'}; sent.push(body); return {id:body.front_path,front_path:body.front_path}; }};
   const generate = vm.runInNewContext(
     between('function chatgptReadyPaths(', 'function updateChatgptControls(') +
     between('async function runChatgptQueue(', 'async function generateChatgpt(') +
@@ -139,7 +139,7 @@ test('AC6 colourise uses the same guidance payload fields', async () => {
     $:()=>({}), renderImages:()=>{}, updateChatgptControls:()=>{},
     showChatgptPreview:()=>{}, toast:()=>{}, reviewChatgptItem:item=>{current.review=item;},
     offerChooseOutputFolder:()=>false,
-    api:async (route,body)=>{ sent.push(body); return {id:body.front_path,front_path:body.front_path}; }};
+    api:async (route,body)=>{ if(route==='/api/begin-batch') return {batch_id:'test-batch'}; sent.push(body); return {id:body.front_path,front_path:body.front_path}; }};
   const generate = vm.runInNewContext(
     between('function chatgptReadyPaths(', 'function updateChatgptControls(') +
     between('async function runChatgptQueue(', 'async function generateChatgpt(') +
@@ -165,6 +165,7 @@ test('AC11 deselecting a photo does not cancel its queued job; stop still works'
     showChatgptPreview:()=>{}, toast:()=>{}, reviewChatgptItem:item=>{current.review=item;},
     offerChooseOutputFolder:()=>false,
     api:async (route,body)=>{
+      if (route==='/api/begin-batch') return {batch_id:'test-batch'};
       sent.push(body);
       if (body.front_path === 'a') { started(); await gate; }
       return {id:body.front_path,front_path:body.front_path};
