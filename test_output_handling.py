@@ -2082,6 +2082,7 @@ class OutputHandlingTests(unittest.TestCase):
     def test_tab_registrations_are_capped_and_idle_tabs_expire(self):
         folder = Path(self.folder.name)
         server.register_allowed_root(folder, self._tab())
+        self.addCleanup(server.reset_tabs)
         self.assertTrue(server.allowed_roots_for('tabid-test-000001'))
         for index in range(31):
             server.register_tab(f'tabid-cap-{index:08d}')
