@@ -549,7 +549,7 @@ def choose_folder_dialog() -> Path | None:
             threading.Thread(target=release_when_done, args=(thread,), daemon=True).start()
             raise FolderDialogBusy()
         if timed_out:
-            raise FolderDialogBusy()
+            raise ValueError("The folder dialog timed out. Try again.")
         if errors:
             raise ValueError("Could not open the folder dialog.") from errors[0]
         if not result or not result[0]:
