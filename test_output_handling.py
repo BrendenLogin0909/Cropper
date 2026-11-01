@@ -2231,6 +2231,54 @@ class OutputHandlingTests(unittest.TestCase):
         }, tab=tab)
         self.assertEqual(status, 409)
 
+    def test_file_and_batch_tokens_refused_after_ttl_with_clock(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, first = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        file_ack = self._ack(first, confirm_overwrite=True)
+        status, preview = self._json(http.server_port, '/api/overwrite-preview', {
+            'paths': [str(photo)], 'operation': 'crop',
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(preview['confirmation_token'], first['confirmation_token'])
+        status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+            **self._ack(preview, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(confirmed['confirmation_token'], first['confirmation_token'])
+        later = server._now() + server.CONFIRMATION_TTL_SECONDS + 1
+        with patch.object(server, '_now', return_value=later):
+            status, refused_file = self._json(http.server_port, '/api/crop', {
+                'path': str(photo), 'points': corners, 'rotation': 0, **file_ack,
+            }, tab=tab)
+            status_batch, refused_batch = self._json(http.server_port, '/api/crop', {
+                'path': str(photo), 'points': corners, 'rotation': 0,
+                **self._ack(confirmed, skip_overwrite_prompt=True),
+            }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused_file['code'], 'overwrite_confirmation_required')
+        self.assertEqual(status_batch, 409)
+        self.assertEqual(refused_batch['code'], 'overwrite_confirmation_required')
+
     def test_batch_token_refused_after_ttl_with_clock(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
         threading.Thread(target=http.serve_forever, daemon=True).start()
