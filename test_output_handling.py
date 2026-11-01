@@ -1925,6 +1925,43 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(refused['code'], 'replace_confirmation_required')
 
+    def test_evicted_tab_token_is_refused(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, first = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        ack = self._ack(first, confirm_overwrite=True)
+        key = (server.TOKEN, tab)
+        server.TAB_IN_FLIGHT.pop(key, None)
+        server.TABS[key] = time.time() - server.TAB_IDLE_SECONDS - 1
+        self.assertFalse(server.tab_is_registered(tab))
+        server.register_tab(tab)
+        server.register_allowed_root(root, tab)
+        status, refused = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0, **ack,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused['code'], 'overwrite_confirmation_required')
+        self.assertNotEqual(refused['confirmation_token'], first['confirmation_token'])
+
     def test_file_token_plus_skip_never_widens(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
         threading.Thread(target=http.serve_forever, daemon=True).start()

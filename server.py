@@ -587,6 +587,8 @@ def _drop_tab_locked(key: tuple[str, str]) -> None:
     ALLOWED_ROOTS.pop(key, None)
     TAB_IN_FLIGHT.pop(key, None)
     TAB_BATCHES.pop(key, None)
+    with CONFIRMATIONS_LOCK:
+        _invalidate_tab_tokens_locked(key[0], key[1])
 
 
 def _tab_is_busy_locked(key: tuple[str, str]) -> bool:
