@@ -887,7 +887,7 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
-        if kind == "overwrite" and not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+        if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
             return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
