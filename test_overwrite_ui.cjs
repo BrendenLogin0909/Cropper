@@ -166,7 +166,7 @@ exported.tabId = tabId;`,
 
 test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(html, /id="overwrite-dialog"/);
-  assert.match(html, /Don't ask again for the \d+ photos in this folder for 15 minutes/);
+  assert.match(html, /Don't ask again for the \d+ photos? in this folder for 15 minutes/);
   assert.match(html, /data-testid="overwrite-confirm"/);
   assert.match(html, /data-testid="overwrite-cancel"/);
   assert.match(html, /id="replace-dialog"/);
@@ -207,6 +207,11 @@ test('GPS keep is an opt-in setting stripped by default', () => {
 
 test('overwrite skip label uses the server snapshot count and hides when capped', () => {
   const { helpers, els } = loadPromptHelpers();
+  helpers.applyOverwriteSkipLabel(1, true);
+  assert.equal(
+    els['overwrite-skip-label'].textContent,
+    "Don't ask again for the 1 photo in this folder for 15 minutes",
+  );
   helpers.applyOverwriteSkipLabel(4, true);
   assert.equal(
     els['overwrite-skip-label'].textContent,

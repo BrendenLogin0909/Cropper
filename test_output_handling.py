@@ -3215,6 +3215,73 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotEqual(reused['confirmation_token'], confirmed['confirmation_token'])
 
+    def test_unchanged_snapshot_identity_still_matches(self):
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        server.register_allowed_root(root, tab)
+        server.begin_tab_batch(tab, folder=root)
+        before = server._file_identity(photo)
+        self.assertEqual(len(before), 5)
+        after = server._file_identity(photo)
+        self.assertEqual(before, after)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        plans = [stages.plan(photo, 'crop')]
+        issued = server.overwrite_response(plans, {}, tab_id=tab)
+        confirmed = server.confirm_overwrite_batch({
+            'skip_overwrite_prompt': True,
+            'confirmation_token': issued['confirmation_token'],
+            'batch_id': issued['batch_id'],
+        }, tab_id=tab)
+        self.assertIsNone(server.overwrite_response(plans, {
+            'skip_overwrite_prompt': True,
+            'confirmation_token': confirmed['confirmation_token'],
+            'batch_id': confirmed['batch_id'],
+        }, tab_id=tab))
+
+    def test_recreated_snapshot_source_is_refused(self):
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'a.jpg'
+        Image.new('RGB', (16, 16), 'red').save(photo, format='JPEG')
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'a_c.jpg').write_bytes(png('gray'))
+        server.register_allowed_root(root, tab)
+        server.begin_tab_batch(tab, folder=root)
+        before = server._file_identity(photo)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        plans = [stages.plan(photo, 'crop')]
+        issued = server.overwrite_response(plans, {}, tab_id=tab)
+        confirmed = server.confirm_overwrite_batch({
+            'skip_overwrite_prompt': True,
+            'confirmation_token': issued['confirmation_token'],
+            'batch_id': issued['batch_id'],
+        }, tab_id=tab)
+        ack = {
+            'skip_overwrite_prompt': True,
+            'confirmation_token': confirmed['confirmation_token'],
+            'batch_id': confirmed['batch_id'],
+        }
+        photo.unlink()
+        Image.new('RGB', (32, 32), 'blue').save(photo, format='JPEG')
+        after = server._file_identity(photo)
+        self.assertNotEqual(before, after)
+        self.assertIsNotNone(server.overwrite_response(
+            [stages.plan(photo, 'crop')], ack, tab_id=tab))
+
     def test_recreated_or_relinked_snapshot_file_is_refused(self):
         tab = self._tab()
         root = Path(self.folder.name)
@@ -3243,20 +3310,6 @@ class OutputHandlingTests(unittest.TestCase):
             'confirmation_token': confirmed['confirmation_token'],
             'batch_id': confirmed['batch_id'],
         }
-        before = server._file_identity(existing)
-        existing.unlink()
-        existing.write_bytes(png('blue'))
-        after = server._file_identity(existing)
-        recreated_plans = [stages.plan(photo, 'crop')]
-        if before and after and before != after:
-            self.assertIsNotNone(server.overwrite_response(
-                recreated_plans, ack, tab_id=tab))
-        else:
-            forged = {
-                'targets': frozenset({stages.path_key(existing)}),
-                'identities': frozenset({(stages.path_key(existing), 1, 1)}),
-            }
-            self.assertFalse(server._snapshot_covers([existing], forged))
         existing.unlink()
         try:
             existing.symlink_to(photo)
@@ -3318,12 +3371,15 @@ class OutputHandlingTests(unittest.TestCase):
                 }):
                     server.begin_tab_batch(tab, folder=root)
                     snap = server.current_batch_snapshot(tab)
-                joined = '\n'.join(snap['paths'])
+                    mapped = server._confined_mapped_paths(photo, tab, server.TOKEN)
+                self.assertIn(stages.path_key(photo), snap['paths'])
+                self.assertNotIn(stages.path_key(root / stages.CROP_QUEUE / 'photo_c.png'), snap['paths'])
+                joined = '\n'.join(str(path) for path in mapped)
                 self.assertNotIn('/../', joined.replace('\\', '/'))
                 self.assertNotIn('\\..\\', joined)
                 for reserved in ('CON', 'NUL', 'COM1'):
                     self.assertFalse(any(
-                        Path(path).stem.upper() == reserved for path in snap['paths']))
+                        Path(path).stem.upper() == reserved for path in mapped))
         app_settings.save_settings({
             'filename_template': '{name}{suffix}{ext}',
             'conflict_policy': 'overwrite',
@@ -3333,10 +3389,16 @@ class OutputHandlingTests(unittest.TestCase):
         Image.new('RGB', (16, 16), 'gray').save(collision)
         server.begin_tab_batch(tab, folder=root)
         snap = server.current_batch_snapshot(tab)
+        mapped = {
+            stages.path_key(path)
+            for path in server._confined_mapped_paths(photo, tab, server.TOKEN)
+        }
         self.assertIn(stages.path_key(photo), snap['paths'])
-        self.assertIn(stages.path_key(root / stages.CROP_QUEUE / 'photo_c.png'), snap['paths'])
+        self.assertNotIn(stages.path_key(root / stages.CROP_QUEUE / 'photo_c.png'), snap['paths'])
+        self.assertIn(stages.path_key(root / stages.CROP_QUEUE / 'photo_c.png'), mapped)
 
     def test_snapshot_cap_disables_batch_grant(self):
+        self.assertEqual(server.BATCH_SNAPSHOT_CAP, 2000)
         tab = self._tab()
         root = Path(self.folder.name)
         Image.new('RGB', (16, 16), 'red').save(root / 'a.png')
@@ -3368,21 +3430,54 @@ class OutputHandlingTests(unittest.TestCase):
                 }, tab_id=tab)
 
     def test_client_cannot_extend_the_server_snapshot(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
         tab = self._tab()
         root = Path(self.folder.name)
         photo = root / 'photo.png'
+        nested = root / 'sub'
+        nested.mkdir()
+        outsider = nested / 'n.jpg'
         Image.new('RGB', (16, 16), 'red').save(photo)
-        late = root / 'late.png'
-        server.register_allowed_root(root, tab)
-        server.begin_tab_batch(tab, folder=root)
-        Image.new('RGB', (16, 16), 'blue').save(late)
-        before = server.current_batch_snapshot(tab)
-        server.begin_tab_batch(tab, folder=root, sources=[late])
-        after = server.current_batch_snapshot(tab)
-        self.assertNotEqual(before['batch_id'], after['batch_id'])
-        self.assertEqual(after['count'], 1)
-        self.assertIn(stages.path_key(late), after['paths'])
-        self.assertNotIn(stages.path_key(photo), after['paths'])
+        Image.new('RGB', (16, 16), 'blue').save(outsider)
+        (root / stages.CROP_QUEUE).mkdir(parents=True)
+        (root / stages.CROP_QUEUE / 'photo_c.png').write_bytes(png('gray'))
+        (nested / stages.CROP_QUEUE).mkdir(parents=True)
+        (nested / stages.CROP_QUEUE / 'n_c.jpg').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        enumerated = {stages.path_key(path) for path in server._top_level_images(root)}
+        status, begun = self._json(http.server_port, '/api/begin-batch', {
+            'path': str(root),
+            'paths': [str(outsider)],
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        snap = server.current_batch_snapshot(tab)
+        self.assertEqual(snap['count'], 1)
+        self.assertEqual(set(snap['paths']), enumerated)
+        self.assertIn(stages.path_key(photo), snap['paths'])
+        self.assertNotIn(stages.path_key(outsider), snap['paths'])
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        status, preview = self._json(http.server_port, '/api/overwrite-preview', {
+            'paths': [str(photo)], 'operation': 'crop',
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+            **self._ack(preview, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, refused = self._json(http.server_port, '/api/crop', {
+            'path': str(outsider), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused['code'], 'overwrite_confirmation_required')
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')

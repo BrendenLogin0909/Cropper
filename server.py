@@ -60,7 +60,7 @@ TAB_ID_MAX_LEN = 128
 TAB_LIMIT = 32
 TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
 DIALOG_TIMEOUT_SECONDS = 300
-BATCH_SNAPSHOT_CAP = 5000
+BATCH_SNAPSHOT_CAP = 2000
 _DIALOG_LOCK = threading.Lock()
 _GRANTED = threading.local()
 
@@ -807,8 +807,8 @@ def _invalidate_tab_tokens_locked(session: str, tab_id: str) -> None:
         CONFIRMATIONS.pop(token, None)
 
 
-def _file_identity(path: Path) -> tuple[str, int, int] | None:
-    """Resolved path plus st_dev/st_ino (Windows file index). None if the file is gone."""
+def _file_identity(path: Path) -> tuple[str, int, int, int, int] | None:
+    """Resolved path plus st_dev/st_ino, st_ctime_ns, and st_size. None if the file is gone."""
     try:
         resolved = Path(path).expanduser().resolve()
         if stage_files.is_link(path) or stage_files.is_link(resolved):
@@ -816,7 +816,13 @@ def _file_identity(path: Path) -> tuple[str, int, int] | None:
         st = resolved.stat()
     except OSError:
         return None
-    return (stage_files.path_key(resolved), int(st.st_dev), int(st.st_ino))
+    return (
+        stage_files.path_key(resolved),
+        int(st.st_dev),
+        int(st.st_ino),
+        int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1_000_000_000))),
+        int(st.st_size),
+    )
 
 
 def _top_level_images(folder: Path) -> list[Path]:
@@ -847,25 +853,6 @@ def _resolve_batch_folder(folder, tab_id: str, session: str) -> Path | None:
     except ValueError:
         return None
     return path if path.is_dir() else None
-
-
-def _resolve_batch_sources(paths, tab_id: str, session: str) -> list[Path]:
-    roots = allowed_roots_for(tab_id, session)
-    found: list[Path] = []
-    seen: set[str] = set()
-    for value in paths or ():
-        try:
-            path = stage_files.resolve_in_allowed_roots(value, roots, label="That image")
-            if stage_files.is_link(path) or not path.is_file() or path.suffix.lower() not in EXTENSIONS:
-                continue
-            key = stage_files.path_key(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(path)
-        except ValueError:
-            continue
-    return found
 
 
 def _fallback_batch_folder(tab_id: str, session: str) -> Path | None:
@@ -904,24 +891,17 @@ def _confined_mapped_paths(source: Path, tab_id: str, session: str) -> list[Path
     return mapped
 
 
-def _take_batch_snapshot(sources: list[Path], folder: Path | None,
-                         tab_id: str, session: str) -> dict:
-    """Immutable server-side snapshot. The client cannot supply or extend it."""
-    identities: set[tuple[str, int, int]] = set()
+def _take_batch_snapshot(sources: list[Path], folder: Path | None) -> dict:
+    """Immutable server-side snapshot of path + stat only. Outputs are computed later."""
+    identities: set[tuple[str, int, int, int, int]] = set()
     paths: set[str] = set()
     capped = len(sources) > BATCH_SNAPSHOT_CAP
     if not capped:
         for source in sources:
             ident = _file_identity(source)
-            key = stage_files.path_key(source)
-            paths.add(key)
+            paths.add(stage_files.path_key(source))
             if ident is not None:
                 identities.add(ident)
-            for mapped in _confined_mapped_paths(source, tab_id, session):
-                paths.add(stage_files.path_key(mapped))
-                mapped_ident = _file_identity(mapped)
-                if mapped_ident is not None:
-                    identities.add(mapped_ident)
     return {
         "folder": stage_files.path_key(folder) if folder is not None else "",
         "identities": frozenset(identities),
@@ -951,27 +931,47 @@ def _snapshot_public(tab_id: str, session: str | None = None) -> dict:
     }
 
 
+def _lazy_confined_output_keys(sources: list[Path], record: dict) -> set[str]:
+    """O-6 confined output paths, computed at check time from snapshot sources."""
+    tab_id = record.get("tab_id")
+    session = record.get("session") or TOKEN
+    if not tab_id:
+        return set()
+    keys: set[str] = set()
+    for source in sources:
+        for mapped in _confined_mapped_paths(source, tab_id, session):
+            keys.add(stage_files.path_key(mapped))
+    return keys
+
+
 def _snapshot_covers(paths: list[Path], record: dict) -> bool:
-    """True only when every path is in the immutable snapshot and still the same file."""
+    """True only when every path is a snapshot source or its lazily mapped output."""
     if not paths:
         return False
     allowed = record.get("targets") or frozenset()
     identities = record.get("identities") or frozenset()
     by_path = {item[0]: item for item in identities}
+    snapshot_sources: list[Path] = []
+    extras: list[Path] = []
     for path in paths:
         key = stage_files.path_key(path)
-        if key not in allowed:
-            return False
         try:
             if stage_files.is_link(path):
                 return False
         except OSError:
             return False
-        stored = by_path.get(key)
-        if stored is None:
-            continue
-        if _file_identity(path) != stored:
-            return False
+        if key in allowed:
+            stored = by_path.get(key)
+            if stored is not None and _file_identity(path) != stored:
+                return False
+            snapshot_sources.append(path)
+        else:
+            extras.append(path)
+    if extras:
+        mapped = _lazy_confined_output_keys(snapshot_sources, record)
+        for path in extras:
+            if stage_files.path_key(path) not in mapped:
+                return False
     return True
 
 
@@ -985,19 +985,17 @@ def _coverage_paths(plans: list[dict], targets: list[Path]) -> list[Path]:
 
 
 def begin_tab_batch(tab_id: str, session: str | None = None,
-                    folder=None, sources=None) -> str:
+                    folder=None) -> str:
     """Issue a new batch and freeze its server-side target set. Old tokens are dropped."""
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     if not tab_id:
         raise ValueError("This browser tab must register a random id first.")
-    resolved_sources = _resolve_batch_sources(sources, tab_id, session) if sources else None
     resolved_folder = _resolve_batch_folder(folder, tab_id, session)
-    if resolved_folder is None and not resolved_sources:
+    if resolved_folder is None:
         resolved_folder = _fallback_batch_folder(tab_id, session)
-    if resolved_sources is None:
-        resolved_sources = _top_level_images(resolved_folder) if resolved_folder else []
-    snap = _take_batch_snapshot(resolved_sources, resolved_folder, tab_id, session)
+    resolved_sources = _top_level_images(resolved_folder) if resolved_folder else []
+    snap = _take_batch_snapshot(resolved_sources, resolved_folder)
     batch_id = _new_batch_id()
     snap["batch_id"] = batch_id
     with CONFIRMATIONS_LOCK:
@@ -1422,9 +1420,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not tab_id or not tab_is_registered(tab_id, TOKEN):
                     raise ValueError("This browser tab must register a random id first.")
                 payload = data if isinstance(data, dict) else {}
-                raw_paths = payload.get("paths") if isinstance(payload.get("paths"), list) else None
-                batch_id = begin_tab_batch(
-                    tab_id, folder=payload.get("path"), sources=raw_paths)
+                batch_id = begin_tab_batch(tab_id, folder=payload.get("path"))
                 self.json(200, {"batch_id": batch_id, **_snapshot_public(tab_id)})
                 return
             if self.path == "/api/settings":

@@ -253,7 +253,8 @@ function askModal(dialogId, confirmValue, countId, namesId, skipId, count, names
 function applyOverwriteSkipLabel(snapshotCount, batchGrant) {
   const count = Number.isFinite(Number(snapshotCount)) ? Number(snapshotCount) : 0;
   const label = $('overwrite-skip-label');
-  if (label) label.textContent = `Don't ask again for the ${count} photos in this folder for 15 minutes`;
+  const noun = count === 1 ? 'photo' : 'photos';
+  if (label) label.textContent = `Don't ask again for the ${count} ${noun} in this folder for 15 minutes`;
   const line = $('overwrite-skip-line');
   if (line) line.classList.toggle('hidden', batchGrant === false || count < 1);
 }
@@ -812,7 +813,8 @@ async function loadFolder(path, preserve = false) {
     if (ticket !== state.folderLoadId) return;
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
     if (ticket !== state.folderLoadId) return;
-    const prior = preserve && state.index >= 0 ? state.images[state.index]?.path : null;
+    const openPath = state.index >= 0 ? state.images[state.index]?.path : null;
+    const prior = preserve && openPath ? openPath : null;
     if (data.path !== state.folder) $('images').scrollTop = 0;
     state.folder = data.path; state.parent = data.parent; state.images = data.images; state.folders = data.folders;
     colorRequest++;colorScanning=false;colorScanFolder='';colorCandidates.clear();selectedPairs.clear();
@@ -827,8 +829,11 @@ async function loadFolder(path, preserve = false) {
     await refreshChatgptPending();
     if (ticket !== state.folderLoadId) return;
     const priorIndex = data.images.findIndex(image => image.path === prior);
+    const stillOpen = state.index >= 0 && state.images[state.index]?.path
+      && (state.images[state.index].path === openPath || openPath == null);
     if (priorIndex >= 0) await openImage(priorIndex);
-    else if (state.index < 0) { clearEditor(); updateControls(); }
+    else if (stillOpen) { /* keep the photo opened after this load assigned images */ }
+    else { state.index = -1; clearEditor(); updateControls(); }
     if (state.view === 'merge') renderMerge();
     if (!data.images.length) toast('No supported images in this folder. Open a subfolder or choose another folder.');
   } catch (error) { toast(error.message, true); }
