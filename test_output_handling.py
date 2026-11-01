@@ -1747,8 +1747,8 @@ class OutputHandlingTests(unittest.TestCase):
             'confirm_replace': True, 'confirmation_token': token,
             'batch_id': replace_batch,
         }, tab=tab)
-        self.assertEqual(status, 200)
-        self.assertTrue((root / stages.BACKUPS / photo2.name).is_file())
+        self.assertEqual(status, 409)
+        self.assertEqual(result['code'], 'replace_confirmation_required')
 
     def test_confirm_overwrite_batch_issues_batch_token(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
@@ -1891,6 +1891,76 @@ class OutputHandlingTests(unittest.TestCase):
         }, tab=tab)
         self.assertEqual(status, 409)
         self.assertEqual(refused_c['code'], 'overwrite_confirmation_required')
+
+    def test_replace_batch_token_refused_for_unlisted_file(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo_a = root / 'a.jpg'
+        photo_b = root / 'b.jpg'
+        Image.new('RGB', (16, 16), 'red').save(photo_a)
+        Image.new('RGB', (16, 16), 'blue').save(photo_b)
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': True,
+            'backup_originals': True,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, first = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_a), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(first['code'], 'replace_confirmation_required')
+        status, refused = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_b), 'points': corners, 'rotation': 0,
+            'confirm_replace': True,
+            'confirmation_token': first['confirmation_token'],
+            'batch_id': first['batch_id'],
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused['code'], 'replace_confirmation_required')
+
+    def test_evicted_tab_token_is_refused(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo = root / 'photo.png'
+        Image.new('RGB', (16, 16), 'red').save(photo)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'photo_c.png').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, first = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        ack = self._ack(first, confirm_overwrite=True)
+        key = (server.TOKEN, tab)
+        server.TAB_IN_FLIGHT.pop(key, None)
+        server.TABS[key] = time.time() - server.TAB_IDLE_SECONDS - 1
+        self.assertFalse(server.tab_is_registered(tab))
+        server.register_tab(tab)
+        server.register_allowed_root(root, tab)
+        status, refused = self._json(http.server_port, '/api/crop', {
+            'path': str(photo), 'points': corners, 'rotation': 0, **ack,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused['code'], 'overwrite_confirmation_required')
+        self.assertNotEqual(refused['confirmation_token'], first['confirmation_token'])
 
     def test_file_token_plus_skip_never_widens(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)

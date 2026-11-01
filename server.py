@@ -607,6 +607,8 @@ def _drop_tab_locked(key: tuple[str, str]) -> None:
     ALLOWED_ROOTS.pop(key, None)
     TAB_IN_FLIGHT.pop(key, None)
     TAB_BATCHES.pop(key, None)
+    with CONFIRMATIONS_LOCK:
+        _invalidate_tab_tokens_locked(key[0], key[1])
 
 
 def _tab_is_busy_locked(key: tuple[str, str]) -> bool:
@@ -907,7 +909,7 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
-        if kind == "overwrite" and not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+        if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
             return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
