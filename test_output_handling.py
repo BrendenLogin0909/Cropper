@@ -3479,6 +3479,56 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(refused['code'], 'overwrite_confirmation_required')
 
+    def test_replace_of_file_added_after_batch_start_uses_file_token(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        first = root / 'a.png'
+        Image.new('RGB', (16, 16), 'red').save(first)
+        self._open_folder(http.server_port, root, tab)
+        late = root / 'late.png'
+        Image.new('RGB', (16, 16), 'blue').save(late)
+        original = late.read_bytes()
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': True,
+            'backup_originals': True,
+        })
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, asked = self._json(http.server_port, '/api/crop', {
+            'path': str(late), 'points': corners, 'rotation': 0,
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(asked['code'], 'replace_confirmation_required')
+        record = server.CONFIRMATIONS[asked['confirmation_token']]
+        self.assertEqual(record['scope'], 'files')
+        self.assertIn(stages.path_key(late), record['targets'])
+        status, result = self._json(http.server_port, '/api/crop', {
+            'path': str(late), 'points': corners, 'rotation': 0,
+            'confirm_replace': True,
+            'confirmation_token': asked['confirmation_token'],
+            'batch_id': asked['batch_id'],
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(late.read_bytes(), original)
+        self.assertNotIn(asked['confirmation_token'], server.CONFIRMATIONS)
+
+    def test_begin_batch_uncapped_5000_timing(self):
+        tab = self._tab()
+        root = Path(self.folder.name)
+        for index in range(5000):
+            (root / f'img-{index:04d}.jpg').write_bytes(b'')
+        server.register_allowed_root(root, tab)
+        with patch.object(server, 'BATCH_SNAPSHOT_CAP', 5000):
+            started = time.perf_counter()
+            server.begin_tab_batch(tab, folder=root)
+            elapsed = time.perf_counter() - started
+        print(f'CROPPER_BEGIN_BATCH_TIMING uncapped_5000={elapsed:.4f}s', flush=True)
+
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
 class WindowsIntegrationTests(unittest.TestCase):

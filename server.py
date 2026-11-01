@@ -1043,7 +1043,8 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
     Overwrite tokens start as file-scoped. Don't-ask-again calls
     confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
     A new confirmation never inherits another token's batch_id, scope, or targets.
-    Batch-scoped replace tokens use the server snapshot, never the client list.
+    Batch-scoped replace tokens use the server snapshot. A confirm dialog for a
+    file outside that snapshot issues a single-use file token instead.
     """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
@@ -1053,6 +1054,15 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
         granted = scope
     if granted == "batch" and (snap.get("capped") or not snap.get("count")):
         granted = "files"
+    if granted == "batch" and targets:
+        cover = {
+            "targets": snap.get("paths") or frozenset(),
+            "identities": snap.get("identities") or frozenset(),
+            "tab_id": tab_id,
+            "session": session,
+        }
+        if not _snapshot_covers(_coverage_paths(plans, targets), cover):
+            granted = "files"
     if granted == "batch":
         covered = set(snap.get("paths") or ())
         identities = set(snap.get("identities") or ())
