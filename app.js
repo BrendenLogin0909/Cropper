@@ -799,6 +799,7 @@ async function loadFolder(path, preserve = false) {
   if (state.enhance.busy) { toast('Stop or finish the enhancement batch before changing folders.', true); return; }
   if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
   try {
+    await api('/api/begin-batch', {});
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
     const prior = preserve && state.index >= 0 ? state.images[state.index]?.path : null;
     if (data.path !== state.folder) $('images').scrollTop = 0;

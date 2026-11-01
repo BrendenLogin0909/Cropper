@@ -454,3 +454,104 @@ test('another tab cannot reuse a skip grant', async () => {
     child.kill();
   }
 });
+
+function makeLoadFolder(apiFn) {
+  const els = {};
+  const stub = () => ({
+    textContent: '',
+    value: '',
+    disabled: false,
+    classList: { add() {}, remove() {}, toggle() {} },
+    replaceChildren() {},
+    querySelector() { return { textContent: '' }; },
+    scrollTop: 0,
+  });
+  const state = {
+    folder: '', parent: null, images: [], folders: [], index: -1, folderLoadId: 0,
+    chatgpt: {
+      busy: false, reviewBusy: false, queuedPaths: new Set(), selected: new Set(),
+      pending: [], recovered: [], preview: null, review: null,
+    },
+    enhance: { busy: false, selected: new Set() },
+    restore: { busy: false, selected: new Set(), notNeeded: new Set(), marks: new Map() },
+    view: 'crop',
+  };
+  const context = {
+    state,
+    localStorage: { setItem() {}, getItem() { return null; } },
+    colorRequest: 0, colorScanning: false, colorScanFolder: '',
+    colorCandidates: new Map(), selectedPairs: new Set(),
+    $: (id) => els[id] ||= stub(),
+    toast(message, isError) { if (isError) throw new Error(message); },
+    renderFolders() {}, renderImages() {}, renderMerge() {},
+    clearChatgptPreview() {}, updateChatgptControls() {},
+    clearEnhancePreview() {}, renderEnhanceControls() {},
+    clearRestorationPreview() {}, renderRestorationControls() {},
+    clearEditor() { state.index = -1; },
+    updateControls() {},
+    async refreshChatgptPending() {},
+    async openImage() {},
+    api: apiFn,
+  };
+  const start = app.indexOf('async function loadFolder');
+  const end = app.indexOf('\nfunction renderFolders');
+  return vm.runInNewContext(`${app.slice(start, end)}\nloadFolder`, context);
+}
+
+test('browsing to another folder and back refuses the old dont-ask-again grant', async () => {
+  const python = pythonBin();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cropper-ow-browse-'));
+  const root = path.join(dataDir, 'root');
+  const folderA = path.join(root, 'A');
+  const folderB = path.join(root, 'B');
+  writeBatchPhotos(python, folderA, ['photo']);
+  fs.mkdirSync(folderB, { recursive: true });
+  const { child, base } = await startServer(python, dataDir, { dialogFolder: root });
+  const tab = 'e2e-tab-browse-batch';
+  try {
+    const session = await (await fetch(`${base}/api/session`, {
+      headers: { 'X-Cropper-Tab': tab },
+    })).json();
+    const client = loadCropClient({
+      base, token: session.token, els: {}, skipChecked: true, tab,
+    });
+    await client.api('/api/pick-folder', {});
+    await client.api('/api/settings', {
+      conflict_policy: 'overwrite',
+      replace_original: false,
+      filename_template: '{name}{suffix}{ext}',
+    });
+    const photo = path.join(folderA, 'photo.png');
+    const preview = await client.api('/api/overwrite-preview', {
+      paths: [photo], operation: 'crop',
+    });
+    const confirmed = await client.api('/api/confirm-overwrite-batch', {
+      confirmation_token: preview.confirmation_token,
+      batch_id: preview.batch_id,
+      skip_overwrite_prompt: true,
+    });
+    const loadFolder = makeLoadFolder(client.api);
+    await loadFolder(folderB);
+    await loadFolder(folderA);
+    const crop = await fetch(`${base}/api/crop`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Cropper-Token': session.token,
+        'X-Cropper-Tab': tab,
+      },
+      body: JSON.stringify({
+        ...cropPayload(folderA, 'photo'),
+        confirm_overwrite: true,
+        skip_overwrite_prompt: true,
+        confirmation_token: confirmed.confirmation_token,
+        batch_id: confirmed.batch_id,
+      }),
+    });
+    assert.equal(crop.status, 409);
+    const refused = await crop.json();
+    assert.equal(refused.code, 'overwrite_confirmation_required');
+  } finally {
+    child.kill();
+  }
+});
