@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: null, back: null, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
+const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, folderLoadId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: null, back: null, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
 state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
@@ -798,9 +798,12 @@ async function loadFolder(path, preserve = false) {
   if (state.chatgpt.queuedPaths.size && path !== state.folder) { toast('Start or clear queued GPT photos before changing folders.', true); return; }
   if (state.enhance.busy) { toast('Stop or finish the enhancement batch before changing folders.', true); return; }
   if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
+  const ticket = ++state.folderLoadId;
   try {
     await api('/api/begin-batch', {});
+    if (ticket !== state.folderLoadId) return;
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
+    if (ticket !== state.folderLoadId) return;
     const prior = preserve && state.index >= 0 ? state.images[state.index]?.path : null;
     if (data.path !== state.folder) $('images').scrollTop = 0;
     state.folder = data.path; state.parent = data.parent; state.images = data.images; state.folders = data.folders;
@@ -814,6 +817,7 @@ async function loadFolder(path, preserve = false) {
     $('go-parent').disabled = !data.parent;
     renderFolders(); renderImages();
     await refreshChatgptPending();
+    if (ticket !== state.folderLoadId) return;
     const priorIndex = data.images.findIndex(image => image.path === prior);
     if (priorIndex >= 0) await openImage(priorIndex);
     else { state.index = -1; clearEditor(); updateControls(); }
@@ -866,6 +870,7 @@ function clearEditor() {
 }
 async function openImage(index) {
   if (index < 0 || index >= state.images.length) return;
+  state.folderLoadId += 1;
   const ticket = ++state.requestId; state.index = index; state.points = []; state.rotation = 0; endZoom();
   clearLiveCropPreview();
   const item = state.images[index];
