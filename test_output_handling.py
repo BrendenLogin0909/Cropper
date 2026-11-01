@@ -2942,8 +2942,8 @@ class OutputHandlingTests(unittest.TestCase):
              patch.object(server, '_run_folder_dialog', side_effect=hang):
             status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
         self.assertEqual(status, 400)
-        self.assertRegex(body['error'], 'still open')
-        self.assertEqual(body.get('code'), 'dialog_still_open')
+        self.assertEqual(body['error'], 'The folder dialog timed out. Try again.')
+        self.assertNotEqual(body.get('code'), 'dialog_still_open')
         self.assertEqual(cancel_seen, [True])
 
         def quick(result, errors, cancel):
@@ -2994,6 +2994,39 @@ class OutputHandlingTests(unittest.TestCase):
                 time.sleep(0.05)
         self.assertEqual(later[0], 200)
         self.assertFalse(later[1].get('cancelled'))
+
+    def test_dialog_timeout_wording_depends_on_whether_thread_is_alive(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+
+        def exits_after_cancel(result, errors, cancel):
+            cancel.wait(5)
+
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 0.2), \
+             patch.object(server, '_run_folder_dialog', side_effect=exits_after_cancel):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400)
+        self.assertEqual(body['error'], 'The folder dialog timed out. Try again.')
+        self.assertNotIn('still open', body['error'])
+        self.assertNotEqual(body.get('code'), 'dialog_still_open')
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def stays_alive(result, errors, cancel):
+            started.set()
+            release.wait(20)
+
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 0.2), \
+             patch.object(server, '_run_folder_dialog', side_effect=stays_alive):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+            self.assertEqual(status, 400)
+            self.assertRegex(body['error'], 'still open')
+            self.assertEqual(body.get('code'), 'dialog_still_open')
+        release.set()
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
