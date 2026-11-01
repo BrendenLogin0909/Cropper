@@ -820,7 +820,7 @@ async function loadFolder(path, preserve = false) {
     if (ticket !== state.folderLoadId) return;
     const priorIndex = data.images.findIndex(image => image.path === prior);
     if (priorIndex >= 0) await openImage(priorIndex);
-    else { state.index = -1; clearEditor(); updateControls(); }
+    else if (state.index < 0) { clearEditor(); updateControls(); }
     if (state.view === 'merge') renderMerge();
     if (!data.images.length) toast('No supported images in this folder. Open a subfolder or choose another folder.');
   } catch (error) { toast(error.message, true); }

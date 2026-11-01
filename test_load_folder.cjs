@@ -107,3 +107,35 @@ test('stale loadFolder cannot clear a photo opened during refreshChatgptPending'
   assert.equal(state.index, 0);
   assert.equal(wasCleared(), false);
 });
+
+test('a photo opened after loadFolder began is never cleared', async () => {
+  let releasePending;
+  const pending = new Promise((resolve) => { releasePending = resolve; });
+  let listed = false;
+  const { loadFolder, state, wasCleared } = loadFolderHarness({
+    api: async (route) => {
+      if (String(route).startsWith('/api/begin-batch')) return { batch_id: 'batch-1' };
+      if (String(route).startsWith('/api/list')) {
+        listed = true;
+        return {
+          path: '/photos',
+          parent: null,
+          images: [{ path: '/photos/a.png', name: 'a.png', bytes: 12 }],
+          folders: [],
+        };
+      }
+      throw new Error(`unexpected ${route}`);
+    },
+    refresh: async () => { await pending; },
+    openImage: async (index) => { state.index = index; },
+  });
+  const loading = loadFolder('/photos');
+  const deadline = Date.now() + 1000;
+  while (!listed && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(listed, true);
+  state.index = 0;
+  releasePending();
+  await loading;
+  assert.equal(state.index, 0);
+  assert.equal(wasCleared(), false);
+});
