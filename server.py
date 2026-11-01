@@ -72,15 +72,6 @@ class FolderDialogBusy(ValueError):
         super().__init__(message)
 
 
-class FolderDialogBusy(ValueError):
-    """The native folder dialog is still open. The UI shows this as dialog_still_open."""
-
-    code = "dialog_still_open"
-
-    def __init__(self, message: str = "The folder dialog is still open.") -> None:
-        super().__init__(message)
-
-
 class ConfirmationRequired(Exception):
     """Raised when a write needs an overwrite/replace token before it can proceed."""
 
@@ -903,7 +894,7 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
 
     File tokens are single-use. skip_overwrite_prompt and confirm_replace never
     widen a file token; Don't-ask-again is POST /api/confirm-overwrite-batch.
-    Batch tokens stay reusable within their server-held batch (_batch_key).
+    Batch tokens stay reusable only for the server-held file list on that token.
     """
     _clear_granted()
     flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
@@ -916,6 +907,8 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
+        if kind == "overwrite" and not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+            return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
         return True
