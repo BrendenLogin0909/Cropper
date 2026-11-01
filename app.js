@@ -40,7 +40,7 @@ async function finishStageSelection(kind) {
   const paths = [...selection]; if (!paths.length) return;
   state.chatgpt.reviewBusy = true; renderEnhanceControls(); updateChatgptControls();
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     const preview = await api('/api/stage-finish', {paths, dry_run:true});
     const destinations = [...new Set(preview.items.flatMap(item => item.snapshots.map(path => path.split(/[\\/]/).slice(-2,-1)[0])))];
     if (!window.confirm(`Finish ${preview.items.length} file(s), including linked pair members, WITHOUT more processing?\n\nUnchanged snapshots will be saved in:\n${destinations.join('\n')}\n\nQueue sources will then be removed. No API calls or charges. Pending results must be reviewed first.`)) return;
@@ -556,7 +556,7 @@ async function saveEnhancedBatch() {
   let saved = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     extra = await ensureOverwriteConfirmed(paths, 'enhance');
   }
   catch (error) { state.enhance.busy = false; renderEnhanceControls(); toast(error.message, true); return; }
@@ -688,7 +688,7 @@ async function saveRestorationBatch() {
   let saved = 0, skipped = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     extra = await ensureOverwriteConfirmed(paths, 'enhance');
   }
   catch (error) { state.restore.busy = false; renderRestorationControls(); toast(error.message, true); return; }
@@ -800,7 +800,7 @@ async function loadFolder(path, preserve = false) {
   if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
   const ticket = ++state.folderLoadId;
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path });
     if (ticket !== state.folderLoadId) return;
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
     if (ticket !== state.folderLoadId) return;
@@ -1323,7 +1323,7 @@ async function generateChatgpt(selection = state.chatgpt.selected) {
   if (!paths.length) return;
   current.queuedPaths.clear();
   current.busy = true; current.stop = false;
-  try { await api('/api/begin-batch', {}); }
+  try { await api('/api/begin-batch', { path: state.folder }); }
   catch (error) { current.busy = false; toast(error.message, true); renderImages(); updateChatgptControls(); return; }
   current.failures = new Map();
   const concurrency = chatgptConcurrency;

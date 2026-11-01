@@ -53,12 +53,14 @@ TABS: dict[tuple[str, str], float] = {}
 ALLOWED_ROOTS: dict[tuple[str, str], set[str]] = {}
 TAB_IN_FLIGHT: dict[tuple[str, str], int] = {}
 TAB_BATCHES: dict[tuple[str, str], str] = {}
+TAB_SNAPSHOTS: dict[tuple[str, str], dict] = {}
 TABS_LOCK = threading.Lock()
 TAB_ID_MIN_LEN = 16
 TAB_ID_MAX_LEN = 128
 TAB_LIMIT = 32
 TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
 DIALOG_TIMEOUT_SECONDS = 300
+BATCH_SNAPSHOT_CAP = 5000
 _DIALOG_LOCK = threading.Lock()
 _GRANTED = threading.local()
 
@@ -459,6 +461,7 @@ def reset_tabs() -> None:
         ALLOWED_ROOTS.clear()
         TAB_IN_FLIGHT.clear()
         TAB_BATCHES.clear()
+        TAB_SNAPSHOTS.clear()
 
 
 def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
@@ -587,6 +590,7 @@ def _drop_tab_locked(key: tuple[str, str]) -> None:
     ALLOWED_ROOTS.pop(key, None)
     TAB_IN_FLIGHT.pop(key, None)
     TAB_BATCHES.pop(key, None)
+    TAB_SNAPSHOTS.pop(key, None)
     with CONFIRMATIONS_LOCK:
         _invalidate_tab_tokens_locked(key[0], key[1])
 
@@ -722,9 +726,14 @@ def _confirmation_public(token: str) -> dict:
     with CONFIRMATIONS_LOCK:
         record = CONFIRMATIONS.get(token) or {}
         batch_id = record.get("batch_id") or ""
+        snapshot_count = record.get("snapshot_count")
+        capped = bool(record.get("capped"))
     payload = {"confirmation_token": token}
     if batch_id:
         payload["batch_id"] = batch_id
+    if snapshot_count is not None:
+        payload["snapshot_count"] = int(snapshot_count)
+        payload["batch_grant"] = bool(snapshot_count) and not capped
     return payload
 
 
@@ -798,18 +807,205 @@ def _invalidate_tab_tokens_locked(session: str, tab_id: str) -> None:
         CONFIRMATIONS.pop(token, None)
 
 
-def begin_tab_batch(tab_id: str, session: str | None = None) -> str:
-    """Issue a new batch for this tab. Old overwrite and replace tokens are dropped."""
+def _file_identity(path: Path) -> tuple[str, int, int] | None:
+    """Resolved path plus st_dev/st_ino (Windows file index). None if the file is gone."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+        if stage_files.is_link(path) or stage_files.is_link(resolved):
+            return None
+        st = resolved.stat()
+    except OSError:
+        return None
+    return (stage_files.path_key(resolved), int(st.st_dev), int(st.st_ino))
+
+
+def _top_level_images(folder: Path) -> list[Path]:
+    """Top-level regular images only. No recursion; skip symlinks and junctions."""
+    found: list[Path] = []
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return found
+    for child in children:
+        try:
+            if stage_files.is_link(child):
+                continue
+            if not child.is_file() or child.suffix.lower() not in EXTENSIONS:
+                continue
+            found.append(child.resolve())
+        except OSError:
+            continue
+    return found
+
+
+def _resolve_batch_folder(folder, tab_id: str, session: str) -> Path | None:
+    if folder is None or not str(folder).strip():
+        return None
+    try:
+        path = stage_files.resolve_in_allowed_roots(
+            folder, allowed_roots_for(tab_id, session), label="The folder")
+    except ValueError:
+        return None
+    return path if path.is_dir() else None
+
+
+def _resolve_batch_sources(paths, tab_id: str, session: str) -> list[Path]:
+    roots = allowed_roots_for(tab_id, session)
+    found: list[Path] = []
+    seen: set[str] = set()
+    for value in paths or ():
+        try:
+            path = stage_files.resolve_in_allowed_roots(value, roots, label="That image")
+            if stage_files.is_link(path) or not path.is_file() or path.suffix.lower() not in EXTENSIONS:
+                continue
+            key = stage_files.path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+        except ValueError:
+            continue
+    return found
+
+
+def _fallback_batch_folder(tab_id: str, session: str) -> Path | None:
+    with TABS_LOCK:
+        previous = TAB_SNAPSHOTS.get((session, tab_id)) or {}
+        stored = previous.get("folder")
+    if stored:
+        folder = Path(stored)
+        if folder.is_dir():
+            return folder
+    roots = allowed_roots_for(tab_id, session)
+    return roots[0] if roots else None
+
+
+def _confined_mapped_paths(source: Path, tab_id: str, session: str) -> list[Path]:
+    """Server-computed output and snapshot paths, confined to write roots (O-6)."""
+    roots = stage_files.write_roots_for(allowed_roots_for(tab_id, session))
+    mapped: list[Path] = []
+    for operation in ("crop", "enhance", "restore", "colorize"):
+        try:
+            item = stage_files.plan(source, operation)
+        except ValueError:
+            continue
+        candidates: list[Path] = []
+        if item.get("output") is not None:
+            candidates.append(Path(item["output"]))
+        for snap in item.get("snapshots") or ():
+            candidates.append(Path(snap))
+        for candidate in candidates:
+            try:
+                stage_files.resolve_output_folder(
+                    candidate.parent, roots, label="The output folder")
+            except ValueError:
+                continue
+            mapped.append(candidate)
+    return mapped
+
+
+def _take_batch_snapshot(sources: list[Path], folder: Path | None,
+                         tab_id: str, session: str) -> dict:
+    """Immutable server-side snapshot. The client cannot supply or extend it."""
+    identities: set[tuple[str, int, int]] = set()
+    paths: set[str] = set()
+    capped = len(sources) > BATCH_SNAPSHOT_CAP
+    if not capped:
+        for source in sources:
+            ident = _file_identity(source)
+            key = stage_files.path_key(source)
+            paths.add(key)
+            if ident is not None:
+                identities.add(ident)
+            for mapped in _confined_mapped_paths(source, tab_id, session):
+                paths.add(stage_files.path_key(mapped))
+                mapped_ident = _file_identity(mapped)
+                if mapped_ident is not None:
+                    identities.add(mapped_ident)
+    return {
+        "folder": stage_files.path_key(folder) if folder is not None else "",
+        "identities": frozenset(identities),
+        "paths": frozenset(paths),
+        "count": len(sources),
+        "capped": capped,
+    }
+
+
+def current_batch_snapshot(tab_id: str, session: str | None = None) -> dict:
+    session = session or TOKEN
+    tab_id = normalize_tab_id(tab_id)
+    with TABS_LOCK:
+        record = TAB_SNAPSHOTS.get((session, tab_id))
+        return dict(record) if record else {
+            "batch_id": "", "folder": "", "identities": frozenset(),
+            "paths": frozenset(), "count": 0, "capped": False,
+        }
+
+
+def _snapshot_public(tab_id: str, session: str | None = None) -> dict:
+    snap = current_batch_snapshot(tab_id, session)
+    count = int(snap.get("count") or 0)
+    return {
+        "snapshot_count": count,
+        "batch_grant": bool(count) and not snap.get("capped"),
+    }
+
+
+def _snapshot_covers(paths: list[Path], record: dict) -> bool:
+    """True only when every path is in the immutable snapshot and still the same file."""
+    if not paths:
+        return False
+    allowed = record.get("targets") or frozenset()
+    identities = record.get("identities") or frozenset()
+    by_path = {item[0]: item for item in identities}
+    for path in paths:
+        key = stage_files.path_key(path)
+        if key not in allowed:
+            return False
+        try:
+            if stage_files.is_link(path):
+                return False
+        except OSError:
+            return False
+        stored = by_path.get(key)
+        if stored is None:
+            continue
+        if _file_identity(path) != stored:
+            return False
+    return True
+
+
+def _coverage_paths(plans: list[dict], targets: list[Path]) -> list[Path]:
+    found = list(targets or [])
+    for item in plans or ():
+        source = item.get("source")
+        if source is not None:
+            found.append(Path(source))
+    return found
+
+
+def begin_tab_batch(tab_id: str, session: str | None = None,
+                    folder=None, sources=None) -> str:
+    """Issue a new batch and freeze its server-side target set. Old tokens are dropped."""
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
     if not tab_id:
         raise ValueError("This browser tab must register a random id first.")
+    resolved_sources = _resolve_batch_sources(sources, tab_id, session) if sources else None
+    resolved_folder = _resolve_batch_folder(folder, tab_id, session)
+    if resolved_folder is None and not resolved_sources:
+        resolved_folder = _fallback_batch_folder(tab_id, session)
+    if resolved_sources is None:
+        resolved_sources = _top_level_images(resolved_folder) if resolved_folder else []
+    snap = _take_batch_snapshot(resolved_sources, resolved_folder, tab_id, session)
     batch_id = _new_batch_id()
+    snap["batch_id"] = batch_id
     with CONFIRMATIONS_LOCK:
         _purge_confirmations_locked()
         _invalidate_tab_tokens_locked(session, tab_id)
     with TABS_LOCK:
         TAB_BATCHES[(session, tab_id)] = batch_id
+        TAB_SNAPSHOTS[(session, tab_id)] = snap
     return batch_id
 
 
@@ -825,11 +1021,17 @@ def current_batch_id(tab_id: str, session: str | None = None) -> str:
 
 def _continuing_batch_token(kind: str, token: str, plans: list[dict],
                             session: str, tab_id: str, batch_id: str = "") -> str | None:
-    """Return token when it is a live batch-scoped grant for this tab and folder set."""
+    """Reuse a batch grant only when every write target is in the frozen snapshot."""
     record = _record_for_token(token, kind, plans, session, tab_id)
     if record is None or record.get("scope") != "batch":
         return None
     if not _batch_id_matches(record, {"batch_id": batch_id}):
+        return None
+    write_targets = (
+        stage_files.planned_overwrites(plans) if kind == "overwrite"
+        else stage_files.planned_replaces(plans)
+    )
+    if not (write_targets and _snapshot_covers(_coverage_paths(plans, write_targets), record)):
         return None
     return token
 
@@ -843,13 +1045,22 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
     Overwrite tokens start as file-scoped. Don't-ask-again calls
     confirm_overwrite_batch; skip_overwrite_prompt never upgrades scope here.
     A new confirmation never inherits another token's batch_id, scope, or targets.
+    Batch-scoped replace tokens use the server snapshot, never the client list.
     """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
-    covered = set(_target_keys(targets))
+    snap = current_batch_snapshot(tab_id, session)
     granted = "batch" if kind == "replace" else "files"
     if scope in {"batch", "files"}:
         granted = scope
+    if granted == "batch" and (snap.get("capped") or not snap.get("count")):
+        granted = "files"
+    if granted == "batch":
+        covered = set(snap.get("paths") or ())
+        identities = set(snap.get("identities") or ())
+    else:
+        covered = set(_target_keys(targets))
+        identities = {ident for ident in (_file_identity(path) for path in targets) if ident}
     batch_id = current_batch_id(tab_id, session)
     token = secrets.token_urlsafe(32)
     record = {
@@ -860,6 +1071,9 @@ def issue_confirmation(kind: str, plans: list[dict], targets: list[Path],
         "batch_id": batch_id,
         "scope": granted,
         "targets": frozenset(covered),
+        "identities": frozenset(identities),
+        "snapshot_count": int(snap.get("count") or 0),
+        "capped": bool(snap.get("capped")),
         "expires": _now() + CONFIRMATION_TTL_SECONDS,
     }
     with CONFIRMATIONS_LOCK:
@@ -876,7 +1090,8 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
 
     File tokens are single-use. skip_overwrite_prompt and confirm_replace never
     widen a file token; Don't-ask-again is POST /api/confirm-overwrite-batch.
-    Batch tokens stay reusable only for the server-held file list on that token.
+    Batch tokens stay reusable only for the immutable server snapshot.
+    An empty target list is never granted.
     """
     _clear_granted()
     flags = ("confirm_overwrite", "skip_overwrite_prompt") if kind == "overwrite" else ("confirm_replace",)
@@ -889,12 +1104,12 @@ def confirmation_allows(kind: str, payload: dict, plans: list[dict], targets: li
     if record is None or not _batch_id_matches(record, payload):
         return False
     if record.get("scope") == "batch":
-        if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+        if not (targets and _snapshot_covers(_coverage_paths(plans, targets), record)):
             return False
         _GRANTED.token = token
         _GRANTED.batch_id = record.get("batch_id")
         return True
-    if not (_target_keys(targets) <= (record.get("targets") or frozenset())):
+    if not (targets and (_target_keys(targets) <= (record.get("targets") or frozenset()))):
         return False
     with CONFIRMATIONS_LOCK:
         CONFIRMATIONS.pop(token, None)
@@ -906,8 +1121,8 @@ def confirm_overwrite_batch(payload: dict, session: str | None = None,
     """Issue a batch-wide token for Don't-ask-again. The file token is left unchanged.
 
     Requires a live overwrite token, the server-issued batch_id, and
-    skip_overwrite_prompt. The new token covers only the targets already stored
-    on that record for that batch_id. Crop/enhance/restore flags never do this.
+    skip_overwrite_prompt. The new token covers only the immutable server
+    snapshot for that batch. The confirm dialog list never defines scope.
     """
     session = session or TOKEN
     tab_id = normalize_tab_id(tab_id)
@@ -917,6 +1132,10 @@ def confirm_overwrite_batch(payload: dict, session: str | None = None,
     record = _live_record(token, "overwrite", session, tab_id)
     if record is None or not _batch_id_matches(record, payload):
         raise ValueError("That confirmation is no longer valid.")
+    snap = current_batch_snapshot(tab_id, session)
+    if (snap.get("batch_id") != record.get("batch_id")
+            or snap.get("capped") or not snap.get("count") or not snap.get("paths")):
+        raise ValueError("Don't ask again is not available for this folder.")
     granted = {
         "kind": "overwrite",
         "session": record["session"],
@@ -924,7 +1143,10 @@ def confirm_overwrite_batch(payload: dict, session: str | None = None,
         "batch": record["batch"],
         "batch_id": record["batch_id"],
         "scope": "batch",
-        "targets": frozenset(record.get("targets") or ()),
+        "targets": frozenset(snap.get("paths") or ()),
+        "identities": frozenset(snap.get("identities") or ()),
+        "snapshot_count": int(snap.get("count") or 0),
+        "capped": False,
         "expires": _now() + CONFIRMATION_TTL_SECONDS,
     }
     minted = secrets.token_urlsafe(32)
@@ -950,6 +1172,7 @@ def overwrite_response(plans: list[dict], data: dict | None, session: str | None
         "error": f"This batch would overwrite {len(targets)} existing file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
+        **_snapshot_public(tab_id, session),
         **_confirmation_public(token),
     }
 
@@ -970,6 +1193,7 @@ def replace_response(plans: list[dict], data: dict | None, session: str | None =
         "error": f"This batch would replace {len(targets)} original file(s). Confirm to continue.",
         "count": len(targets),
         "names": [path.name for path in targets],
+        **_snapshot_public(tab_id, session),
         **_confirmation_public(token),
     }
 
@@ -1187,14 +1411,21 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(200, {"cancelled": True, "path": None})
                     return
                 path = register_allowed_root(chosen, tab_id)
-                begin_tab_batch(tab_id)
-                self.json(200, {"cancelled": False, "path": str(path)})
+                batch_id = begin_tab_batch(tab_id, folder=path)
+                self.json(200, {
+                    "cancelled": False, "path": str(path), "batch_id": batch_id,
+                    **_snapshot_public(tab_id),
+                })
                 return
             if self.path == "/api/begin-batch":
                 tab_id = self.request_tab_id()
                 if not tab_id or not tab_is_registered(tab_id, TOKEN):
                     raise ValueError("This browser tab must register a random id first.")
-                self.json(200, {"batch_id": begin_tab_batch(tab_id)})
+                payload = data if isinstance(data, dict) else {}
+                raw_paths = payload.get("paths") if isinstance(payload.get("paths"), list) else None
+                batch_id = begin_tab_batch(
+                    tab_id, folder=payload.get("path"), sources=raw_paths)
+                self.json(200, {"batch_id": batch_id, **_snapshot_public(tab_id)})
                 return
             if self.path == "/api/settings":
                 if not isinstance(data, dict):
@@ -1252,6 +1483,7 @@ class Handler(BaseHTTPRequestHandler):
                     "replace_paths": [str(path) for path in replaces],
                 }
                 tab_id = self.request_tab_id()
+                body.update(_snapshot_public(tab_id))
                 overwrite_token = None
                 replace_token = None
                 if targets:

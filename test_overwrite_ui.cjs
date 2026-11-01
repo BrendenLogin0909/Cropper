@@ -25,6 +25,7 @@ function loadPromptHelpers() {
         textContent: '',
         checked: false,
         returnValue: 'cancel',
+        classList: { add() {}, remove() {}, toggle() { this.hidden = true; } },
         showModal() {
           this._open = true;
           queueMicrotask(() => { if (this._close) this._close(); });
@@ -128,6 +129,7 @@ function loadCropClient({ base, token, els, skipChecked, overwriteReturn = 'over
         textContent: '',
         checked: false,
         returnValue: 'cancel',
+        classList: { add() {}, remove() {}, toggle() {} },
         showModal() {
           if (id === 'overwrite-dialog') {
             dialogOpens.overwrite += 1;
@@ -516,6 +518,7 @@ test('browsing to another folder and back refuses the old dont-ask-again grant',
       base, token: session.token, els: {}, skipChecked: true, tab,
     });
     await client.api('/api/pick-folder', {});
+    await client.api('/api/begin-batch', { path: folderA });
     await client.api('/api/settings', {
       conflict_policy: 'overwrite',
       replace_original: false,
