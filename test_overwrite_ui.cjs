@@ -44,7 +44,8 @@ exported.hasReplaceAck = hasReplaceAck;
 exported.overwriteAckForBatch = overwriteAckForBatch;
 exported.replaceAckForBatch = replaceAckForBatch;
 exported.askOverwrite = askOverwrite;
-exported.askReplace = askReplace;`,
+exported.askReplace = askReplace;
+exported.applyOverwriteSkipLabel = applyOverwriteSkipLabel;`,
     context,
   );
   exported.el = context.$;
@@ -165,7 +166,7 @@ exported.tabId = tabId;`,
 
 test('overwrite and replace confirmation copy is per batch', () => {
   assert.match(html, /id="overwrite-dialog"/);
-  assert.match(html, /Don't ask again this batch/);
+  assert.match(html, /Don't ask again for the \d+ photos in this folder for 15 minutes/);
   assert.match(html, /data-testid="overwrite-confirm"/);
   assert.match(html, /data-testid="overwrite-cancel"/);
   assert.match(html, /id="replace-dialog"/);
@@ -202,6 +203,21 @@ test('GPS keep is an opt-in setting stripped by default', () => {
   assert.match(html, /Keep GPS location in saved photos/);
   assert.match(app, /keep_gps/);
   assert.doesNotMatch(html, /id="settings-keep-gps" checked/);
+});
+
+test('overwrite skip label uses the server snapshot count and hides when capped', () => {
+  const { helpers, els } = loadPromptHelpers();
+  helpers.applyOverwriteSkipLabel(4, true);
+  assert.equal(
+    els['overwrite-skip-label'].textContent,
+    "Don't ask again for the 4 photos in this folder for 15 minutes",
+  );
+  helpers.applyOverwriteSkipLabel(12, false);
+  assert.equal(
+    els['overwrite-skip-label'].textContent,
+    "Don't ask again for the 12 photos in this folder for 15 minutes",
+  );
+  assert.equal(els['overwrite-skip-line'].classList.hidden, true);
 });
 
 test('overwrite dialog cancel keeps the count and does not confirm', async () => {

@@ -250,7 +250,15 @@ function askModal(dialogId, confirmValue, countId, namesId, skipId, count, names
     try { dialog.showModal(); } catch (_) { dialog.setAttribute('open', ''); }
   });
 }
-function askOverwrite(count, names) {
+function applyOverwriteSkipLabel(snapshotCount, batchGrant) {
+  const count = Number.isFinite(Number(snapshotCount)) ? Number(snapshotCount) : 0;
+  const label = $('overwrite-skip-label');
+  if (label) label.textContent = `Don't ask again for the ${count} photos in this folder for 15 minutes`;
+  const line = $('overwrite-skip-line');
+  if (line) line.classList.toggle('hidden', batchGrant === false || count < 1);
+}
+function askOverwrite(count, names, snapshotCount, batchGrant) {
+  applyOverwriteSkipLabel(snapshotCount, batchGrant);
   return askModal('overwrite-dialog', 'overwrite', 'overwrite-dialog-count', 'overwrite-dialog-names', 'overwrite-skip-batch', count, names);
 }
 function askReplace(count, names) {
@@ -288,7 +296,7 @@ async function ensureOverwriteConfirmed(paths, operation) {
     if (stored) {
       Object.assign(extra, overwriteAckForBatch(stored, true));
     } else {
-      const decision = await askOverwrite(preview.count, preview.names);
+      const decision = await askOverwrite(preview.count, preview.names, preview.snapshot_count, preview.batch_grant);
       if (!decision.ok) throw new Error('Overwrite cancelled.');
       if (decision.skip) {
         const upgraded = await confirmOverwriteBatch(preview.confirmation_token, preview.batch_id);
@@ -324,7 +332,7 @@ async function api(path, body) {
         payload = { ...payload, ...overwriteAckForBatch(storedSkip, true) };
         continue;
       }
-      const decision = await askOverwrite(data.count, data.names);
+      const decision = await askOverwrite(data.count, data.names, data.snapshot_count, data.batch_grant);
       if (!decision.ok) {
         const error = new Error('Overwrite cancelled.');
         error.status = 409; error.code = data.code;
