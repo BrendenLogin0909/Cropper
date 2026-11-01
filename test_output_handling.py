@@ -1831,8 +1831,66 @@ class OutputHandlingTests(unittest.TestCase):
             'path': str(extra), 'points': corners, 'rotation': 0,
             **self._ack(confirmed, skip_overwrite_prompt=True),
         }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(body['code'], 'overwrite_confirmation_required')
+
+    def test_batch_token_refused_for_unlisted_file_and_later_run(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        root = Path(self.folder.name)
+        photo_a = root / 'a.jpg'
+        photo_b = root / 'b.jpg'
+        photo_c = root / 'c.jpg'
+        Image.new('RGB', (16, 16), 'red').save(photo_a)
+        Image.new('RGB', (16, 16), 'blue').save(photo_b)
+        Image.new('RGB', (16, 16), 'green').save(photo_c)
+        queue = root / stages.CROP_QUEUE
+        queue.mkdir(parents=True)
+        (queue / 'a_c.jpg').write_bytes(png('gray'))
+        (queue / 'b_c.jpg').write_bytes(png('gray'))
+        (queue / 'c_c.jpg').write_bytes(png('gray'))
+        self._open_folder(http.server_port, root, tab)
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'overwrite',
+            'replace_original': False,
+        })
+        status, preview = self._json(http.server_port, '/api/overwrite-preview', {
+            'paths': [str(photo_a)], 'operation': 'crop',
+        }, tab=tab)
         self.assertEqual(status, 200)
-        self.assertEqual(body['name'], 'extra_c.png')
+        self.assertEqual(preview['names'], ['a_c.jpg'])
+        status, confirmed = self._json(http.server_port, '/api/confirm-overwrite-batch', {
+            **self._ack(preview, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        corners = [[0, 0], [15, 0], [15, 15], [0, 15]]
+        status, listed = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_a), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        self.assertEqual(listed['name'], 'a_c.jpg')
+        status, refused_b = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_b), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused_b['code'], 'overwrite_confirmation_required')
+        status, later = self._json(http.server_port, '/api/overwrite-preview', {
+            'paths': [str(photo_c)], 'operation': 'crop',
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 200)
+        status, refused_c = self._json(http.server_port, '/api/crop', {
+            'path': str(photo_c), 'points': corners, 'rotation': 0,
+            **self._ack(confirmed, skip_overwrite_prompt=True),
+        }, tab=tab)
+        self.assertEqual(status, 409)
+        self.assertEqual(refused_c['code'], 'overwrite_confirmation_required')
 
     def test_file_token_plus_skip_never_widens(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
