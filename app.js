@@ -40,7 +40,7 @@ async function finishStageSelection(kind) {
   const paths = [...selection]; if (!paths.length) return;
   state.chatgpt.reviewBusy = true; renderEnhanceControls(); updateChatgptControls();
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     const preview = await api('/api/stage-finish', {paths, dry_run:true});
     const destinations = [...new Set(preview.items.flatMap(item => item.snapshots.map(path => path.split(/[\\/]/).slice(-2,-1)[0])))];
     if (!window.confirm(`Finish ${preview.items.length} file(s), including linked pair members, WITHOUT more processing?\n\nUnchanged snapshots will be saved in:\n${destinations.join('\n')}\n\nQueue sources will then be removed. No API calls or charges. Pending results must be reviewed first.`)) return;
@@ -250,7 +250,15 @@ function askModal(dialogId, confirmValue, countId, namesId, skipId, count, names
     try { dialog.showModal(); } catch (_) { dialog.setAttribute('open', ''); }
   });
 }
-function askOverwrite(count, names) {
+function applyOverwriteSkipLabel(snapshotCount, batchGrant) {
+  const count = Number.isFinite(Number(snapshotCount)) ? Number(snapshotCount) : 0;
+  const label = $('overwrite-skip-label');
+  if (label) label.textContent = `Don't ask again for the ${count} photos in this folder for 15 minutes`;
+  const line = $('overwrite-skip-line');
+  if (line) line.classList.toggle('hidden', batchGrant === false || count < 1);
+}
+function askOverwrite(count, names, snapshotCount, batchGrant) {
+  applyOverwriteSkipLabel(snapshotCount, batchGrant);
   return askModal('overwrite-dialog', 'overwrite', 'overwrite-dialog-count', 'overwrite-dialog-names', 'overwrite-skip-batch', count, names);
 }
 function askReplace(count, names) {
@@ -288,7 +296,7 @@ async function ensureOverwriteConfirmed(paths, operation) {
     if (stored) {
       Object.assign(extra, overwriteAckForBatch(stored, true));
     } else {
-      const decision = await askOverwrite(preview.count, preview.names);
+      const decision = await askOverwrite(preview.count, preview.names, preview.snapshot_count, preview.batch_grant);
       if (!decision.ok) throw new Error('Overwrite cancelled.');
       if (decision.skip) {
         const upgraded = await confirmOverwriteBatch(preview.confirmation_token, preview.batch_id);
@@ -324,7 +332,7 @@ async function api(path, body) {
         payload = { ...payload, ...overwriteAckForBatch(storedSkip, true) };
         continue;
       }
-      const decision = await askOverwrite(data.count, data.names);
+      const decision = await askOverwrite(data.count, data.names, data.snapshot_count, data.batch_grant);
       if (!decision.ok) {
         const error = new Error('Overwrite cancelled.');
         error.status = 409; error.code = data.code;
@@ -556,7 +564,7 @@ async function saveEnhancedBatch() {
   let saved = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     extra = await ensureOverwriteConfirmed(paths, 'enhance');
   }
   catch (error) { state.enhance.busy = false; renderEnhanceControls(); toast(error.message, true); return; }
@@ -688,7 +696,7 @@ async function saveRestorationBatch() {
   let saved = 0, skipped = 0; const failed = []; const archived = new Set(); let protectedNote = '';
   let extra = {};
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path: state.folder });
     extra = await ensureOverwriteConfirmed(paths, 'enhance');
   }
   catch (error) { state.restore.busy = false; renderRestorationControls(); toast(error.message, true); return; }
@@ -800,7 +808,7 @@ async function loadFolder(path, preserve = false) {
   if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
   const ticket = ++state.folderLoadId;
   try {
-    await api('/api/begin-batch', {});
+    await api('/api/begin-batch', { path });
     if (ticket !== state.folderLoadId) return;
     const data = await api(`/api/list?path=${encodeURIComponent(path)}`);
     if (ticket !== state.folderLoadId) return;
@@ -820,7 +828,7 @@ async function loadFolder(path, preserve = false) {
     if (ticket !== state.folderLoadId) return;
     const priorIndex = data.images.findIndex(image => image.path === prior);
     if (priorIndex >= 0) await openImage(priorIndex);
-    else { state.index = -1; clearEditor(); updateControls(); }
+    else if (state.index < 0) { clearEditor(); updateControls(); }
     if (state.view === 'merge') renderMerge();
     if (!data.images.length) toast('No supported images in this folder. Open a subfolder or choose another folder.');
   } catch (error) { toast(error.message, true); }
@@ -1541,7 +1549,7 @@ async function generateChatgpt(selection = state.chatgpt.selected) {
   if (!paths.length) return;
   current.queuedPaths.clear();
   current.busy = true; current.stop = false;
-  try { await api('/api/begin-batch', {}); }
+  try { await api('/api/begin-batch', { path: state.folder }); }
   catch (error) { current.busy = false; toast(error.message, true); renderImages(); updateChatgptControls(); return; }
   current.failures = new Map();
   const concurrency = chatgptConcurrency;
