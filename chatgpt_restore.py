@@ -152,7 +152,8 @@ def reassemble(front_png: bytes, composite: Path, split: int, layout: str) -> by
 
 
 def file_accepted(front: Path, front_png: bytes, composite: Path | None = None,
-                  composite_png: bytes | None = None, operation="restore", stage_routing=True) -> list[Path]:
+                  composite_png: bytes | None = None, operation="restore", stage_routing=True,
+                  output_paths=None) -> list[Path]:
     """Always file through stage_files. Old routing arguments cannot change paths."""
     if operation not in {'restore','colorize'}: raise ValueError('Invalid image operation.')
     sources = [front] + ([composite] if composite else [])
@@ -161,4 +162,5 @@ def file_accepted(front: Path, front_png: bytes, composite: Path | None = None,
     if len({path.resolve() for path in sources}) != len(sources):
         raise ValueError("Choose different front and combined files.")
     from stage_files import file_results
-    return file_results(sources, [front_png] + ([composite_png] if composite else []), operation)
+    return file_results(sources, [front_png] + ([composite_png] if composite else []), operation,
+                        output_paths=output_paths)

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from PIL import Image
+import app_settings
 import server
 import chatgpt_pending
 import photo_pairs
@@ -20,28 +21,45 @@ class StageServerTests(unittest.TestCase):
         self.stack=ExitStack(); self.addCleanup(self.stack.close)
         self.root=Path(self.stack.enter_context(TemporaryDirectory()))
         self.pending=self.root/'pending'
+        app_settings.configure_runtime(self.root)
+        self.addCleanup(lambda: setattr(app_settings, '_data_dir', None))
         stream=io.BytesIO();Image.new('RGB',(8,8),'blue').save(stream,'PNG');self.png=stream.getvalue()
         self.stack.enter_context(patch.object(photo_pairs,'ROOT',self.root/'links'))
         self.edit=self.stack.enter_context(patch.object(server,'edit_front',return_value=self.png))
         self.stack.enter_context(patch.object(server,'save_pending',side_effect=lambda source,png,**kwargs:chatgpt_pending.save_pending(source,png,self.pending,**kwargs)))
         self.stack.enter_context(patch.object(server,'get_pending',side_effect=lambda ident:chatgpt_pending.get_pending(ident,self.pending)))
         self.stack.enter_context(patch.object(server,'list_pending',side_effect=lambda folder:chatgpt_pending.list_pending(folder,self.pending)))
+        self.stack.enter_context(patch.object(server,'list_recovered',side_effect=lambda:chatgpt_pending.list_recovered(self.pending)))
         self.stack.enter_context(patch.object(server,'remove_pending',side_effect=lambda ident:chatgpt_pending.remove_pending(ident,self.pending)))
         self.stack.enter_context(patch.object(server,'attach_link',side_effect=lambda ident,link:chatgpt_pending.attach_link(ident,link,self.pending)))
+        self.stack.enter_context(patch.object(server,'keep_recovered',side_effect=lambda ident:chatgpt_pending.keep_recovered(ident,self.pending)))
+        self.stack.enter_context(patch.object(server,'discard_recovered',side_effect=lambda ident:chatgpt_pending.discard_recovered(ident,self.pending)))
         self.http=server.LocalServer(('127.0.0.1',0),server.Handler)
         threading.Thread(target=self.http.serve_forever,daemon=True).start()
         self.addCleanup(self.stop_server)
         self.base=f'http://127.0.0.1:{self.http.server_port}'
+        server.reset_tabs(); server.reset_confirmations()
+        self.tab='tabid-test-000001'
+        server.register_tab(self.tab)
+        with patch.object(server,'choose_folder_dialog',return_value=self.root):
+            request=Request(self.base+'/api/pick-folder',b'{}',{'X-Cropper-Token':server.TOKEN,'X-Cropper-Tab':self.tab,'Content-Type':'application/json'})
+            with urlopen(request) as response: json.load(response)
 
     def stop_server(self):
         self.http.shutdown();self.http.server_close()
 
     def post(self,endpoint,body):
-        request=Request(self.base+endpoint,json.dumps(body).encode(),{'X-Cropper-Token':server.TOKEN,'Content-Type':'application/json'})
+        request=Request(self.base+endpoint,json.dumps(body).encode(),{'X-Cropper-Token':server.TOKEN,'X-Cropper-Tab':self.tab,'Content-Type':'application/json'})
         with urlopen(request) as response:return json.load(response)
 
     def source(self,folder,name):
-        source=self.root/folder/name;source.parent.mkdir(parents=True,exist_ok=True);source.write_bytes(self.png);return source
+        source=self.root/folder/name;source.parent.mkdir(parents=True,exist_ok=True)
+        suffix=Path(name).suffix.lower()
+        if suffix in {'.jpg','.jpeg'}:
+            stream=io.BytesIO();Image.new('RGB',(8,8),'blue').save(stream,'JPEG');source.write_bytes(stream.getvalue())
+        else:
+            source.write_bytes(self.png)
+        return source
 
     def test_new_routing_survives_pending_reload_and_is_not_changed_at_acceptance(self):
         source=self.source(stages.CROP_QUEUE,'photo_c.png')
@@ -53,14 +71,25 @@ class StageServerTests(unittest.TestCase):
         self.assertTrue((self.root/stages.SKIP_ENHANCE/source.name).exists())
         self.assertFalse(source.exists());self.assertEqual(self.edit.call_count,1)
 
-    def test_invalid_input_stage_is_rejected_before_api_call(self):
-        source=self.source('other','photo.png')
-        for flag in [True,False,None]:
-            body={'front_path':str(source)}
-            if flag is not None:body['stage_routing']=flag
-            with self.assertRaises(HTTPError) as caught:
-                self.post('/api/chatgpt-generate',body)
-            self.assertEqual(caught.exception.code,400);caught.exception.close();self.edit.assert_not_called();self.assertTrue(source.exists())
+    def test_nested_and_completed_stage_restore_use_output_settings(self):
+        nested=self.source(str(Path(stages.CROP_QUEUE)/'old-output'),'photo.png')
+        completed=self.source(stages.AI_QUEUE,'done.png')
+        for source in [nested, completed]:
+            self.edit.reset_mock()
+            record=self.post('/api/chatgpt-generate',{'front_path':str(source)})
+            self.post('/api/chatgpt-accept',{'id':record['id']})
+            self.assertTrue(source.exists())
+            self.assertTrue((source.parent/f'{source.stem}_ai.png').exists())
+            self.assertEqual(self.edit.call_count,1)
+
+    def test_non_stage_folder_is_accepted_for_ai_restore(self):
+        source=self.source('other','[Scan]_20261027_0004 [B&W].jpg')
+        record=self.post('/api/chatgpt-generate',{'front_path':str(source)})
+        self.post('/api/chatgpt-accept',{'id':record['id']})
+        self.assertTrue((source.parent/'[Scan]_20261027_0004 [B&W]_ai.png').exists())
+        self.assertTrue(source.exists())
+        self.assertEqual(self.edit.call_count,1)
+        self.assertFalse((source.parent/stages.AI_QUEUE).exists())
 
     def test_false_and_missing_flags_cannot_restore_legacy_filing(self):
         for index, flag in enumerate([False, None]):
@@ -100,7 +129,7 @@ class StageServerTests(unittest.TestCase):
     def test_finish_preview_then_files_both_pair_members_without_api(self):
         front=self.source(stages.ENHANCE_QUEUE,'photo_c_e.png')
         combined=self.source(stages.ENHANCE_QUEUE,'photo_front-back_c_e.png')
-        photo_pairs.approve_link(front,combined,50,'right')
+        photo_pairs.approve_link(front,combined,50,'right',allowed_roots=[front.parent])
         preview=self.post('/api/stage-finish',{'paths':[str(front)],'dry_run':True})
         self.assertEqual(len(preview['items']),2);self.assertTrue(front.exists());self.assertTrue(combined.exists())
         result=self.post('/api/stage-finish',{'paths':[str(front)],'dry_run':False})

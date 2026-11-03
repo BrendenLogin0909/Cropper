@@ -7,12 +7,15 @@ import unittest
 from unittest.mock import patch
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.parse import quote
 from types import SimpleNamespace
 
 from PIL import Image
+import app_settings
 import server
 import chatgpt_pending
 import photo_pairs
+import stage_files as stages
 
 
 class ServerPendingTests(unittest.TestCase):
@@ -21,10 +24,21 @@ class ServerPendingTests(unittest.TestCase):
             queue=Path(folder)/'1.5. TBP Cropped';queue.mkdir()
             source = queue / 'front.png'
             Image.new('RGB', (8, 8), 'gray').save(source)
+            app_settings.configure_runtime(folder)
             local_server = server.LocalServer(('127.0.0.1', 0), server.Handler)
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
             base = f'http://127.0.0.1:{local_server.server_port}'
+            tab = 'tabid-test-000001'
+            server.reset_tabs()
+            server.reset_confirmations()
+            server.register_tab(tab)
+            with patch.object(server, 'choose_folder_dialog', return_value=queue):
+                pick = Request(base + '/api/pick-folder', b'{}', {
+                    'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json',
+                })
+                with urlopen(pick) as response:
+                    json.load(response)
             cases = [
                 (429, 'rate_limit_exceeded', 'rate_limit_error', 429),
                 (429, 'billing_not_active', 'insufficient_quota', 429),
@@ -38,6 +52,7 @@ class ServerPendingTests(unittest.TestCase):
             try:
                 with patch.object(server, 'read_links', return_value=[]), \
                      patch.object(server, 'list_pending', return_value=[]), \
+                     patch.object(server, 'list_recovered', return_value=[]), \
                      patch.object(server, 'save_pending') as save:
                     for status, code, kind, expected in cases:
                         with self.subTest(status=status, code=code):
@@ -48,7 +63,7 @@ class ServerPendingTests(unittest.TestCase):
                             error.response = SimpleNamespace(headers={'retry-after': '300', 'x-request-id': 'req_example'})
                             request = Request(base + '/api/chatgpt-generate',
                                 json.dumps({'front_path': str(source)}).encode(),
-                                {'X-Cropper-Token': server.TOKEN, 'Content-Type': 'application/json'})
+                                {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': tab, 'Content-Type': 'application/json'})
                             with patch.object(server, 'edit_front', side_effect=error), \
                                  self.assertRaises(HTTPError) as caught:
                                 urlopen(request)
@@ -83,16 +98,27 @@ class ServerPendingTests(unittest.TestCase):
                 source.write_bytes(image.getvalue())
             composite = root / 'combined.png'
             Image.new('RGB', (16, 8), 'ivory').save(composite)
+            app_settings.configure_runtime(folder)
             local_server = server.LocalServer(("127.0.0.1", 0), server.Handler)
             thread = threading.Thread(target=local_server.serve_forever, daemon=True)
             thread.start()
             base = f"http://127.0.0.1:{local_server.server_port}"
-            headers = {"X-Cropper-Token": server.TOKEN}
+            tab = 'tabid-test-000001'
+            server.reset_tabs()
+            server.reset_confirmations()
+            server.register_tab(tab)
+            headers = {"X-Cropper-Token": server.TOKEN, "X-Cropper-Tab": tab}
 
             def post(endpoint, payload):
                 request = Request(base + endpoint, json.dumps(payload).encode(), {**headers, "Content-Type": "application/json"})
                 with urlopen(request) as response:
                     return json.load(response)
+
+            def open_folder(path):
+                with patch.object(server, 'choose_folder_dialog', return_value=Path(path)):
+                    request = Request(base + "/api/pick-folder", b'{}', {**headers, "Content-Type": "application/json"})
+                    with urlopen(request) as response:
+                        return json.load(response)
 
             try:
                 with patch.object(photo_pairs, 'ROOT', root / 'links'), \
@@ -102,10 +128,12 @@ class ServerPendingTests(unittest.TestCase):
                      patch.object(server, "save_pending", side_effect=lambda source, png, **kw: chatgpt_pending.save_pending(source, png, pending, **kw)), \
                      patch.object(server, "get_pending", side_effect=lambda ident: chatgpt_pending.get_pending(ident, pending)), \
                      patch.object(server, "list_pending", side_effect=lambda location: chatgpt_pending.list_pending(location, pending)), \
+                     patch.object(server, "list_recovered", side_effect=lambda: chatgpt_pending.list_recovered(pending)), \
                      patch.object(server, "remove_pending", side_effect=lambda ident: chatgpt_pending.remove_pending(ident, pending)):
+                    open_folder(root)
                     post('/api/photo-link', {'front_path':str(sources[0]), 'composite_path':str(composite), 'split':50, 'layout':'right'})
                     first = post("/api/chatgpt-generate", {"front_path": str(sources[0])})
-                    self.assertEqual(first['link']['composite_path'], str(composite))
+                    self.assertTrue(stages.same_path(first['link']['composite_path'], composite))
                     second = post("/api/chatgpt-generate", {"front_path": str(sources[1])})
                     self.assertNotEqual(first["id"], second["id"])
                     self.assertTrue(all(source.is_file() for source in sources))
@@ -122,7 +150,7 @@ class ServerPendingTests(unittest.TestCase):
                     self.assertFalse((root.parent / "1.7. TBP AI-Improved" / "b_ai.png").exists())
                     monochrome=root/'mono.png';Image.new('RGB',(8,8),'gray').save(monochrome)
                     detection=post('/api/colorization-candidates',{'path':str(root)})
-                    self.assertTrue(any(item['path']==str(monochrome) and item['suggested'] for item in detection['items']))
+                    self.assertTrue(any(stages.same_path(item['path'], monochrome) and item['suggested'] for item in detection['items']))
                     colored=post('/api/chatgpt-generate',{'front_path':str(monochrome),'operation':'colorize'})
                     self.assertEqual(colored['operation'],'colorize')
                     self.assertEqual(edit.call_args.kwargs,{'operation':'colorize'})

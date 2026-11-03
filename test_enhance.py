@@ -8,6 +8,7 @@ from PIL import Image
 
 from enhance import _lift_weak_color, auto_enhance
 from server import save_enhanced_image
+import stage_files as stages
 
 
 class EnhanceTests(unittest.TestCase):
@@ -109,7 +110,7 @@ class EnhanceTests(unittest.TestCase):
             self.assertEqual(size, (80, 60))
             self.assertEqual(first.name, "old_e.jpg")
             self.assertFalse(source.exists())
-            self.assertEqual(archived, Path(temporary) / "2. Cropped" / "old.jpg")
+            self.assertTrue(stages.same_path(archived, Path(temporary) / "2. Cropped" / "old.jpg"))
             self.assertEqual(archived.read_bytes(), original)
 
 
