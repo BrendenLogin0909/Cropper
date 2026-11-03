@@ -10,7 +10,22 @@
 .chatgpt-pending-list{display:grid;gap:5px;max-height:260px;overflow-y:auto}
 .chatgpt-pending-list button{width:100%;border:1px solid #34454b;border-radius:7px;background:#19272e;color:#dceae9;text-align:left;padding:8px;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chatgpt-pending-list button:hover,.chatgpt-pending-list button.active{border-color:#73dec9;background:#214039}
-#chatgpt-comment { width:100%; box-sizing:border-box; resize:vertical; min-height:90px; padding:10px; background:var(--surface, #18262c); color:inherit; border:1px solid #34464f; border-radius:8px; font:inherit; }
+#chatgpt-comment, .chatgpt-guidance textarea, .guidance-used textarea { width:100%; box-sizing:border-box; resize:vertical; min-height:90px; padding:10px; background:var(--surface, #18262c); color:inherit; border:1px solid #34464f; border-radius:8px; font:inherit; }
+.chatgpt-guidance { margin:0 18px 16px; padding:10px 12px; border:1px solid #33434b; border-radius:8px; background:#19262c; color:#a8bbc2; font-size:11px; line-height:1.45; flex-shrink:0; }
+.chatgpt-guidance summary { cursor:pointer; color:#8ee6d4; font-weight:700; }
+.chatgpt-guidance > p, .chatgpt-guidance .aspect-note { margin:8px 0 10px; }
+.guidance-field-meta { display:flex; justify-content:flex-end; margin:-6px 0 8px; color:#8aa0a8; font-size:10px; }
+.guidance-truncation { margin:0 0 10px; color:#e9c18e; font-size:10px; line-height:1.45; }
+.guidance-notes-count { margin:8px 0 0; color:#91a4ad; font-size:10px; }
+.guidance-photo-list { display:grid; gap:8px; max-height:440px; overflow-y:auto; margin-top:8px; }
+.guidance-photo-row { display:grid; grid-template-columns:48px minmax(0,1fr); gap:8px; align-items:start; }
+.guidance-photo-row img { width:48px; height:48px; object-fit:cover; border-radius:5px; background:#0b1115; }
+.guidance-photo-row .field { margin-bottom:0; }
+.guidance-photo-row textarea { min-height:64px; }
+.guidance-used { margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid #34464f; }
+.guidance-used-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:10px; color:#dceae9; font-size:12px; font-weight:700; }
+.guidance-used-head .button { padding:6px 10px; font-size:11px; }
+.guidance-used textarea[readonly] { opacity:.85; }
 #chatgpt-resubmit { white-space:normal; }
 #chatgpt-resubmit-dialog { max-width:520px; padding:24px; background:#18262c; color:#e0efef; border:1px solid #476066; border-radius:12px; }
 #chatgpt-resubmit-dialog::backdrop { background:#0009; }
