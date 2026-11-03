@@ -514,6 +514,7 @@ function makeLoadFolder(apiFn) {
     updateControls() {},
     async refreshChatgptPending() {},
     async openImage() {},
+    resetFolderNeedsPickChrome() {},
     api: apiFn,
   };
   const start = app.indexOf('async function loadFolder');

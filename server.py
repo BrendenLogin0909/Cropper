@@ -576,6 +576,25 @@ def allowed_roots_for(tab_id: str, session: str | None = None) -> list[Path]:
     return [Path(key) for key in keys]
 
 
+def folder_is_registered(value: str, tab_id: str, session: str | None = None) -> bool:
+    """True only when this folder is already in the tab's allowed roots.
+
+    Read-only: does not register a path, start a batch, or return a listing.
+    Traversal, symlink, and junction escapes report as unregistered, the same
+    as a missing path, so the check cannot leak filesystem details.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    roots = allowed_roots_for(tab_id, session)
+    if not roots:
+        return False
+    try:
+        path = stage_files.resolve_in_allowed_roots(value, roots, label="Folder")
+        return path.is_dir()
+    except (ValueError, OSError):
+        return False
+
+
 def normalize_tab_id(value: object) -> str:
     text = str(value or "").strip()
     if not TAB_ID_MIN_LEN <= len(text) <= TAB_ID_MAX_LEN:
@@ -1336,6 +1355,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/chatgpt-pending":
                 folder = self.request_folder(query.get("path", [""])[0])
                 self.json(200, {"items": list_pending(folder), "recovered": list_recovered()})
+                return
+            if parsed.path == "/api/folder-status":
+                registered = folder_is_registered(query.get("path", [""])[0], self.request_tab_id())
+                self.json(200, {"registered": registered})
                 return
             if parsed.path == "/api/folders":
                 self.json(200, folder_listing(query.get("path", [""])[0]))

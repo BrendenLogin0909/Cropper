@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, folderLoadId: 0, picker: null, pickerRequest: 0, view: 'crop', merge: { front: null, back: null, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
+const state = { token: '', home: '', folder: '', parent: null, images: [], folders: [], index: -1, points: [], width: 0, height: 0, rotation: 0, zoom: false, drag: -1, pointer: null, busy: false, requestId: 0, folderLoadId: 0, picker: null, pickerRequest: 0, folderNeedsPick: '', view: 'crop', merge: { front: null, back: null, frontInfo: null, backInfo: null, busy: false }, enhance: { selected: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false }, restore: { selected: new Set(), notNeeded: new Set(), preview: -1, requestId: 0, previewUrl: null, busy: false, stop: false, resultsFolder: '', marks: new Map(), brush: false, drawing: null, showMarks: false } };
 state.chatgpt = { selected: new Set(), queuedPaths: new Set(), batchPaths: null, anchor: -1, preview: null, pending: [], recovered: [], review: null, busy: false, total: 0, completed: 0, stop: false };
 const RESTORE_INFO = {
   dust: { title: 'Dust repair', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Removes only isolated marks and short scratches the app can identify with high confidence. Review faces, clothing details, and textured areas in the preview.' },
@@ -187,7 +187,10 @@ async function assignImage(img, resource) {
   return objectUrl;
 }
 function assignImageLater(img, resource) {
-  assignImage(img, resource).catch(() => { img.removeAttribute('src'); });
+  assignImage(img, resource).catch((error) => {
+    img.removeAttribute('src');
+    handleOutsideAllowedFolder(error);
+  });
 }
 const batchPromptState = { overwriteSkip: [], overwriteBatchIds: {}, replaceTokens: [], replaceBatchIds: {} };
 function hasOverwriteSkip(token) { return !!(token && batchPromptState.overwriteSkip.includes(token)); }
@@ -802,6 +805,86 @@ async function selectPickerFolder() {
     renderMerge();
   }
 }
+const FOLDER_NEEDS_PICK_COPY = 'Cropper needs you to pick this folder again before it can open your photos.';
+function isOutsideAllowedFolder(error) {
+  return /outside the allowed folder/i.test(String(error && error.message || error || ''));
+}
+function emptyStateCopy() {
+  if (state.folderNeedsPick) return FOLDER_NEEDS_PICK_COPY;
+  return state.folder ? 'Double-click an image in the explorer to begin.' : 'Pick an image folder to start your batch.';
+}
+function resetFolderNeedsPickChrome() {
+  const rememberedEl = $('empty-remembered-path');
+  if (rememberedEl) {
+    rememberedEl.textContent = '';
+    rememberedEl.classList.add('hidden');
+  }
+  const browse = $('empty-open');
+  if (browse) browse.innerHTML = 'Open image folder <span>→</span>';
+}
+function showFolderNeedsPick(path) {
+  const remembered = String(path || '').trim();
+  if (!remembered) return;
+  const already = state.folderNeedsPick === remembered;
+  state.folderNeedsPick = remembered;
+  state.folder = '';
+  state.parent = null;
+  state.images = [];
+  state.folders = [];
+  state.index = -1;
+  const pathBox = $('folder-path');
+  if (pathBox) pathBox.value = remembered;
+  const folderCount = $('folder-count');
+  if (folderCount) folderCount.textContent = '0';
+  const imageCount = $('image-count');
+  if (imageCount) imageCount.textContent = '0';
+  const rememberedEl = $('empty-remembered-path');
+  if (rememberedEl) {
+    rememberedEl.textContent = remembered;
+    rememberedEl.classList.remove('hidden');
+  }
+  const browse = $('empty-open');
+  if (browse) {
+    browse.textContent = 'Browse…';
+    if (browse.classList && browse.classList.add) browse.classList.add('button-primary');
+  }
+  const images = $('images');
+  if (images) {
+    if (images.querySelectorAll) images.querySelectorAll('img[data-object-url]').forEach(revokeDatasetUrl);
+    if (images.replaceChildren) images.replaceChildren();
+  }
+  const folders = $('folders');
+  if (folders && folders.replaceChildren) folders.replaceChildren();
+  if (already && !images?.querySelector?.('.image-tile')) {
+    clearEditor();
+    return;
+  }
+  clearEditor();
+  if (typeof renderFolders === 'function') renderFolders();
+  if (typeof renderImages === 'function') renderImages();
+}
+function handleOutsideAllowedFolder(error) {
+  if (!isOutsideAllowedFolder(error)) return false;
+  const remembered = state.folderNeedsPick
+    || state.folder
+    || ($('folder-path') && $('folder-path').value)
+    || (typeof localStorage !== 'undefined' && localStorage.getItem('cropper-last-folder'))
+    || '';
+  showFolderNeedsPick(remembered);
+  return true;
+}
+async function restoreRememberedFolder() {
+  const last = localStorage.getItem('cropper-last-folder');
+  if (!last) return;
+  try {
+    const status = await api(`/api/folder-status?path=${encodeURIComponent(last)}`);
+    if (status && status.registered) {
+      await loadFolder(last);
+      return;
+    }
+  } catch (_) {}
+  showFolderNeedsPick(last);
+}
 async function loadFolder(path, preserve = false) {
   if (state.chatgpt.busy || state.chatgpt.reviewBusy || state.chatgpt.resubmissions?.size) { toast('Wait for active image requests before changing folders. You can still review other pending images.', true); return; }
   if (state.chatgpt.queuedPaths.size && path !== state.folder) { toast('Start or clear queued GPT photos before changing folders.', true); return; }
@@ -816,6 +899,8 @@ async function loadFolder(path, preserve = false) {
     const openPath = state.index >= 0 ? state.images[state.index]?.path : null;
     const prior = preserve && openPath ? openPath : null;
     if (data.path !== state.folder) $('images').scrollTop = 0;
+    state.folderNeedsPick = '';
+    resetFolderNeedsPickChrome();
     state.folder = data.path; state.parent = data.parent; state.images = data.images; state.folders = data.folders;
     colorRequest++;colorScanning=false;colorScanFolder='';colorCandidates.clear();selectedPairs.clear();
     $('photo-pairs-suggestions').replaceChildren();$('photo-pairs-manual-preview').replaceChildren();
@@ -877,8 +962,10 @@ function renderImages() {
 function clearEditor() {
   state.points = []; state.rotation = 0; state.width = 0; state.height = 0; endZoom();
   $('image-layer').classList.add('hidden'); $('empty-state').classList.remove('hidden');
-  $('image-title').textContent = 'Ready when you are'; $('image-subtitle').textContent = state.folder ? 'Double-click an image in the explorer to begin.' : 'Open a folder, then double-click an image to begin.';
-  $('empty-state').querySelector('p').textContent = state.folder ? 'Double-click an image in the explorer to begin.' : 'Pick an image folder to start your batch.';
+  $('image-title').textContent = 'Ready when you are';
+  $('image-subtitle').textContent = state.folderNeedsPick ? FOLDER_NEEDS_PICK_COPY : (state.folder ? 'Double-click an image in the explorer to begin.' : 'Open a folder, then double-click an image to begin.');
+  const emptyCopy = $('empty-state-copy') || $('empty-state').querySelector('p');
+  if (emptyCopy) emptyCopy.textContent = emptyStateCopy();
   $('position').textContent = `— / ${state.images.length || '—'}`; renderOverlay();
 }
 async function openImage(index) {
@@ -900,7 +987,9 @@ async function openImage(index) {
     $('empty-state').classList.add('hidden'); $('image-layer').classList.remove('hidden');
     $('image-subtitle').textContent = `${info.width.toLocaleString()} × ${info.height.toLocaleString()} px  ·  ${formatBytes(item.bytes)}`;
     fitImage(); renderOverlay(); updateControls();
-  } catch (error) { toast(error.message, true); }
+  } catch (error) {
+    if (!handleOutsideAllowedFolder(error)) toast(error.message, true);
+  }
 }
 function fitImage() {
   if (state.index < 0 || !state.width) return;
@@ -1905,8 +1994,7 @@ async function init() {
     state.stageRoutingAvailable = session.stage_routing_version >= 2;
     state.hasKey = session.has_key !== false;
     wire();
-    const last = localStorage.getItem('cropper-last-folder');
-    if (last) await loadFolder(last);
+    await restoreRememberedFolder();
     if (!state.stageRoutingAvailable && stageRoutingEnabled()) toast('Flat stage routing is installed but needs an idle Cropper server restart on 8767 before new saves.', true);
     try {
       const settings = await api('/api/settings');
