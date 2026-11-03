@@ -3529,6 +3529,134 @@ class OutputHandlingTests(unittest.TestCase):
             elapsed = time.perf_counter() - started
         print(f'CROPPER_BEGIN_BATCH_TIMING uncapped_5000={elapsed:.4f}s', flush=True)
 
+    def _folder_status(self, port, folder, tab):
+        return self._get(port, f'/api/folder-status?path={quote(str(folder))}', tab=tab)
+
+    def _roots_snapshot(self):
+        return {key: set(paths) for key, paths in server.ALLOWED_ROOTS.items()}
+
+    def test_folder_status_does_not_register_and_reports_only_registered(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            chosen = Path(tmp) / 'picked'
+            other = Path(tmp) / 'other'
+            chosen.mkdir()
+            other.mkdir()
+            Image.new('RGB', (8, 8), 'red').save(chosen / 'front.jpg')
+            Image.new('RGB', (8, 8), 'blue').save(other / 'secret.jpg')
+            status, body = self._folder_status(http.server_port, chosen, tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {'registered': False})
+            self.assertEqual(set(body.keys()), {'registered'})
+            self.assertEqual(server.allowed_roots_for(tab), [])
+            self.assertEqual(self._roots_snapshot(), {})
+            self.assertNotIn((server.TOKEN, tab), server.TAB_SNAPSHOTS)
+            self._open_folder(http.server_port, chosen, tab)
+            roots_after_pick = self._roots_snapshot()
+            snaps_after_pick = dict(server.TAB_SNAPSHOTS)
+            self.assertTrue(server.allowed_roots_for(tab))
+            status, body = self._folder_status(http.server_port, chosen, tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {'registered': True})
+            status, body = self._folder_status(http.server_port, other, tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {'registered': False})
+            self.assertNotIn('images', body)
+            self.assertNotIn('folders', body)
+            self.assertNotIn('path', body)
+            self.assertEqual(self._roots_snapshot(), roots_after_pick)
+            self.assertEqual(server.TAB_SNAPSHOTS, snaps_after_pick)
+            listed_roots = [Path(key) for key in server.ALLOWED_ROOTS.get((server.TOKEN, tab), ())]
+            self.assertFalse(any(stages.same_path(root, other) for root in listed_roots))
+            thumb = self._get(
+                http.server_port,
+                f'/api/thumb?path={quote(str(other / "secret.jpg"))}',
+                tab=tab,
+            )
+            self.assertEqual(thumb[0], 400)
+            self.assertRegex(thumb[1]['error'], 'outside the allowed folder')
+
+    def test_folder_status_traversal_is_unregistered(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'allowed'
+            outside = Path(tmp) / 'outside'
+            nested = allowed / 'nested'
+            allowed.mkdir()
+            outside.mkdir()
+            nested.mkdir()
+            Image.new('RGB', (8, 8), 'red').save(allowed / 'ok.jpg')
+            Image.new('RGB', (8, 8), 'blue').save(outside / 'secret.jpg')
+            self._open_folder(http.server_port, allowed, tab)
+            roots_before = self._roots_snapshot()
+            traversed = nested / '..' / '..' / 'outside'
+            status, body = self._folder_status(http.server_port, traversed, tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {'registered': False})
+            self.assertEqual(set(body.keys()), {'registered'})
+            self.assertNotIn('images', body)
+            self.assertNotIn('folders', body)
+            self.assertEqual(self._roots_snapshot(), roots_before)
+            listed_roots = [Path(key) for key in server.ALLOWED_ROOTS.get((server.TOKEN, tab), ())]
+            self.assertFalse(any(stages.same_path(root, outside) for root in listed_roots))
+            thumb = self._get(
+                http.server_port,
+                f'/api/thumb?path={quote(str(outside / "secret.jpg"))}',
+                tab=tab,
+            )
+            self.assertEqual(thumb[0], 400)
+
+    def test_folder_status_symlink_or_junction_escape_is_unregistered(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with TemporaryDirectory() as tmp:
+            allowed = Path(tmp) / 'allowed'
+            outside = Path(tmp) / 'outside'
+            allowed.mkdir()
+            outside.mkdir()
+            Image.new('RGB', (8, 8), 'red').save(allowed / 'ok.jpg')
+            Image.new('RGB', (8, 8), 'blue').save(outside / 'secret.jpg')
+            link = allowed / 'escape'
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                if os.name != 'nt':
+                    self.skipTest('symlinks are not available')
+                _create_windows_junction(link, outside)
+            self.assertTrue(stages.is_link(link))
+            self._open_folder(http.server_port, allowed, tab)
+            roots_before = self._roots_snapshot()
+            status, body = self._folder_status(http.server_port, link, tab)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {'registered': False})
+            self.assertEqual(set(body.keys()), {'registered'})
+            self.assertNotIn('images', body)
+            self.assertNotIn('folders', body)
+            nested = self._folder_status(http.server_port, link / 'secret.jpg', tab)
+            self.assertEqual(nested[0], 200)
+            self.assertEqual(nested[1], {'registered': False})
+            self.assertEqual(self._roots_snapshot(), roots_before)
+            listed_roots = [Path(key) for key in server.ALLOWED_ROOTS.get((server.TOKEN, tab), ())]
+            self.assertFalse(any(stages.same_path(root, outside) for root in listed_roots))
+            thumb = self._get(
+                http.server_port,
+                f'/api/thumb?path={quote(str(link / "secret.jpg"))}',
+                tab=tab,
+            )
+            self.assertEqual(thumb[0], 400)
+            self.assertRegex(thumb[1]['error'], 'outside the allowed folder')
+
 
 @unittest.skipUnless(os.name == 'nt', 'Windows-only path and lock behaviour')
 class WindowsIntegrationTests(unittest.TestCase):

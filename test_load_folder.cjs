@@ -77,6 +77,7 @@ function loadFolderHarness({ api, refresh, openImage }) {
     offerChooseOutputFolder() { return false; },
     refreshChatgptPending: refresh,
     openImage,
+    resetFolderNeedsPickChrome() {},
     api: async (route, body) => {
       if (route === '/api/crop') posts.push(body);
       return api(route, body);
