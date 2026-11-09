@@ -10,7 +10,14 @@ this module.
 
 from __future__ import annotations
 
+import json
 import sys
+
+
+def _emit(payload: dict) -> None:
+    blob = json.dumps(payload, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    sys.stdout.buffer.write(blob)
+    sys.stdout.buffer.flush()
 
 
 def _open_dialog() -> str:
@@ -53,14 +60,20 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
     try:
         if args == ["--self-test"]:
-            sys.stdout.write(_self_test())
+            _self_test()
+            _emit({"ok": True})
         elif args:
-            print("usage: folder_dialog.py [--self-test]", file=sys.stderr)
+            sys.stderr.buffer.write(b"usage: folder_dialog.py [--self-test]\n")
             return 2
         else:
-            sys.stdout.write(_open_dialog())
+            chosen = _open_dialog()
+            if chosen:
+                _emit({"path": chosen})
+            else:
+                _emit({"cancelled": True})
     except Exception as exc:
-        print(str(exc), file=sys.stderr)
+        sys.stderr.buffer.write(str(exc).encode("utf-8", "surrogatepass"))
+        sys.stderr.buffer.flush()
         return 2
     return 0
 
