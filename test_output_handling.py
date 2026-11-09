@@ -1,7 +1,9 @@
 import hashlib
 import io
 import os
+import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -3029,6 +3031,492 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertEqual(body.get('code'), 'dialog_still_open')
         release.set()
 
+    def test_tkinter_is_imported_only_in_the_dialog_subprocess(self):
+        root = Path(server.__file__).resolve().parent
+        hits = []
+        pattern = re.compile(r'^\s*(?:import tkinter|from tkinter)\b', re.M)
+        for path in root.rglob('*.py'):
+            if '.git' in path.parts:
+                continue
+            text = path.read_text(encoding='utf-8')
+            if pattern.search(text):
+                hits.append(path.name)
+        self.assertEqual(hits, ['folder_dialog.py'])
+
+    def test_pick_folder_does_not_construct_tk_on_request_threads(self):
+        """Fails on 06cf667: _run_folder_dialog built tk.Tk() in the server process."""
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        chosen = Path(self.folder.name)
+        chosen.mkdir(parents=True, exist_ok=True)
+        constructed = []
+        request_threads = []
+        tcl_error = type('TclError', (Exception,), {})
+
+        class FakeTk:
+            def __init__(self, *args, **kwargs):
+                constructed.append(threading.current_thread())
+            def withdraw(self):
+                return None
+            def attributes(self, *args, **kwargs):
+                return None
+            def after(self, *args, **kwargs):
+                return None
+            def quit(self):
+                return None
+            def destroy(self):
+                return None
+            def update_idletasks(self):
+                return None
+
+        fake_tk = types.ModuleType('tkinter')
+        fake_tk.Tk = FakeTk
+        fake_tk.TclError = tcl_error
+        fake_dialog = types.ModuleType('tkinter.filedialog')
+        fake_dialog.askdirectory = lambda **kwargs: str(chosen)
+        fake_tk.filedialog = fake_dialog
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self.returncode = 0
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                return json.dumps({'path': str(chosen)}).encode('utf-8'), b''
+            def terminate(self):
+                return None
+            def kill(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+
+        original_handle = server.Handler.handle
+
+        def tracking_handle(handler_self):
+            request_threads.append(threading.current_thread())
+            return original_handle(handler_self)
+
+        with patch.dict(sys.modules, {'tkinter': fake_tk, 'tkinter.filedialog': fake_dialog}), \
+             patch.object(subprocess, 'Popen', FakePopen), \
+             patch.object(server.Handler, 'handle', tracking_handle):
+            errors = []
+
+            def hammer():
+                try:
+                    for _ in range(8):
+                        self._get(http.server_port, f'/api/folder-status?path={quote(str(chosen))}', tab=tab)
+                        self._json(http.server_port, '/api/settings', {}, tab=tab)
+                except Exception as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=hammer) for _ in range(3)]
+            for worker in workers:
+                worker.start()
+            for _ in range(3):
+                status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+                self.assertEqual(status, 200, body)
+                self.assertFalse(body.get('cancelled'))
+            for worker in workers:
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(constructed, [])
+        self.assertTrue(request_threads)
+        self.assertFalse(any(thread in constructed for thread in request_threads))
+
+    def _dialog_child_popen(self, source):
+        script = Path(self.folder.name) / 'dialog_child.py'
+        script.write_text(source, encoding='utf-8')
+        original = subprocess.Popen
+
+        def popen(args, **kwargs):
+            return original([sys.executable, str(script)], **kwargs)
+
+        return popen
+
+    def test_non_ascii_dialog_path_round_trips_as_utf8_json(self):
+        path = r'C:\Users\José\Fotos — 写真'
+        raw = json.dumps({'path': path}, ensure_ascii=False).encode('utf-8')
+        self.assertEqual(server.parse_folder_dialog_stdout(raw), path)
+
+        import folder_dialog as dialog
+        captured = []
+
+        class FakeBuffer:
+            def write(self, data):
+                captured.append(data)
+            def flush(self):
+                return None
+
+        fake_stdout = types.SimpleNamespace(buffer=FakeBuffer())
+        with patch.object(dialog, '_open_dialog', return_value=path), \
+             patch.object(dialog.sys, 'stdout', fake_stdout):
+            self.assertEqual(dialog.main([]), 0)
+        emitted = b''.join(captured)
+        self.assertEqual(emitted.decode('utf-8'), json.dumps({'path': path}, ensure_ascii=False))
+        self.assertEqual(server.parse_folder_dialog_stdout(emitted), path)
+
+        chosen = Path(self.folder.name) / 'José' / 'Fotos — 写真'
+        chosen.mkdir(parents=True, exist_ok=True)
+        source = (
+            'import json, sys\n'
+            f'payload = {{"path": {json.dumps(str(chosen), ensure_ascii=False)}}}\n'
+            'sys.stdout.buffer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))\n'
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body.get('cancelled'))
+        self.assertTrue(stages.same_path(body['path'], chosen))
+
+    def test_pick_folder_does_not_leave_tkinter_in_sys_modules(self):
+        sys.modules.pop('tkinter', None)
+        sys.modules.pop('tkinter.filedialog', None)
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        chosen = Path(self.folder.name)
+        chosen.mkdir(parents=True, exist_ok=True)
+        seen = {}
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                seen.update(kwargs)
+                self.returncode = 0
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                return json.dumps({'path': str(chosen)}).encode('utf-8'), b''
+            def terminate(self):
+                return None
+            def kill(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+
+        with patch.object(subprocess, 'Popen', FakePopen):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertNotIn('tkinter', sys.modules)
+        self.assertFalse(any(name == 'tkinter' or name.startswith('tkinter.') for name in sys.modules))
+        self.assertIs(seen.get('stdin'), subprocess.DEVNULL)
+        self.assertEqual((seen.get('env') or {}).get('PYTHONIOENCODING'), 'utf-8')
+
+    def test_dialog_timeout_kills_and_reaps_the_real_child(self):
+        started = []
+        original = subprocess.Popen
+
+        def hanging_popen(args, **kwargs):
+            proc = original(
+                [sys.executable, '-c', 'import time; time.sleep(60)'],
+                **kwargs,
+            )
+            started.append(proc)
+            return proc
+
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 0.3), \
+             patch.object(subprocess, 'Popen', hanging_popen):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'The folder dialog timed out. Try again.')
+        self.assertTrue(started)
+        self.assertIsNotNone(started[0].poll())
+        self.assertNotIn(started[0], server._DIALOG_CHILDREN)
+
+    def test_malformed_dialog_stdout_is_an_error(self):
+        source = (
+            'import sys\n'
+            'sys.stdout.buffer.write(b"not-json\\nTk warning\\n")\n'
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertNotIn('cancelled', body)
+
+        extra = (
+            'import json, sys\n'
+            'sys.stdout.buffer.write(json.dumps({"path": "x", "noise": 1}).encode("utf-8"))\n'
+        )
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(extra)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+
+        trailing = (
+            'import json, sys\n'
+            'sys.stdout.buffer.write(b\'{"path": "x"} extra\')\n'
+        )
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(trailing)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+
+    def test_nonzero_dialog_exit_is_an_error(self):
+        chosen = Path(self.folder.name)
+        chosen.mkdir(parents=True, exist_ok=True)
+        source = (
+            'import json, sys\n'
+            f'payload = {{"path": {json.dumps(str(chosen))}}}\n'
+            'sys.stdout.buffer.write(json.dumps(payload).encode("utf-8"))\n'
+            'raise SystemExit(2)\n'
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertNotIn('cancelled', body)
+
+    def test_cancelled_json_envelope_is_not_a_path(self):
+        source = (
+            'import json, sys\n'
+            'sys.stdout.buffer.write(json.dumps({"cancelled": True}).encode("utf-8"))\n'
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get('cancelled'))
+        self.assertIsNone(body.get('path'))
+
+    def test_oversized_dialog_output_errors_without_hanging(self):
+        chosen = Path(self.folder.name)
+        chosen.mkdir(parents=True, exist_ok=True)
+        source = (
+            'import json, sys\n'
+            'sys.stderr.buffer.write(b"E" * 70000)\n'
+            'sys.stdout.buffer.write(json.dumps({"path": %s}).encode("utf-8"))\n'
+            % json.dumps(str(chosen))
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        before = self._roots_snapshot()
+        started = time.perf_counter()
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 8), \
+             patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+        huge = (
+            'import sys\n'
+            'sys.stdout.buffer.write(b"A" * 70000)\n'
+        )
+        started = time.perf_counter()
+        with patch.object(server, 'DIALOG_TIMEOUT_SECONDS', 8), \
+             patch.object(subprocess, 'Popen', self._dialog_child_popen(huge)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+    def test_relative_and_dotdot_dialog_results_are_not_registered(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        staged = TemporaryDirectory(prefix='cropper_l3_', dir=os.getcwd())
+        self.addCleanup(staged.cleanup)
+        relative = Path(staged.name).name
+        self.assertFalse(Path(relative).is_absolute())
+        self.assertTrue((Path.cwd() / relative).is_dir())
+        before = self._roots_snapshot()
+
+        def emit_relative(result, errors, cancel):
+            result.append(relative)
+
+        with patch.object(server, '_run_folder_dialog', emit_relative):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+        parent = Path.cwd().resolve().parent
+
+        def emit_dotdot(result, errors, cancel):
+            result.append('..')
+
+        with patch.object(server, '_run_folder_dialog', emit_dotdot):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+        roots = server.ALLOWED_ROOTS.get((server.TOKEN, tab), set())
+        self.assertFalse(any(stages.same_path(path, parent) for path in roots))
+
+    def test_dialog_result_rejects_newline_nul_and_overlength(self):
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        chosen = Path(self.folder.name).resolve()
+        other = chosen / 'other'
+        other.mkdir()
+        before = self._roots_snapshot()
+
+        def emit_newline(result, errors, cancel):
+            result.append(f'{chosen}\n{other}')
+
+        with patch.object(server, '_run_folder_dialog', emit_newline):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+        def emit_nul(result, errors, cancel):
+            result.append(f'{chosen}\0{other}')
+
+        with patch.object(server, '_run_folder_dialog', emit_nul):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+        def emit_overlength(result, errors, cancel):
+            result.append(str(chosen) + ('x' * (server.DIALOG_PATH_MAX + 1)))
+
+        with patch.object(server, '_run_folder_dialog', emit_overlength):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+        source = (
+            'import json, sys\n'
+            'sys.stdout.buffer.write(json.dumps({"path": "outside"}).encode("utf-8"))\n'
+        )
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body.get('error'), 'Could not open the folder dialog.')
+        self.assertEqual(self._roots_snapshot(), before)
+
+    def test_dialog_path_keeps_leading_and_trailing_spaces(self):
+        parent = Path(self.folder.name)
+        wanted = '  spaced  '
+        spaced = parent / wanted
+        spaced.mkdir()
+        on_disk = next(path for path in parent.iterdir() if path.is_dir() and 'spaced' in path.name)
+        verbatim = str(spaced)
+        raw = json.dumps({'path': verbatim}, ensure_ascii=False).encode('utf-8')
+        self.assertEqual(server.parse_folder_dialog_stdout(raw), verbatim)
+        self.assertTrue(Path(verbatim).name.startswith(' '))
+        self.assertTrue(Path(verbatim).name.endswith(' '))
+        server.reject_untrusted_dialog_path(verbatim)
+        source = (
+            'import json, sys\n'
+            f'payload = {{"path": {json.dumps(str(on_disk), ensure_ascii=False)}}}\n'
+            'sys.stdout.buffer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))\n'
+        )
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', self._dialog_child_popen(source)):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body.get('cancelled'))
+        self.assertTrue(stages.same_path(body['path'], on_disk))
+        returned = Path(body['path']).name
+        self.assertEqual(returned, on_disk.name)
+        if on_disk.name.startswith(' '):
+            self.assertTrue(returned.startswith(' '))
+        if on_disk.name.endswith(' '):
+            self.assertTrue(returned.endswith(' '))
+
+    def test_dialog_child_runs_isolated_from_pythonpath_tkinter(self):
+        mark = Path(self.folder.name) / 'pythonpath_hit'
+        shadow = Path(self.folder.name) / 'shadow'
+        shadow.mkdir()
+        (shadow / 'tkinter.py').write_text(
+            f'open({str(mark)!r}, "w").write("hit")\nraise SystemExit(0)\n',
+            encoding='utf-8',
+        )
+        previous = os.environ.get('PYTHONPATH')
+        os.environ['PYTHONPATH'] = str(shadow)
+
+        def restore_pythonpath():
+            if previous is None:
+                os.environ.pop('PYTHONPATH', None)
+            else:
+                os.environ['PYTHONPATH'] = previous
+
+        self.addCleanup(restore_pythonpath)
+        probe = Path(self.folder.name) / 'probe.py'
+        probe.write_text(
+            'import json, sys\n'
+            'try:\n'
+            '    import tkinter\n'
+            'except ModuleNotFoundError:\n'
+            '    pass\n'
+            'sys.stdout.buffer.write(json.dumps({"cancelled": True}).encode("utf-8"))\n',
+            encoding='utf-8',
+        )
+        seen = []
+        original = subprocess.Popen
+
+        def wrapped(args, **kwargs):
+            seen.append(list(args))
+            replaced = [str(probe) if str(arg).endswith('folder_dialog.py') else arg for arg in args]
+            return original(replaced, **kwargs)
+
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        with patch.object(subprocess, 'Popen', wrapped):
+            status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get('cancelled'))
+        self.assertTrue(seen)
+        self.assertIn('-I', seen[0])
+        self.assertIn('-X', seen[0])
+        self.assertIn('utf8', seen[0])
+        self.assertEqual(seen[0][0], sys.executable)
+        self.assertFalse(mark.exists())
+
     def test_batch_grant_covers_second_photo_in_the_same_folder(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
         threading.Thread(target=http.serve_forever, daemon=True).start()
@@ -3715,6 +4203,36 @@ class WindowsIntegrationTests(unittest.TestCase):
             path.write_bytes(b'device-safe')
             self.assertTrue(path.is_file())
             self.assertEqual(path.read_bytes(), b'device-safe')
+
+    def test_subprocess_tk_selftest_cycles_under_threads(self):
+        script = Path(server.__file__).resolve().parent / 'folder_dialog.py'
+        probe = subprocess.run(
+            [sys.executable, str(script), '--self-test'],
+            capture_output=True, timeout=30,
+        )
+        if probe.returncode != 0:
+            self.skipTest(
+                'headless Tk is unavailable on this Windows runner '
+                f'({(probe.stderr or b"").decode("utf-8", "replace").strip() or probe.returncode})'
+            )
+        errors = []
+
+        def cycle():
+            for _ in range(3):
+                completed = subprocess.run(
+                    [sys.executable, str(script), '--self-test'],
+                    capture_output=True, timeout=30,
+                )
+                if completed.returncode != 0:
+                    errors.append((completed.returncode, completed.stderr))
+
+        workers = [threading.Thread(target=cycle) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
 
     def test_windows_junction_escape_is_refused(self):
         with TemporaryDirectory() as tmp:

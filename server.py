@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import io
 import json
 import os
 import secrets
+import subprocess
 import sys
 import tempfile
 import threading
@@ -60,6 +62,8 @@ TAB_ID_MAX_LEN = 128
 TAB_LIMIT = 32
 TAB_IDLE_SECONDS = CONFIRMATION_TTL_SECONDS
 DIALOG_TIMEOUT_SECONDS = 300
+DIALOG_OUTPUT_LIMIT = 32 * 1024
+DIALOG_PATH_MAX = 4096
 BATCH_SNAPSHOT_CAP = 2000
 _DIALOG_LOCK = threading.Lock()
 _GRANTED = threading.local()
@@ -484,41 +488,161 @@ def reset_tabs() -> None:
         TAB_SNAPSHOTS.clear()
 
 
-def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
-    """Open the native folder dialog. Tests monkeypatch this; production has no env stub."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
+_DIALOG_CHILDREN: set[subprocess.Popen] = set()
+_DIALOG_CHILDREN_LOCK = threading.Lock()
 
-        def poll_cancel() -> None:
-            if cancel.is_set():
+
+def _remember_dialog_child(proc: subprocess.Popen) -> None:
+    with _DIALOG_CHILDREN_LOCK:
+        _DIALOG_CHILDREN.add(proc)
+
+
+def _forget_dialog_child(proc: subprocess.Popen) -> None:
+    with _DIALOG_CHILDREN_LOCK:
+        _DIALOG_CHILDREN.discard(proc)
+
+
+def _close_dialog_pipes(proc: subprocess.Popen) -> None:
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _kill_dialog_process(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=2)
+                return
+            except subprocess.TimeoutExpired:
+                proc.kill()
                 try:
-                    root.quit()
-                    root.destroy()
-                except tk.TclError:
-                    pass
+                    proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    _close_dialog_pipes(proc)
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+        else:
+            try:
+                proc.communicate(timeout=2)
+            except (ValueError, OSError, subprocess.TimeoutExpired):
+                _close_dialog_pipes(proc)
+    finally:
+        _forget_dialog_child(proc)
+
+
+def _kill_dialog_children() -> None:
+    with _DIALOG_CHILDREN_LOCK:
+        children = list(_DIALOG_CHILDREN)
+    for proc in children:
+        _kill_dialog_process(proc)
+
+
+atexit.register(_kill_dialog_children)
+
+
+def parse_folder_dialog_stdout(raw: bytes) -> str | None:
+    """Decode the child's UTF-8 JSON envelope. None means the user cancelled.
+
+    Malformed bytes, extra noise, or unexpected keys are errors — never a path.
+    The path string is taken verbatim: leading or trailing spaces are kept.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Could not open the folder dialog.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Could not open the folder dialog.")
+    keys = set(payload)
+    if keys == {"cancelled"} and payload["cancelled"] is True:
+        return None
+    if keys == {"path"} and isinstance(payload["path"], str) and payload["path"]:
+        return payload["path"]
+    raise ValueError("Could not open the folder dialog.")
+
+
+def reject_untrusted_dialog_path(path: str) -> None:
+    """Refuse relative, overlong, or control-character dialog results before register."""
+    if len(path) > DIALOG_PATH_MAX:
+        raise ValueError("Could not open the folder dialog.")
+    if "\n" in path or "\r" in path or "\0" in path:
+        raise ValueError("Could not open the folder dialog.")
+    if not Path(path).is_absolute():
+        raise ValueError("Could not open the folder dialog.")
+
+
+def _dialog_child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _dialog_output_size(stdout: bytes | None, stderr: bytes | None) -> int:
+    return len(stdout or b"") + len(stderr or b"")
+
+
+def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
+    """Open the native folder dialog in a one-shot subprocess.
+
+    Tests monkeypatch this; production has no env stub. Tk must not run in the
+    server process: ThreadingHTTPServer handles pick-folder, folder-status and
+    settings on worker threads, and Tcl 8.6 raises Tcl_AsyncDelete (tcl86t.dll)
+    if a Tk root is created, destroyed, or garbage-collected off the main thread.
+    """
+    proc = None
+    try:
+        kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": _dialog_child_env(),
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-X", "utf8", str(HERE / "folder_dialog.py")],
+            **kwargs,
+        )
+        _remember_dialog_child(proc)
+        stdout = stderr = b""
+        while True:
+            if cancel.is_set():
+                _kill_dialog_process(proc)
                 return
             try:
-                root.after(200, poll_cancel)
-            except tk.TclError:
-                pass
-
+                stdout, stderr = proc.communicate(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired as exc:
+                if _dialog_output_size(exc.stdout, exc.stderr) > DIALOG_OUTPUT_LIMIT:
+                    errors.append(RuntimeError("Could not open the folder dialog."))
+                    _kill_dialog_process(proc)
+                    return
+                continue
+        _forget_dialog_child(proc)
+        if cancel.is_set():
+            return
+        if _dialog_output_size(stdout, stderr) > DIALOG_OUTPUT_LIMIT:
+            errors.append(RuntimeError("Could not open the folder dialog."))
+            return
+        if proc.returncode != 0:
+            message = (stderr or b"").decode("utf-8", "replace").strip()
+            errors.append(RuntimeError(message or "Could not open the folder dialog."))
+            return
         try:
-            root.attributes("-topmost", True)
-        except tk.TclError:
-            pass
-        root.after(200, poll_cancel)
-        chosen = filedialog.askdirectory(title="Choose folder")
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
-        if not cancel.is_set():
-            result.append(chosen)
+            result.append(parse_folder_dialog_stdout(stdout or b""))
+        except ValueError as exc:
+            errors.append(exc)
     except Exception as exc:  # pragma: no cover - exercised via monkeypatch
         errors.append(exc)
+        if proc is not None:
+            _kill_dialog_process(proc)
 
 
 def choose_folder_dialog() -> Path | None:
@@ -555,9 +679,13 @@ def choose_folder_dialog() -> Path | None:
             raise ValueError("The folder dialog timed out. Try again.")
         if errors:
             raise ValueError("Could not open the folder dialog.") from errors[0]
-        if not result or not result[0]:
+        if not result or result[0] is None:
             return None
-        return Path(result[0])
+        path = result[0]
+        if not isinstance(path, str):
+            raise ValueError("Could not open the folder dialog.")
+        reject_untrusted_dialog_path(path)
+        return Path(path)
     finally:
         if not thread.is_alive():
             release_lock()
@@ -1892,6 +2020,10 @@ class Handler(BaseHTTPRequestHandler):
 class LocalServer(ThreadingHTTPServer):
     # Windows SO_REUSEADDR can permit two processes to listen on the same port.
     allow_reuse_address = False
+
+    def server_close(self):
+        _kill_dialog_children()
+        super().server_close()
 
 
 def resolve_port(cli_port: int | None) -> int:
