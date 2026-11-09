@@ -3433,16 +3433,19 @@ class OutputHandlingTests(unittest.TestCase):
 
     def test_dialog_path_keeps_leading_and_trailing_spaces(self):
         parent = Path(self.folder.name)
-        spaced = parent / '  spaced  '
+        wanted = '  spaced  '
+        spaced = parent / wanted
         spaced.mkdir()
-        if spaced.name != '  spaced  ' or not spaced.is_dir():
-            self.skipTest('filesystem does not preserve leading and trailing spaces')
-        raw = json.dumps({'path': str(spaced)}, ensure_ascii=False).encode('utf-8')
-        self.assertEqual(server.parse_folder_dialog_stdout(raw), str(spaced))
-        server.reject_untrusted_dialog_path(str(spaced))
+        on_disk = next(path for path in parent.iterdir() if path.is_dir() and 'spaced' in path.name)
+        verbatim = str(spaced)
+        raw = json.dumps({'path': verbatim}, ensure_ascii=False).encode('utf-8')
+        self.assertEqual(server.parse_folder_dialog_stdout(raw), verbatim)
+        self.assertTrue(Path(verbatim).name.startswith(' '))
+        self.assertTrue(Path(verbatim).name.endswith(' '))
+        server.reject_untrusted_dialog_path(verbatim)
         source = (
             'import json, sys\n'
-            f'payload = {{"path": {json.dumps(str(spaced), ensure_ascii=False)}}}\n'
+            f'payload = {{"path": {json.dumps(str(on_disk), ensure_ascii=False)}}}\n'
             'sys.stdout.buffer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))\n'
         )
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
@@ -3454,9 +3457,13 @@ class OutputHandlingTests(unittest.TestCase):
             status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
         self.assertEqual(status, 200, body)
         self.assertFalse(body.get('cancelled'))
-        self.assertTrue(stages.same_path(body['path'], spaced))
-        self.assertTrue(Path(body['path']).name.startswith(' '))
-        self.assertTrue(Path(body['path']).name.endswith(' '))
+        self.assertTrue(stages.same_path(body['path'], on_disk))
+        returned = Path(body['path']).name
+        self.assertEqual(returned, on_disk.name)
+        if on_disk.name.startswith(' '):
+            self.assertTrue(returned.startswith(' '))
+        if on_disk.name.endswith(' '):
+            self.assertTrue(returned.endswith(' '))
 
     def test_dialog_child_runs_isolated_from_pythonpath_tkinter(self):
         mark = Path(self.folder.name) / 'pythonpath_hit'
