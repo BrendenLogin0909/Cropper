@@ -1,7 +1,9 @@
 import hashlib
 import io
 import os
+import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -3029,6 +3031,103 @@ class OutputHandlingTests(unittest.TestCase):
             self.assertEqual(body.get('code'), 'dialog_still_open')
         release.set()
 
+    def test_tkinter_is_imported_only_in_the_dialog_subprocess(self):
+        root = Path(server.__file__).resolve().parent
+        hits = []
+        pattern = re.compile(r'^\s*(?:import tkinter|from tkinter)\b', re.M)
+        for path in root.rglob('*.py'):
+            if '.git' in path.parts:
+                continue
+            text = path.read_text(encoding='utf-8')
+            if pattern.search(text):
+                hits.append(path.name)
+        self.assertEqual(hits, ['folder_dialog.py'])
+
+    def test_pick_folder_does_not_construct_tk_on_request_threads(self):
+        """Fails on 06cf667: _run_folder_dialog built tk.Tk() in the server process."""
+        http = server.LocalServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        tab = self._tab()
+        chosen = Path(self.folder.name)
+        chosen.mkdir(parents=True, exist_ok=True)
+        constructed = []
+        request_threads = []
+        tcl_error = type('TclError', (Exception,), {})
+
+        class FakeTk:
+            def __init__(self, *args, **kwargs):
+                constructed.append(threading.current_thread())
+            def withdraw(self):
+                return None
+            def attributes(self, *args, **kwargs):
+                return None
+            def after(self, *args, **kwargs):
+                return None
+            def quit(self):
+                return None
+            def destroy(self):
+                return None
+            def update_idletasks(self):
+                return None
+
+        fake_tk = types.ModuleType('tkinter')
+        fake_tk.Tk = FakeTk
+        fake_tk.TclError = tcl_error
+        fake_dialog = types.ModuleType('tkinter.filedialog')
+        fake_dialog.askdirectory = lambda **kwargs: str(chosen)
+        fake_tk.filedialog = fake_dialog
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self.returncode = 0
+            def poll(self):
+                return 0
+            def communicate(self, timeout=None):
+                return str(chosen).encode('utf-8'), b''
+            def terminate(self):
+                return None
+            def kill(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+
+        original_handle = server.Handler.handle
+
+        def tracking_handle(handler_self):
+            request_threads.append(threading.current_thread())
+            return original_handle(handler_self)
+
+        with patch.dict(sys.modules, {'tkinter': fake_tk, 'tkinter.filedialog': fake_dialog}), \
+             patch.object(subprocess, 'Popen', FakePopen), \
+             patch.object(server.Handler, 'handle', tracking_handle):
+            errors = []
+
+            def hammer():
+                try:
+                    for _ in range(8):
+                        self._get(http.server_port, f'/api/folder-status?path={quote(str(chosen))}', tab=tab)
+                        self._json(http.server_port, '/api/settings', {}, tab=tab)
+                except Exception as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=hammer) for _ in range(3)]
+            for worker in workers:
+                worker.start()
+            for _ in range(3):
+                status, body = self._json(http.server_port, '/api/pick-folder', {}, tab=tab)
+                self.assertEqual(status, 200, body)
+                self.assertFalse(body.get('cancelled'))
+            for worker in workers:
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(constructed, [])
+        self.assertTrue(request_threads)
+        self.assertFalse(any(thread in constructed for thread in request_threads))
+
     def test_batch_grant_covers_second_photo_in_the_same_folder(self):
         http = server.LocalServer(('127.0.0.1', 0), server.Handler)
         threading.Thread(target=http.serve_forever, daemon=True).start()
@@ -3715,6 +3814,36 @@ class WindowsIntegrationTests(unittest.TestCase):
             path.write_bytes(b'device-safe')
             self.assertTrue(path.is_file())
             self.assertEqual(path.read_bytes(), b'device-safe')
+
+    def test_subprocess_tk_selftest_cycles_under_threads(self):
+        script = Path(server.__file__).resolve().parent / 'folder_dialog.py'
+        probe = subprocess.run(
+            [sys.executable, str(script), '--self-test'],
+            capture_output=True, timeout=30,
+        )
+        if probe.returncode != 0:
+            self.skipTest(
+                'headless Tk is unavailable on this Windows runner '
+                f'({(probe.stderr or b"").decode("utf-8", "replace").strip() or probe.returncode})'
+            )
+        errors = []
+
+        def cycle():
+            for _ in range(3):
+                completed = subprocess.run(
+                    [sys.executable, str(script), '--self-test'],
+                    capture_output=True, timeout=30,
+                )
+                if completed.returncode != 0:
+                    errors.append((completed.returncode, completed.stderr))
+
+        workers = [threading.Thread(target=cycle) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(60)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
 
     def test_windows_junction_escape_is_refused(self):
         with TemporaryDirectory() as tmp:

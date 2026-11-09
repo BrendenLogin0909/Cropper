@@ -7,6 +7,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import sys
 import tempfile
 import threading
@@ -484,41 +485,57 @@ def reset_tabs() -> None:
         TAB_SNAPSHOTS.clear()
 
 
-def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
-    """Open the native folder dialog. Tests monkeypatch this; production has no env stub."""
+def _kill_dialog_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
+        proc.terminate()
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
-        def poll_cancel() -> None:
+
+def _run_folder_dialog(result: list, errors: list, cancel: threading.Event) -> None:
+    """Open the native folder dialog in a one-shot subprocess.
+
+    Tests monkeypatch this; production has no env stub. Tk must not run in the
+    server process: ThreadingHTTPServer handles pick-folder, folder-status and
+    settings on worker threads, and Tcl 8.6 raises Tcl_AsyncDelete (tcl86t.dll)
+    if a Tk root is created, destroyed, or garbage-collected off the main thread.
+    """
+    proc = None
+    try:
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc = subprocess.Popen(
+            [sys.executable, str(HERE / "folder_dialog.py")],
+            **kwargs,
+        )
+        while proc.poll() is None:
             if cancel.is_set():
-                try:
-                    root.quit()
-                    root.destroy()
-                except tk.TclError:
-                    pass
+                _kill_dialog_process(proc)
                 return
-            try:
-                root.after(200, poll_cancel)
-            except tk.TclError:
-                pass
-
-        try:
-            root.attributes("-topmost", True)
-        except tk.TclError:
-            pass
-        root.after(200, poll_cancel)
-        chosen = filedialog.askdirectory(title="Choose folder")
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
-        if not cancel.is_set():
-            result.append(chosen)
+            time.sleep(0.05)
+        stdout, stderr = proc.communicate()
+        if cancel.is_set():
+            return
+        if proc.returncode != 0:
+            message = (stderr or b"").decode("utf-8", "replace").strip()
+            errors.append(RuntimeError(message or "Could not open the folder dialog."))
+            return
+        result.append((stdout or b"").decode("utf-8", "surrogateescape").strip())
     except Exception as exc:  # pragma: no cover - exercised via monkeypatch
         errors.append(exc)
+        if proc is not None:
+            _kill_dialog_process(proc)
 
 
 def choose_folder_dialog() -> Path | None:
