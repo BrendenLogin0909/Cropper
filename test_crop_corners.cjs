@@ -36,7 +36,7 @@ test('old backend gives an explicit restart message without modifying points',as
   const h=harness(async()=>{throw new Error('Not found.');});
   await h.predict();assert.match(h.messages[0],/backend restart/);assert.equal(h.state.points.length,0);
 });
-test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
+test('shortcuts preserve text entry and Shift zoom, and bind Ctrl+A to predict',()=>{
   const keys=code.slice(code.indexOf("document.addEventListener('keydown'"));
   assert.ok(keys.indexOf("'INPUT','TEXTAREA','SELECT'")<keys.indexOf("event.key==='Shift'"));
   assert.match(keys,/event.key==='Shift'/);

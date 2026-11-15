@@ -1095,6 +1095,7 @@ function clearCropPoints() {
 }
 function selectWholeImage() {
   if (!state.width || !state.height || state.busy) return;
+  cropPredictionRequest++;
   state.points = [{ x: 0, y: 0 }, { x: state.width - 1, y: 0 }, { x: state.width - 1, y: state.height - 1 }, { x: 0, y: state.height - 1 }];
   renderOverlay(); updateControls();
 }
@@ -2103,7 +2104,7 @@ function wire() {
       if(key==='z'){event.preventDefault();if(!state.busy){state.points.pop();renderOverlay();updateControls();}}
       else if(key==='q'){event.preventDefault();clearCropPoints();}
       else if(key==='a'){
-        event.preventDefault();
+        event.preventDefault(); // crop view: do not let the browser select the page
         if(state.busy)return;
         if(event.shiftKey)selectWholeImage();
         else if(!event.repeat)predictCropCorners();

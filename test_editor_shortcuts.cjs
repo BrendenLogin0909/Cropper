@@ -75,7 +75,7 @@ function shortcutHarness(api) {
   };
   context.predictCalls = 0;
   context.selectCalls = 0;
-  async function press(partial) {
+  function dispatch(partial) {
     const event = {
       key: 'a',
       ctrlKey: false,
@@ -87,11 +87,18 @@ function shortcutHarness(api) {
       ...partial,
     };
     listeners[0](event);
-    const batch = pending.splice(0);
-    await Promise.all(batch);
     return event;
   }
-  return {state, messages, press, setActive(el) { active = el; }, context};
+  async function flush() {
+    const batch = pending.splice(0);
+    await Promise.all(batch);
+  }
+  async function press(partial) {
+    const event = dispatch(partial);
+    await flush();
+    return event;
+  }
+  return {state, messages, press, dispatch, flush, setActive(el) { active = el; }, context};
 }
 
 const twoCandidates = {
@@ -169,6 +176,84 @@ test('Ctrl+A and Ctrl+Shift+A are no-ops while busy', async () => {
   assert.equal(h.context.predictCalls, 0);
   assert.equal(h.context.selectCalls, 0);
   assert.equal(h.state.points.length, 0);
+});
+
+test('a third Ctrl+A wraps to the first candidate', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  await h.press({key: 'a', ctrlKey: true});
+  await h.press({key: 'a', ctrlKey: true});
+  await h.press({key: 'a', ctrlKey: true});
+  assert.equal(h.context.predictCalls, 3);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+});
+
+test('Cmd+A predicts and Cmd+Shift+A selects the whole image', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  const predictEvent = await h.press({key: 'a', metaKey: true});
+  assert.equal(predictEvent.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+  const selectEvent = await h.press({key: 'A', metaKey: true, shiftKey: true});
+  assert.equal(selectEvent.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[1].x, 599);
+});
+
+test('Ctrl+A while a predict is in flight does not start a second request', async () => {
+  let release;
+  let calls = 0;
+  const h = shortcutHarness(() => { calls++; return new Promise((resolve) => { release = resolve; }); });
+  h.dispatch({key: 'a', ctrlKey: true});
+  assert.equal(calls, 1);
+  const second = h.dispatch({key: 'a', ctrlKey: true});
+  assert.equal(second.defaultPrevented, true);
+  assert.equal(calls, 1);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points[0].x, 10);
+});
+
+test('Ctrl+Shift+A while a predict is in flight still selects the whole image', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.dispatch({key: 'a', ctrlKey: true});
+  const event = h.dispatch({key: 'A', ctrlKey: true, shiftKey: true});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[1].x, 599);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[1].x, 599);
+});
+
+test('a late predict after Whole image does not overwrite the corners', async () => {
+  let releaseShortcut;
+  const viaShortcut = shortcutHarness(() => new Promise((resolve) => { releaseShortcut = resolve; }));
+  viaShortcut.dispatch({key: 'a', ctrlKey: true});
+  viaShortcut.dispatch({key: 'A', ctrlKey: true, shiftKey: true});
+  assert.equal(viaShortcut.state.points[0].x, 0);
+  releaseShortcut(twoCandidates);
+  await viaShortcut.flush();
+  assert.equal(viaShortcut.state.points[0].x, 0);
+  assert.equal(viaShortcut.state.points[1].x, 599);
+
+  let releaseButton;
+  const viaButton = shortcutHarness(() => new Promise((resolve) => { releaseButton = resolve; }));
+  viaButton.dispatch({key: 'a', ctrlKey: true});
+  viaButton.context.selectWholeImage();
+  assert.equal(viaButton.state.points[0].x, 0);
+  releaseButton(twoCandidates);
+  await viaButton.flush();
+  assert.equal(viaButton.state.points[0].x, 0);
+  assert.equal(viaButton.state.points[1].x, 599);
 });
 
 test('shortcut strip and tooltips mention Ctrl+A and Ctrl+Shift+A', () => {
