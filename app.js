@@ -1037,7 +1037,7 @@ function updateControls() {
   [...$('progress-dots').children].forEach((dot,index)=>dot.classList.toggle('done',index<count));
   $('step-title').textContent = count < 4 ? `Select corner ${count + 1} of 4` : complete ? 'Crop is ready' : 'Adjust the corners';
   $('step-detail').textContent = count < 4 ? 'Click anywhere on the image. Order does not matter.' : complete ? 'Drag any point to refine, then save.' : 'Corners must form a four-sided area.';
-  $('canvas-help').textContent = count < 4 ? 'Predict corners finds the print · For several photos, place one point inside the intended print first' : complete ? 'Drag corners to refine · Predict corners cycles outlines · Enter to save' : 'Drag a point to make a four-sided area';
+  $('canvas-help').textContent = count < 4 ? 'Ctrl+A predicts corners · For several photos, place one point inside the intended print first' : complete ? 'Drag corners to refine · Ctrl+A cycles outlines · Enter to save' : 'Drag a point to make a four-sided area';
   $('undo').disabled = !count; $('reset').disabled = !count; $('rotate-left').disabled = state.index < 0; $('rotate-right').disabled = state.index < 0;
   $('save').disabled = !complete || state.busy || !!validSettings();
   $('select-whole').disabled = state.index < 0 || !state.width || state.busy;
@@ -1084,7 +1084,7 @@ async function predictCropCorners() {
     cache.index = (cache.index+1) % cache.candidates.length;
     state.points = cache.candidates[cache.index].points.map(([x,y]) => ({x:Math.max(0,Math.min(state.width-1,x)),y:Math.max(0,Math.min(state.height-1,y))}));
     renderOverlay(); updateControls();
-    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. Use Predict corners to cycle alternatives. Always check the corners.`);
+    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. Ctrl+A cycles alternatives; Ctrl+Q clears. Always check the corners.`);
   } catch (error) { toast(error.message,true); }
   finally { cropPredictionBusy = false; updateControls(); }
 }
@@ -2102,6 +2102,12 @@ function wire() {
       const key=event.key.toLowerCase();
       if(key==='z'){event.preventDefault();if(!state.busy){state.points.pop();renderOverlay();updateControls();}}
       else if(key==='q'){event.preventDefault();clearCropPoints();}
+      else if(key==='a'){
+        event.preventDefault();
+        if(state.busy)return;
+        if(event.shiftKey)selectWholeImage();
+        else if(!event.repeat)predictCropCorners();
+      }
       return;
     }
     if(state.busy)return;

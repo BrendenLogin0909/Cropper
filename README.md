@@ -51,7 +51,7 @@ Ctrl+A predicts corners locally; repeat to cycle outlines. For multi-photo pages
 place one point inside the intended print first. Ctrl+Q clears all points; Ctrl+Z
 undoes one point; Backspace resets. Hold Ctrl to zoom. Left/right arrows navigate;
 Enter saves. Prediction is approximate: inspect every outline before saving.
-Whole image selects the full frame. Re-crop from the original, not a later stage.
+Whole image (Ctrl+Shift+A) selects the full frame. Re-crop from the original, not a later stage.
 
 Choose output proportions using the physical print size when known. Perspective
 corners alone cannot establish the correct aspect ratio. The live preview helps

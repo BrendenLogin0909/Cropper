@@ -46,8 +46,9 @@ test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
   assert.match(keys,/clearCropPoints\(\)/);
   assert.match(keys,/state.points.pop\(\)/);
   assert.doesNotMatch(keys,/event.key==='Control'/);
-  assert.doesNotMatch(keys,/event.key.toLowerCase\(\)==='a'&&event.ctrlKey/);
-  assert.doesNotMatch(keys,/predictCropCorners\(\);\}/);
+  assert.match(keys,/key==='a'/);
+  assert.match(keys,/!event.repeat\)predictCropCorners\(\)/);
+  assert.match(keys,/event.shiftKey\)selectWholeImage\(\)/);
   assert.match(keys,/ArrowLeft.*openImage\(state.index-1\)/);
   assert.match(keys,/ArrowRight.*openImage\(state.index\+1\)/);
   const html=fs.readFileSync(__dirname+'/index.html','utf8');
