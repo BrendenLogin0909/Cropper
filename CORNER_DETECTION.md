@@ -62,10 +62,12 @@ endpoints, consistent inward sag (`SIGN_FRAC` 0.80; the peak need not be
 centred), and a background-band WIDTH that tracks that sag (Pearson
 correlation ≥ `BAND_TRACK_CORR` 0.75 — a real bow widens toward the middle;
 noise and picture edges do not). Picture-content gradients never count.
-A linear (offset + tilt) bed-strip term is **not applied**. The 80%
-background rule plus the ΔE content measure cannot tell a matching-colour
+A linear (offset + tilt) bed-strip term is **not applied** (option (i)).
+The 80% background rule plus the ΔE content measure cannot tell a matching-colour
 print border from a scanner-bed strip (synthetic probe below); there is no
-blind fallback and no workaround. Unqualified edges stay exactly straight; if none
+blind fallback and no workaround. An even-width bed strip is a
+**corner-placement** problem, not a bowed edge, so it does not belong in
+`warp()`. Unqualified edges stay exactly straight; if none
 qualify, output is byte-identical to OFF. Poor quadratic fit is left
 straight — there is no unguarded trim. Fitted sag is clipped to
 `DEPTH_CAP_FRAC` (3% of the side). Displacement is skipped above
@@ -111,15 +113,13 @@ background-band WIDTH must track the fitted sag (Pearson ≥ `BAND_TRACK_CORR`
 0.75). A passing bow fixture remaps; a noisy or picture-edge fixture stays
 straight.
 
-B. Linear (offset + tilt) correction is **not shipped**. On a synthetic 3000×2200
-print with a 15 px uniform border the same Lab as the bed (no print-edge line
-or shadow), every stated guard passes: background evidence along the top
-strip = 1.00 (need ≥ 0.80); strip content = 0 (need ≤ 0.0005); per-side
-geometric ≈ 0.0053; 15 px is under the 2% cap. Applying the term ate the
-left and right borders (15.0 px, area 0.00528 each; remaining geometric
-0.01057 after the 1.5% backstop dropped top and bottom). The 80% rule plus
-the content measure cannot tell that border from bed, so the linear term is
-omitted. No workaround.
+B. Linear (offset + tilt) correction is **omitted** (option (i)). A uniform
+border the same colour as the bed is indistinguishable from bed under the
+evidence and content guards. Synthetic numbers (3000×2200, 15 px border, no
+print-edge line or shadow): evidence **1.00**, content **0**, **15 px**.
+Every stated guard would have passed; a probe that applied the term ate the
+left and right borders. An even-width bed strip is a corner-placement
+problem, not a bowed edge, so it does not belong in `warp()`. No workaround.
 
 C. Displacement cap is 3% (matching the depth cap) only where the pulled
 pixels are background under `BACKGROUND_DE`; elsewhere it stays 2%. Asymmetric
@@ -133,6 +133,9 @@ and 4500 px save extra are reported in the bowed-edges PR). Target ≤ +50 ms p9
 on a straight save (no-qualify ≈ zero remap) and ≤ +0.5 s p95 extra on a 4500 px
 bowed save.
 
+A planned follow-up is **not this PR**: corner refinement that moves an edge
+inward only on a positive print-edge signal. See `docs/PLAN.md`.
+
 ## TESTING
 
 Synthetic fixtures only in-repo. False-positive cases (stripes, dark/light
@@ -142,7 +145,8 @@ area loss ≤ 0.1%. A qualifying bowed print on scanner background with a thin
 varying streak must leave a residual streak ≤ 2 px at save scale, and extra
 content loss ≤ 0.5% **per print** and geometric loss ≤ 1.5%. Preview-vs-save
 bounds are in preview pixels: MAE < 0.5, corner max ≤ 1.0, curve p95 ≤ 1.0
-(save-scale distances divided by the save/preview scale). A straight print,
-a 3–6 px uniform strip, a 0–8 px linear wedge, a matching-colour print
-border, and busy content-to-edge fixtures are byte-identical to OFF. Real-scan
-validation is local and off-repo.
+(save-scale distances divided by the save/preview scale). On a bowed edge the
+**curved** residual must be ≤ 2 px at save scale. A leftover constant or
+tilted strip is **reported per edge, not failed**. A straight, strip-less, or
+busy print is byte-identical to OFF. Real-scan validation is local and
+off-repo.
