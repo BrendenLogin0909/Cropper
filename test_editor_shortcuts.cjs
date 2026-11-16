@@ -82,6 +82,7 @@ function shortcutHarness(api) {
     'crop-aspect-custom-field': makeControl('LABEL', {hidden: true}),
     'save-error': makeControl('DIV', {hidden: true}),
     'image-layer': imageLayer,
+    'save-hint': makeControl('DIV'),
     'empty-state': makeControl('DIV', {hidden: true}),
     'image-title': makeControl('DIV'),
     'image-subtitle': makeControl('DIV'),
@@ -965,6 +966,52 @@ test('letter shortcuts are no-ops while busy', async () => {
   assert.equal(h.context.saveCalls, 0);
   assert.equal(h.state.points.length, 1);
   assert.equal(h.state.rotation, 0);
+});
+
+test('cropSave shows busy and guards A/D and letter shortcuts until the request finishes', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  let release;
+  const hung = new Promise((resolve) => { release = resolve; });
+  h.context.Date = Date;
+  h.context.validSettings = () => '';
+  h.context.ensureOverwriteConfirmed = async () => ({});
+  h.context.refreshStageFolders = async () => {};
+  h.context.cropAspectRatio = () => null;
+  h.context.stageRoutingEnabled = () => false;
+  h.context.offerChooseOutputFolder = () => false;
+  h.context.scheduleLiveCropPreview = () => {};
+  h.context.api = async (route) => {
+    if (route === '/api/crop') {
+      await hung;
+      return {name: 'photo_c.png', width: 10, height: 10, path: 'photo_c.png', source_moved: false};
+    }
+    throw new Error(`unexpected ${route}`);
+  };
+  vm.runInContext(extractBlock(code, 'function ordered') + ';', h.context);
+  vm.runInContext(extractBlock(code, 'function updateControls') + ';', h.context);
+  vm.runInContext(extractBlock(code, 'async function cropSave') + ';', h.context);
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.state.points = [{x: 10, y: 10}, {x: 500, y: 12}, {x: 498, y: 380}, {x: 12, y: 378}];
+  const saving = h.context.cropSave();
+  await Promise.resolve();
+  assert.equal(h.state.busy, true);
+  assert.equal(h.els['save-hint'].textContent, 'Saving crop…');
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.index, 1);
+  assert.equal(h.state.points.length, 4);
+  release();
+  await saving;
+  assert.equal(h.state.busy, false);
 });
 
 test('letter shortcuts are ignored while an image is loading', async () => {

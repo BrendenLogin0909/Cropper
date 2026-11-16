@@ -152,7 +152,64 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertTrue(closer_to_print(mid_strip_mean(saved, 'top')))
         saved_small = saved.resize(previewed.size, Image.Resampling.LANCZOS)
         diff = np.abs(np.asarray(previewed, dtype=np.int16) - np.asarray(saved_small, dtype=np.int16))
-        self.assertLess(float(diff.mean()), 12.0)
+        # Measured 1400-cache vs full-res on synthetic bowed fixtures (2000×1500,
+        # 1200×900, 3000×2200): pixel MAE 0.061 (largest size 0.091), p95 0.00;
+        # print-corner max 1.41 px / p95 1.19 px; edge-curve max 1.00 / p95 1.00 px
+        # after upscaling the preview warp to save size. Isolated resample spikes
+        # reach ~46 px but do not move the mean. Tolerance is ~5× measured MAE
+        # and ~2× measured corner/curve p95.
+        self.assertLess(float(diff.mean()), 0.5)
+        previewed_up = previewed.resize(saved.size, Image.Resampling.LANCZOS)
+        print_c = np.array(PRINT, dtype=np.float64)
+        page_c = np.array(PAGE, dtype=np.float64)
+
+        def edge_pos(image, side, samples=48):
+            pixels = np.asarray(image)
+            height, width = pixels.shape[:2]
+            hits = []
+            if side in {'top', 'bottom'}:
+                xs = np.linspace(width * 0.08, width * 0.92, samples).astype(int)
+                rows = range(height) if side == 'top' else range(height - 1, -1, -1)
+                for x in xs:
+                    found = 0 if side == 'top' else height - 1
+                    for y in rows:
+                        pix = pixels[y, x].astype(np.float64)
+                        if np.linalg.norm(pix - print_c) + 12 < np.linalg.norm(pix - page_c):
+                            found = y
+                            break
+                    hits.append(float(found))
+            else:
+                ys = np.linspace(height * 0.08, height * 0.92, samples).astype(int)
+                cols = range(width) if side == 'left' else range(width - 1, -1, -1)
+                for y in ys:
+                    found = 0 if side == 'left' else width - 1
+                    for x in cols:
+                        pix = pixels[y, x].astype(np.float64)
+                        if np.linalg.norm(pix - print_c) + 12 < np.linalg.norm(pix - page_c):
+                            found = x
+                            break
+                    hits.append(float(found))
+            return np.array(hits, dtype=np.float64)
+
+        corner_preview = np.array([
+            [edge_pos(previewed_up, 'left')[0], edge_pos(previewed_up, 'top')[0]],
+            [edge_pos(previewed_up, 'right')[0], edge_pos(previewed_up, 'top')[-1]],
+            [edge_pos(previewed_up, 'right')[-1], edge_pos(previewed_up, 'bottom')[-1]],
+            [edge_pos(previewed_up, 'left')[-1], edge_pos(previewed_up, 'bottom')[0]],
+        ])
+        corner_saved = np.array([
+            [edge_pos(saved, 'left')[0], edge_pos(saved, 'top')[0]],
+            [edge_pos(saved, 'right')[0], edge_pos(saved, 'top')[-1]],
+            [edge_pos(saved, 'right')[-1], edge_pos(saved, 'bottom')[-1]],
+            [edge_pos(saved, 'left')[-1], edge_pos(saved, 'bottom')[0]],
+        ])
+        corner_d = np.linalg.norm(corner_preview - corner_saved, axis=1)
+        curve_d = np.concatenate([
+            np.abs(edge_pos(previewed_up, side) - edge_pos(saved, side))
+            for side in ('top', 'bottom', 'left', 'right')
+        ])
+        self.assertLessEqual(float(corner_d.max()), 3.0)
+        self.assertLessEqual(float(np.percentile(curve_d, 95)), 2.5)
 
     def test_poor_fit_uses_capped_trim(self):
         image, corners = synthetic_ragged_rectangle()

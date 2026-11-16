@@ -43,9 +43,12 @@ begin-batch/folder change resets the server caches and prefetch queue. Saving a
 crop, restore, or enhance evicts that resolved path from both LRUs, and the
 client Map drops that path so the next P refetches. Save/export still uses the
 full-resolution decode. After the homography, warp may follow bowed print edges
-(quadratic per edge, Coons remap, capped trim on a poor fit). That step is on
-by default and skipped when the toggle is off, so the off path matches the
-previous warp. The flag is not part of the corner-prediction cache key. Run
+(quadratic per edge, Coons remap, capped trim on a poor fit). **Straighten
+bowed edges is on by default.** It runs after the four-corner warp on both
+preview and save. Turn it off in Save settings (the checkbox is stored in
+localStorage like auto-next). **Off matches the previous homography-only
+output** (byte-identical to the crop-speed warp). The flag is not part of the
+corner-prediction cache key. Run
 `python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.
 
 Cache keys are `(resolved path, mtime_ns, size)` — not ctime. An external edit

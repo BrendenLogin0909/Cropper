@@ -59,7 +59,8 @@ corners alone cannot establish the correct aspect ratio. The live preview helps
 check proportions before writing a full-resolution image. Straighten bowed edges
 is on by default: after the four-corner warp, Cropper follows a quadratic fit of
 each print edge (with a capped trim if the fit is poor). Turn it off in Save
-settings for the previous homography-only crop. Preview and save share that path.
+settings to get the previous homography-only crop; off is byte-identical to that
+older output. Preview and save share that path. No downscaled remap on save.
 
 ## Front + Back
 
