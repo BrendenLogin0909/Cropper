@@ -8,7 +8,7 @@ neural model. No API request or image upload; the endpoint only reads the source
 - On a page containing multiple photos, clear points and place one point inside
   the intended photo before predicting. Candidates must contain that point.
 - Ctrl+Q clears points and cancels application of any outstanding prediction.
-- Ctrl zoom and arrow-key navigation remain unchanged.
+- Shift zoom and arrow-key navigation remain unchanged.
 - Inspect and adjust every suggestion before saving. Rounded corners, weak
   boundaries, internal rectangular objects and partial prints remain difficult.
 

@@ -379,12 +379,19 @@ async function api(path, body) {
     return data;
   }
 }
+function releaseCropShortcutFocus(el) {
+  if (!el) return;
+  const tag = el.tagName;
+  const type = String(el.type || '').toLowerCase();
+  if (tag === 'SELECT' || tag === 'BUTTON' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio'))) el.blur();
+}
 function saveSettings() {
   settings.autoNext = $('auto-next').checked;
   settings.aspect = $('crop-aspect').value; settings.customAspect = $('crop-aspect-custom').value.trim();
   localStorage.setItem('cropper-settings', JSON.stringify(settings));
   $('crop-aspect-custom-field').classList.toggle('hidden', settings.aspect !== 'custom');
   $('save-error').classList.add('hidden'); updateControls();
+  releaseCropShortcutFocus(document.activeElement);
 }
 function loadSettings() {
   $('auto-next').checked = settings.autoNext;
@@ -972,6 +979,9 @@ async function openImage(index) {
   if (index < 0 || index >= state.images.length) return;
   state.folderLoadId += 1;
   const ticket = ++state.requestId; state.index = index; state.points = []; state.rotation = 0; endZoom();
+  state.width = 0; state.height = 0;
+  $('image-layer').classList.add('hidden');
+  updateControls();
   clearLiveCropPreview();
   const item = state.images[index];
   $('image-title').textContent = item.name; $('image-subtitle').textContent = `${formatBytes(item.bytes)}  ·  Loading image…`;
@@ -1060,13 +1070,14 @@ let cropPredictionBusy = false;
 let cropPredictionRequest = 0;
 async function predictCropCorners() {
   if (state.index < 0 || !state.width || state.busy || cropPredictionBusy || $('image-layer').classList.contains('hidden')) return;
-  const item = state.images[state.index], ticket = state.requestId;
+  const item = state.images[state.index], ticket = state.requestId, imageToken = `${item.path}\0${item.modified}`;
   const target = state.points.length === 1 ? [state.points[0].x,state.points[0].y] : null;
   const baseKey = JSON.stringify([item.path,item.modified]);
   const key = JSON.stringify([baseKey,target]);
   endZoom();
   cropPredictionBusy = true; updateControls();
   const request = ++cropPredictionRequest;
+  const stale = () => ticket !== state.requestId || request !== cropPredictionRequest || `${state.images[state.index]?.path}\0${state.images[state.index]?.modified}` !== imageToken;
   try {
     if (!cropPredictionCache || cropPredictionCache.baseKey !== baseKey || (target && cropPredictionCache.key !== key)) {
       let result;
@@ -1075,10 +1086,10 @@ async function predictCropCorners() {
         if (error.message === 'Not found.') throw new Error('The new corner detector needs an idle Cropper backend restart. F5 alone cannot activate it.');
         throw error;
       }
-      if (ticket !== state.requestId || request !== cropPredictionRequest) return;
+      if (stale()) return;
       cropPredictionCache = {key,baseKey,candidates:result.candidates,index:-1};
     }
-    if (ticket !== state.requestId || request !== cropPredictionRequest) return;
+    if (stale()) return;
     const cache = cropPredictionCache;
     if (!cache.candidates.length) { toast('No reliable print outline found. Place corners manually; no points were changed.',true); return; }
     cache.index = (cache.index+1) % cache.candidates.length;
@@ -2085,6 +2096,9 @@ function wire() {
   $('rotate-left').addEventListener('click',()=>{state.rotation=((state.rotation-90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
   $('rotate-right').addEventListener('click',()=>{state.rotation=((state.rotation+90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
   $('save').addEventListener('click',cropSave);
+  for (const id of ['undo','reset','predict-corners','select-whole','rotate-left','rotate-right','save','prev','next']) {
+    $(id).addEventListener('click',event=>releaseCropShortcutFocus(event.currentTarget));
+  }
   const layer = $('image-layer');
   layer.addEventListener('pointerdown',event=>{
     if(state.index<0||state.busy)return;
@@ -2098,6 +2112,7 @@ function wire() {
     if(!$('folder-modal').classList.contains('hidden')){if(event.key==='Escape')closePicker();return;}
     if (state.view !== 'crop') return;
     if(['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable || document.querySelector('dialog[open]'))return;
+    if(event.isComposing || event.keyCode === 229)return;
     if(event.key==='Shift'){startZoom();return;}
     if(event.ctrlKey||event.metaKey){
       const key=event.key.toLowerCase();

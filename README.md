@@ -49,7 +49,7 @@ advance its source; it leaves the source queued for another attempt.
 Open a batch root or 1. Original. Select a photo and place four points in any order.
 P predicts corners locally; repeat to cycle outlines (Ctrl+A is an alternate). For multi-photo pages,
 place one point inside the intended print first. Ctrl+Q clears all points; Ctrl+Z
-undoes one point; Backspace resets. Hold Ctrl to zoom. Left/right arrows navigate;
+undoes one point; Backspace resets. Hold Shift to zoom. Left/right arrows navigate;
 Enter saves. Prediction is approximate: inspect every outline before saving.
 Whole image (W) selects the full frame (Ctrl+Shift+A is an alternate). Re-crop from the original, not a later stage.
 

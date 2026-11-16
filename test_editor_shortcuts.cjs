@@ -20,26 +20,90 @@ function extractBlock(source, needle) {
   throw new Error(`unclosed ${needle}`);
 }
 
+function makeControl(tag, extra = {}) {
+  const el = {
+    tagName: tag,
+    type: extra.type || '',
+    value: extra.value || '',
+    checked: extra.checked || false,
+    isContentEditable: false,
+    disabled: false,
+    textContent: '',
+    style: {},
+    children: [{}, {}, {}, {}],
+    _hidden: extra.hidden || false,
+    _listeners: {},
+    classList: {
+      contains: (name) => name === 'hidden' && el._hidden,
+      add: (name) => { if (name === 'hidden') el._hidden = true; },
+      remove: (name) => { if (name === 'hidden') el._hidden = false; },
+      toggle() {},
+    },
+    querySelector: () => ({textContent: ''}),
+    addEventListener(type, fn) { (el._listeners[type] ||= []).push(fn); },
+    dispatch(type) {
+      for (const fn of el._listeners[type] || []) fn({currentTarget: el, target: el});
+    },
+  };
+  return el;
+}
+
 function shortcutHarness(api) {
   const state = {
-    index: 0, width: 600, height: 400, busy: false, requestId: 1, points: [],
-    images: [{path: 'photo.jpg', modified: 1}], view: 'crop',
+    index: 0, width: 600, height: 400, busy: false, requestId: 1, folderLoadId: 0, points: [],
+    images: [{path: 'photo.jpg', name: 'photo.jpg', bytes: 10, modified: 1}], view: 'crop',
   };
   const messages = [];
-  let active = {tagName: 'BODY', isContentEditable: false};
+  const body = {tagName: 'BODY', isContentEditable: false};
+  let active = body;
   let folderModalHidden = true;
   let openDialog = null;
   const listeners = [];
+  const cropAspect = makeControl('SELECT', {value: 'auto'});
+  const autoNext = makeControl('INPUT', {type: 'checkbox', checked: true});
+  const cropAspectCustom = makeControl('INPUT', {type: 'text', value: '2:3'});
+  const imageLayer = makeControl('DIV');
+  const els = {
+    'crop-aspect': cropAspect,
+    'auto-next': autoNext,
+    'crop-aspect-custom': cropAspectCustom,
+    'crop-aspect-custom-field': makeControl('LABEL', {hidden: true}),
+    'save-error': makeControl('DIV', {hidden: true}),
+    'image-layer': imageLayer,
+    'empty-state': makeControl('DIV', {hidden: true}),
+    'image-title': makeControl('DIV'),
+    'image-subtitle': makeControl('DIV'),
+    position: makeControl('DIV'),
+    photo: makeControl('IMG'),
+    'predict-corners': makeControl('BUTTON'),
+    'select-whole': makeControl('BUTTON'),
+  };
+  cropAspect.blur = () => { if (active === cropAspect) active = body; };
+  autoNext.blur = () => { if (active === autoNext) active = body; };
   const context = {
     state,
+    settings: {autoNext: true, aspect: 'auto', customAspect: '2:3'},
+    localStorage: {setItem() {}, getItem() { return null; }},
     api,
+    formatBytes: (n) => `${n}`,
+    clearLiveCropPreview() {},
+    assignImage: async () => {},
+    imagePath: () => '',
+    fitImage() {},
+    handleOutsideAllowedFolder: () => false,
     document: {
       get activeElement() { return active; },
       addEventListener(type, fn) { if (type === 'keydown') listeners.push(fn); },
       querySelector(sel) { return sel === 'dialog[open]' ? openDialog : null; },
+      querySelectorAll(sel) {
+        if (sel === '#auto-next, #crop-aspect, #crop-aspect-custom') return [autoNext, cropAspect, cropAspectCustom];
+        if (sel === '.image-tile') return [];
+        return [];
+      },
     },
     $(id) {
       if (id === 'folder-modal') return {classList: {contains: (cls) => cls === 'hidden' ? folderModalHidden : false}};
+      if (els[id]) return els[id];
       return {
         classList: {contains: () => false, add() {}, remove() {}, toggle() {}},
         style: {}, disabled: false, querySelector: () => ({textContent: ''}),
@@ -56,6 +120,11 @@ function shortcutHarness(api) {
     closePicker() {},
   };
   vm.createContext(context);
+  if (code.includes('function releaseCropShortcutFocus')) {
+    vm.runInContext(extractBlock(code, 'function releaseCropShortcutFocus') + ';', context);
+  }
+  vm.runInContext(extractBlock(code, 'function saveSettings') + ';', context);
+  vm.runInContext(extractBlock(code, 'async function openImage') + ';', context);
   vm.runInContext(
     code.slice(code.indexOf('let cropPredictionCache ='), code.indexOf('async function cropSave(')),
     context,
@@ -85,6 +154,8 @@ function shortcutHarness(api) {
       altKey: false,
       shiftKey: false,
       repeat: false,
+      isComposing: false,
+      keyCode: 0,
       defaultPrevented: false,
       preventDefault() { event.defaultPrevented = true; },
       ...partial,
@@ -103,9 +174,11 @@ function shortcutHarness(api) {
   }
   return {
     state, messages, press, dispatch, flush,
+    els, cropAspect, autoNext, body,
     setActive(el) { active = el; },
     setFolderModalHidden(hidden) { folderModalHidden = hidden; },
     setOpenDialog(el) { openDialog = el; },
+    bindSettings() { vm.runInContext(extractBlock(code, 'function loadSettings') + '; loadSettings();', context); },
     context,
   };
 }
@@ -407,6 +480,108 @@ test('a held P (event.repeat) does not spam predict', async () => {
   assert.equal(calls, 0);
   await h.press({key: 'p'});
   await h.press({key: 'p', repeat: true});
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+});
+
+test('P, W, Ctrl+A and the buttons do nothing while an image is loading', async () => {
+  let releaseInfo;
+  const posted = [];
+  const h = shortcutHarness((url, body) => {
+    posted.push([url, body]);
+    if (String(url).startsWith('/api/info')) return new Promise((resolve) => { releaseInfo = resolve; });
+    return twoCandidates;
+  });
+  h.state.images = [
+    {path: 'a.jpg', name: 'a.jpg', bytes: 10, modified: 1},
+    {path: 'b.jpg', name: 'b.jpg', bytes: 20, modified: 2},
+  ];
+  const opening = h.context.openImage(1);
+  await Promise.resolve();
+  assert.equal(h.state.width, 0);
+  assert.equal(h.els['image-layer'].classList.contains('hidden'), true);
+  await h.press({key: 'p'});
+  await h.press({key: 'w'});
+  await h.press({key: 'a', ctrlKey: true});
+  await h.press({key: 'A', ctrlKey: true, shiftKey: true});
+  h.context.predictCropCorners();
+  h.context.selectWholeImage();
+  await h.flush();
+  assert.equal(posted.some((entry) => String(entry[0]).includes('crop-corners')), false);
+  assert.equal(h.state.points.length, 0);
+  assert.equal(h.state.width, 0);
+  releaseInfo({width: 800, height: 500});
+  await opening;
+});
+
+test('a predict started on image A is dropped after image B is opened', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.state.images = [
+    {path: 'a.jpg', name: 'a.jpg', bytes: 10, modified: 1},
+    {path: 'b.jpg', name: 'b.jpg', bytes: 20, modified: 2},
+  ];
+  h.dispatch({key: 'p'});
+  h.state.index = 1;
+  h.state.width = 800;
+  h.state.height = 500;
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points.length, 0);
+});
+
+test('IME composition does not predict or preventDefault', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  const composing = await h.press({key: 'p', isComposing: true});
+  const ime = await h.press({key: 'p', keyCode: 229});
+  assert.equal(composing.defaultPrevented, false);
+  assert.equal(ime.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(calls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('P, W and Ctrl+A are ignored in a textarea or select', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  for (const tag of ['TEXTAREA', 'SELECT']) {
+    h.setActive({tagName: tag, isContentEditable: false});
+    const p = await h.press({key: 'p'});
+    const w = await h.press({key: 'w'});
+    const ctrlA = await h.press({key: 'a', ctrlKey: true});
+    assert.equal(p.defaultPrevented, false, tag);
+    assert.equal(w.defaultPrevented, false, tag);
+    assert.equal(ctrlA.defaultPrevented, false, tag);
+  }
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('changing Output proportions then P still predicts', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  h.bindSettings();
+  h.setActive(h.cropAspect);
+  h.cropAspect.value = '2:3';
+  h.cropAspect.dispatch('input');
+  const event = await h.press({key: 'p'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+});
+
+test('ticking Auto-next then P still predicts', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  h.bindSettings();
+  h.setActive(h.autoNext);
+  h.autoNext.checked = false;
+  h.autoNext.dispatch('input');
+  const event = await h.press({key: 'p'});
+  assert.equal(event.defaultPrevented, true);
   assert.equal(h.context.predictCalls, 1);
   assert.equal(calls, 1);
   assert.equal(h.state.points[0].x, 10);
