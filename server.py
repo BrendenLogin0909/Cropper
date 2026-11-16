@@ -36,7 +36,7 @@ from colorize import candidates
 from photo_pairs import read_links, approve_link, suggestions, accept_linked
 from restore import OPERATIONS, preview_dust_marks, restore, useful_change
 import stage_files
-from crop_detection import predict_corners
+import crop_cache
 
 
 HERE = Path(__file__).resolve().parent
@@ -269,6 +269,8 @@ def save_image(source: Path, points: list[list[float]], settings: dict, rotation
     image, info = load_image(source)
     cropped = warp(image, points, rotation, aspect_ratio)
     destination = stage_files.file_results([source], [rendered_bytes(cropped, source.suffix, info)], 'crop')[0]
+    crop_cache.evict_path(source)
+    crop_cache.evict_path(destination)
     return destination, cropped.size
 
 
@@ -422,6 +424,9 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     merged = merge_front_and_back(front, back, back_rotation)
     stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
     stage_files.remember_protected_outputs([plan])
+    crop_cache.evict_path(front_path)
+    crop_cache.evict_path(back_path)
+    crop_cache.evict_path(destination)
     return destination, merged.size
 
 
@@ -448,6 +453,8 @@ def save_enhanced_image(source: Path, settings: dict, allowed_roots=None) -> tup
             payloads.append(rendered_bytes(merged, composite.suffix, composite_info))
         sources.append(composite)
     outputs = stage_files.file_results(sources, payloads, 'enhance')
+    for path in (*sources, *outputs):
+        crop_cache.evict_path(path)
     if link:
         try:
             approve_link(outputs[0], outputs[1], link['split'], link['layout'],
@@ -468,6 +475,9 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
         if not useful_change(changes):
             return None, restored.size, changes, None
         destination = stage_files.file_results([source], [rendered_bytes(restored, source.suffix, info)], 'enhance')[0]
+    crop_cache.evict_path(source)
+    if destination is not None:
+        crop_cache.evict_path(destination)
     archived = planned['snapshots'][0] if planned.get('snapshots') else None
     return destination, restored.size, changes, archived
 
@@ -1401,6 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def json(self, status: int, payload: dict) -> None:
         self.reply(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
@@ -1522,6 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
                 path = self.request_image(query.get("path", [""])[0])
                 limit = 440 if parsed.path == "/api/thumb" else 1800 if parsed.path == "/api/enhance-original" else 7000
                 image, _ = load_image(path)
+                if parsed.path == "/api/image":
+                    display = image
+                    if max(image.size) > limit:
+                        display = image.copy()
+                        display.thumbnail((limit, limit), Image.Resampling.LANCZOS)
+                    data = io.BytesIO()
+                    display.save(data, format="JPEG", quality=88, optimize=True)
+                    self.reply(200, data.getvalue(), "image/jpeg")
+                    crop_cache.fill_from_full_image_exclusive(path, image)
+                    return
                 image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
                 data = io.BytesIO()
                 image.save(data, format="JPEG", quality=88, optimize=True)
@@ -1590,6 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(200, {"cancelled": True, "path": None})
                     return
                 path = register_allowed_root(chosen, tab_id)
+                crop_cache.reset()
                 batch_id = begin_tab_batch(tab_id, folder=path)
                 self.json(200, {
                     "cancelled": False, "path": str(path), "batch_id": batch_id,
@@ -1601,6 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not tab_id or not tab_is_registered(tab_id, TOKEN):
                     raise ValueError("This browser tab must register a random id first.")
                 payload = data if isinstance(data, dict) else {}
+                crop_cache.reset()
                 batch_id = begin_tab_batch(tab_id, folder=payload.get("path"))
                 self.json(200, {"batch_id": batch_id, **_snapshot_public(tab_id)})
                 return
@@ -1632,12 +1655,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/api/crop-corners':
                 path = self.request_image(data.get('path', ''))
-                image, _ = load_image(path)
                 target = data.get('target')
                 if target is not None and (not isinstance(target, list) or len(target) != 2 or
                                            not all(isinstance(v, (int, float)) and np.isfinite(v) for v in target)):
                     raise ValueError('Invalid photo selection point.')
-                self.json(200, predict_corners(image, target))
+                self.json(200, crop_cache.predict_cached(path, target, foreground=True))
+                return
+            if self.path == '/api/crop-prefetch':
+                raw_paths = data.get('paths') if isinstance(data.get('paths'), list) else []
+                queued = []
+                for value in raw_paths[:8]:
+                    queued.append(self.request_image(value))
+                crop_cache.queue_prefetch(queued)
+                self.json(200, {'queued': len(queued)})
                 return
             if self.path == "/api/overwrite-preview":
                 operation = str(data.get("operation") or "crop")
@@ -1716,9 +1746,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/crop-preview":
                 path = self.request_image(data.get("path", ""))
-                image, _ = load_image(path)
-                original_width, original_height = image.size
-                image.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+                crop_cache.wait_for_pending_fill(path)
+                cached = crop_cache.IMAGE_CACHE.get(path)
+                if cached is None or cached['preview'] is None:
+                    full, _ = load_image(path)
+                    crop_cache.fill_from_full_image_exclusive(path, full)
+                    cached = crop_cache.IMAGE_CACHE.get(path)
+                image = cached['preview']
+                original_width, original_height = cached['original_size']
                 scaled = [[float(x) * image.width / original_width, float(y) * image.height / original_height] for x, y in data.get("points", [])]
                 preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"))
                 payload = io.BytesIO()

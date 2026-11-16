@@ -125,6 +125,11 @@ function shortcutHarness(api) {
     updateControls() {},
     renderOverlay() {},
     toast: (message) => messages.push(message),
+    Map,
+    AbortController,
+    JSON,
+    Set,
+    Promise,
     startZoom() {},
     openImage() {},
     cropSave() { context.saveCalls += 1; },
@@ -140,7 +145,7 @@ function shortcutHarness(api) {
   vm.runInContext(extractBlock(code, 'function saveSettings') + ';', context);
   vm.runInContext(extractBlock(code, 'async function openImage') + ';', context);
   vm.runInContext(
-    code.slice(code.indexOf('let cropPredictionCache ='), code.indexOf('async function cropSave(')),
+    code.slice(code.indexOf('const CROP_PREDICTION_CACHE_LIMIT'), code.indexOf('async function cropSave(')),
     context,
   );
   vm.runInContext(extractBlock(code, "document.addEventListener('keydown'") + ');', context);
@@ -191,7 +196,7 @@ function shortcutHarness(api) {
     context.openCalls += 1;
     return realOpen(...args);
   };
-  function dispatch(partial) {
+  function makeKeyEvent(partial) {
     const event = {
       key: 'a',
       ctrlKey: false,
@@ -206,6 +211,10 @@ function shortcutHarness(api) {
       stopPropagation() { event._stopped = true; },
       ...partial,
     };
+    return event;
+  }
+  function dispatch(partial) {
+    const event = makeKeyEvent(partial);
     const focused = active;
     if (focused && focused._listeners && focused._listeners.keydown) {
       for (const fn of focused._listeners.keydown) {
@@ -213,6 +222,11 @@ function shortcutHarness(api) {
         if (event._stopped) return event;
       }
     }
+    listeners[0](event);
+    return event;
+  }
+  function dispatchDocument(partial) {
+    const event = makeKeyEvent(partial);
     listeners[0](event);
     return event;
   }
@@ -226,7 +240,7 @@ function shortcutHarness(api) {
     return event;
   }
   return {
-    state, messages, press, dispatch, flush,
+    state, messages, press, dispatch, dispatchDocument, flush,
     els, cropAspect, autoNext, cropAspectCustom, body,
     setActive(el) { active = el; },
     setFolderModalHidden(hidden) { folderModalHidden = hidden; },
@@ -1106,6 +1120,46 @@ test('a pointer-driven Output proportions change releases focus so P and W work'
   assert.equal(h.context.selectCalls, 1);
 });
 
+test('document handler SELECT guard skips save and navigation for Enter and Escape', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.setActive(h.cropAspect);
+  const enter = h.dispatchDocument({key: 'Enter', target: h.cropAspect});
+  assert.equal(enter.defaultPrevented, false);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  const escape = h.dispatchDocument({key: 'Escape', target: h.cropAspect});
+  assert.equal(escape.defaultPrevented, false);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+});
+
+test('document handler early SELECT guard blocks arrow keys that cropEnterActivatesFocusedControl does not cover', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.setActive(h.cropAspect);
+  assert.equal(h.context.cropEnterActivatesFocusedControl(h.cropAspect), true);
+  const left = h.dispatchDocument({key: 'ArrowLeft', target: h.cropAspect});
+  assert.equal(left.defaultPrevented, false);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  const right = h.dispatchDocument({key: 'ArrowRight', target: h.cropAspect});
+  assert.equal(right.defaultPrevented, false);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.state.index, 1);
+  const predict = h.dispatchDocument({key: 'p', target: h.cropAspect});
+  assert.equal(predict.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+});
+
 test('Enter and Escape on Output proportions go through the document handler, release focus, and do not save', () => {
   const h = shortcutHarness(async () => twoCandidates);
   h.bindSettings();
@@ -1243,4 +1297,51 @@ test('a stale load failure shows no toast and does not reset the current image',
   assert.equal(h.els['image-layer'].classList.contains('hidden'), false);
   assert.equal(h.els['empty-state'].classList.contains('hidden'), true);
   assert.equal(h.messages.length, 0);
+});
+
+test('switching photo aborts in-flight predict and does not leave Finding corners stuck', async () => {
+  let abortSeen = false;
+  const h = shortcutHarness((url, body, options) => {
+    if (String(url).includes('/api/crop-corners')) {
+      return new Promise((_, reject) => {
+        const signal = options && options.signal;
+        const fail = () => {
+          abortSeen = true;
+          const error = new Error('The operation was aborted.');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (!signal) return;
+        if (signal.aborted) { fail(); return; }
+        signal.addEventListener('abort', fail);
+      });
+    }
+    if (String(url).startsWith('/api/info')) return {width: 800, height: 500};
+    if (String(url).includes('crop-prefetch')) return {queued: 0};
+    return {};
+  });
+  const predictSpan = {textContent: 'Predict corners'};
+  h.els['predict-corners'].querySelector = () => predictSpan;
+  h.context.updateControls = function () {
+    predictSpan.textContent = vm.runInContext('cropPredictionBusy', h.context) ? 'Finding corners…' : 'Predict corners';
+  };
+  h.context.assignImage = async () => {};
+  h.state.images = twoImages();
+  h.state.width = 600;
+  h.state.height = 400;
+  h.els['image-layer'].classList.remove('hidden');
+  const pending = h.context.predictCropCorners();
+  await Promise.resolve();
+  assert.equal(vm.runInContext('cropPredictionBusy', h.context), true);
+  assert.equal(predictSpan.textContent, 'Finding corners…');
+  const opening = h.context.openImage(1);
+  await pending;
+  assert.equal(abortSeen, true);
+  assert.equal(vm.runInContext('cropPredictionBusy', h.context), false);
+  assert.equal(predictSpan.textContent, 'Predict corners');
+  assert.equal(h.state.points.length, 0);
+  assert.equal(h.messages.length, 0);
+  await opening;
+  assert.equal(h.state.index, 1);
+  assert.equal(h.state.points.length, 0);
 });

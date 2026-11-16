@@ -4,13 +4,50 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const code=fs.readFileSync(__dirname+'/app.js','utf8');
 function harness(api) {
-  const state={index:0,width:600,height:400,busy:false,requestId:1,points:[],images:[{path:'photo.jpg',modified:1}]};
+  const state={index:0,width:600,height:400,busy:false,requestId:1,points:[],images:[{path:'photo.jpg',modified:1,bytes:10}],rotation:0};
   const messages=[];
-  const context={state,api,$:()=>({classList:{contains:()=>false}}),endZoom(){},updateControls(){},renderOverlay(){},toast:m=>messages.push(m)};
+  const predictSpan={textContent:'Predict corners'};
+  const context={
+    state,api,settings:{autoNext:false},
+    $:(id)=>({
+      classList:{contains:()=>false,add(){},remove(){}},
+      querySelector:()=>id==='predict-corners'?predictSpan:{textContent:''},
+    }),
+    endZoom(){},updateControls(){
+      predictSpan.textContent=vm.runInContext('cropPredictionBusy',context)?'Finding corners…':'Predict corners';
+    },
+    renderOverlay(){},toast:m=>messages.push(m),
+    Map,AbortController,JSON,Set,Date,
+    ordered:(points)=>points&&points.length===4,
+    validSettings:()=>'',
+    cropAspectRatio:()=>null,
+    stageRoutingEnabled:()=>true,
+    ensureOverwriteConfirmed:async()=>({}),
+    refreshStageFolders:async()=>{},
+    offerChooseOutputFolder:()=>false,
+    renderImages(){},
+    clearEditor(){},
+    openImage:async()=>{},
+  };
   vm.createContext(context);
-  vm.runInContext(code.slice(code.indexOf('let cropPredictionCache ='),code.indexOf('function selectWholeImage(')),context);
-  return {state,messages,predict:()=>vm.runInContext('predictCropCorners()',context),clear:()=>vm.runInContext('clearCropPoints()',context)};
+  vm.runInContext(code.slice(code.indexOf('const CROP_PREDICTION_CACHE_LIMIT'),code.indexOf('function clearLiveCropPreview(')),context);
+  return {
+    state,messages,context,predictSpan,
+    predict:()=>vm.runInContext('predictCropCorners()',context),
+    clear:()=>vm.runInContext('clearCropPoints()',context),
+    cropSave:()=>vm.runInContext('cropSave()',context),
+    forget:(path)=>vm.runInContext('forgetPredictionsForPath('+JSON.stringify(path)+')',context),
+  };
 }
+test('client prediction cache is a bounded Map and predict passes an AbortSignal',()=>{
+  assert.match(code,/CROP_PREDICTION_CACHE_LIMIT = 32/);
+  assert.match(code,/cropPredictionCache = new Map/);
+  assert.match(code,/signal: controller.signal/);
+  assert.match(code,/cropPredictionAbort.abort/);
+  assert.match(code,/forgetPredictionsForPath\(state\.images\[sourceIndex\]\.path\)/);
+  assert.match(code,/async function openImage\(index\) \{\r?\n  if \(index < 0[^\r\n]+\r?\n  invalidateInFlightPredict\(\);/);
+  assert.match(code,/if \(state\.restore\.busy\) \{ toast\('Stop or finish the restoration batch before changing folders\.', true\); return; \}\r?\n  invalidateInFlightPredict\(\);/);
+});
 test('cycles candidates without additional requests; clears all points',async()=>{
   let calls=0;
   const h=harness(async()=>{calls++;return {candidates:[{points:[[10,10],[300,10],[300,300],[10,300]]},{points:[[320,10],[550,10],[550,300],[320,300]]}]};});
@@ -39,6 +76,36 @@ test('late predict for image A is dropped after image B is current',async()=>{
   h.state.images[0]={path:'other.jpg',modified:2};
   h.state.width=800;h.state.height=600;
   release({candidates:[{points:[[1,1],[2,1],[2,2],[1,2]]}]});await request;
+  assert.equal(h.state.points.length,0);
+});
+test('in-place crop save drops the client Map so the next predict refetches',async()=>{
+  let calls=0;
+  const h=harness(async(url)=>{
+    if(String(url).includes('/api/crop-corners')){calls+=1;return {candidates:[{points:[[10,10],[300,10],[300,300],[10,300]]}]};}
+    if(String(url)==='/api/crop') return {name:'photo.jpg',path:'photo.jpg',width:10,height:10,source_moved:false};
+    return {};
+  });
+  await h.predict();
+  assert.equal(calls,1);
+  h.state.points=[{x:10,y:10},{x:300,y:10},{x:300,y:300},{x:10,y:300}];
+  await h.cropSave();
+  await h.predict();
+  assert.equal(calls,2);
+});
+test('cancelled predict aborts the in-flight request',async()=>{
+  let abortSeen=false;
+  const h=harness((url,body,options)=>new Promise((_,reject)=>{
+    const signal=options&&options.signal;
+    if(!signal)return;
+    const fail=()=>{abortSeen=true;const error=new Error('The operation was aborted.');error.name='AbortError';reject(error);};
+    if(signal.aborted){fail();return;}
+    signal.addEventListener('abort',fail);
+  }));
+  h.state.images=[{path:'photo.jpg',modified:1,bytes:10}];
+  const request=h.predict();
+  h.clear();
+  await request;
+  assert.equal(abortSeen,true);
   assert.equal(h.state.points.length,0);
 });
 test('old backend gives an explicit restart message without modifying points',async()=>{

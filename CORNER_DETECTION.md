@@ -26,3 +26,40 @@ are additional. No original photos were modified.
 
 The new endpoint requires an idle backend restart. Browser refresh alone cannot
 install a new Python handler. The UI explains this if the old backend returns 404.
+
+Detection still runs at 960 px. Quad scoring is vectorised and de-duplicated
+before the expensive side walk so the same corners come back faster. Opening an
+image replies with the display JPEG first, then fills a decoded 960/1400 preview
+cache off the request path in two stages: the 960 px detect image is published
+first (same identity + generation check under `_fill_lock`), then the 1400 px
+preview is built with `cv2.resize` INTER_AREA and published the same way. A
+predict waiting on that fill is released as soon as the 960 entry is available,
+not after the 1400 build. The 960 detect resize is unchanged (PIL BILINEAR
+thumbnail). An evict between the two puts stops the second put. A fill captures
+`file_identity` and a per-path eviction generation before decode and puts only
+if both are still unchanged; otherwise the decoded pixels are discarded. The
+identity re-stat, generation check, and `IMAGE_CACHE.put` share one fill lock,
+acquired before the LRU lock (never the reverse), so a same-identity
+`evict_path` cannot land between the check and the put. Prefetch and every
+RESULT_CACHE entry use a full decode (JPEG draft decode was removed).
+Prediction results are LRU-cached on the server and in a small client Map.
+Opening also prefetches the current and
+next image on one background worker; a foreground predict re-queues a skipped
+neighbour rather than dropping it. Cancelling predict (C, Z, Backspace, Whole
+image) aborts the in-flight request. Switching photo or folder also aborts;
+begin-batch/folder change resets the server caches and prefetch queue. Saving a
+crop, restore, or enhance evicts that resolved path from both LRUs, and the
+client Map drops that path so the next P refetches. Save/export still uses the
+full-resolution decode. Run `python tools/perf/bench_crop_corners.py --runs 7`
+for synthetic timings.
+
+Cache keys are `(resolved path, mtime_ns, size)` — not ctime. An external edit
+in the same mtime tick that leaves the file size unchanged can therefore hit a
+stale cached result. Our own writes evict the path explicitly. NTFS mtime is
+100 ns; Windows `st_ctime` is the file's creation time, so adding it would not
+close that hole. This becomes an ADR in DECISIONS.md when this stack joins #16's
+docs.
+
+## PLAN
+
+Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal; follow-up (re-measure with step 3 curve warp).
