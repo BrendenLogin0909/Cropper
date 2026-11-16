@@ -52,16 +52,22 @@ crop, restore, or enhance evicts that resolved path from both LRUs, and the
 client Map drops that path so the next P refetches. Save/export still uses the
 full-resolution decode. After the homography, warp may follow bowed print edges.
 **Straighten bowed edges is on by default.** It runs after the four-corner warp
-on both preview and save. Quadratic sag remaps only with all of: a scanner-bed
+on both preview and save. Sag remaps only with all of: a scanner-bed
 Lab band outside the fitted curve along ≥ ~30% of the side (`BACKGROUND_DE` 14,
 `BACKGROUND_BAND_FRAC` 0.30; background = median Lab of a sparse ring of
 full-resolution samples just outside the crop quad, falling back to a ≤
-`BACKGROUND_MAX` (400 px) outside-median), full-resolution **quadratic sag**
-≥ `BOW_DEPTH_FRAC` (0.4% of the side) measured relative to the chord between the locked
-endpoints, consistent inward sag (`SIGN_FRAC` 0.80; the peak need not be
-centred), and a background-band WIDTH that tracks that sag (Pearson
+`BACKGROUND_MAX` (400 px) outside-median), full-resolution depth
+≥ `max(BOW_DEPTH_FRAC × side, BOW_DEPTH_PX)` (`BOW_DEPTH_FRAC` 0.2%, floor 3
+full-res px). Depth is the observed background-band width (p90) so a 3 px
+bow is not lost to 1 px end AA; chord-relative sag must still be a bow
+(≥ half the gate, consistent inward sign, `SIGN_FRAC` 0.80; the peak need not
+be centred) so a strip or wedge stays identity. Band WIDTH must track that sag (Pearson
 correlation ≥ `BAND_TRACK_CORR` 0.75 — a real bow widens toward the middle;
-noise and picture edges do not). Picture-content gradients never count.
+noise and picture edges do not). The profile is quadratic, cubic, or a spline
+with ≤ `SPLINE_CONTROLS` (5) points, ends locked; the model is chosen by BIC
+on residual vs the background band (`k` = 0 for a zero-sag baseline, then
+1/2/3). A fit with RMSE > `POOR_RESIDUAL_PX` (2.5) is discarded so a spline
+does not win on picture content or a perspective margin. Picture-content gradients never count.
 A linear (offset + tilt) bed-strip term is **not applied** (option (i)).
 The 80% background rule plus the ΔE content measure cannot tell a matching-colour
 print border from a scanner-bed strip (synthetic probe below); there is no
@@ -77,9 +83,12 @@ straight — there is no unguarded trim. Fitted sag is clipped to
 edges qualify, content loss (sag pixels that do not match the ring Lab within
 `BACKGROUND_DE`) must stay ≤ `AREA_LOSS_FRAC` (0.5%), and geometric sag area ≤
 `GEOMETRIC_LOSS_FRAC` (1.5%). Largest-loss edges are dropped until both hold;
-if that removes them all, output is byte-identical to OFF. The ≤800 px estimate
-is refined at full resolution in a `REFINE_BAND_PX` (6 px,
-widened by the downsample scale) band; remap is restricted to the affected
+if that removes them all, output is byte-identical to OFF. All-background sag
+of e.g. 0.82% is allowed: the 0.5% budget is **content-only**, with the 1.5%
+geometric backstop. The ≤800 px estimate is refined in a band around the
+coarse edge at ~2000 px (`REFINE_MID_MAX`) and/or full resolution. A cheap
+≤960 (`EARLY_MAX`) band check can skip full detection when no side is a
+candidate. Remap is restricted to the affected
 edge band. Preview and save apply **one** curve: `/api/crop-preview` loads the
 full-resolution source, runs that detect+refine on the full-res homography, and
 scales the already-qualified params onto the 1400 px warp instead of refitting.
@@ -108,10 +117,21 @@ pixel; the 3√2 Euclidean is the same step on both axes). Bounds: MAE < 0.5,
 corner max ≤ 1.0 preview px, curve p95 ≤ 1.0 preview px. `docs/` is not on this
 branch; this ADR lives here until #16's DECISIONS.md.
 
-A. Straight-edge false positives: `BOW_DEPTH_FRAC` is 0.4% of the side. The
-background-band WIDTH must track the fitted sag (Pearson ≥ `BAND_TRACK_CORR`
-0.75). A passing bow fixture remaps; a noisy or picture-edge fixture stays
-straight.
+A. Depth gate: `BOW_DEPTH_FRAC` is **0.2%** of the side, with an absolute floor
+of `BOW_DEPTH_PX` (3 full-res px). The gate is
+`max(BOW_DEPTH_FRAC × side, BOW_DEPTH_PX)`. Retune the fraction constant.
+Band-width-vs-sag Pearson ≥ `BAND_TRACK_CORR` 0.75. A 3 px bow on a 1500 px
+side with a bed streak remaps; a noisy or picture edge stays identity.
+
+(a)–(d) 2026-11-16 tuning: (a) the 0.2%/3 px gate above. (b) quadratic, cubic,
+or ≤5-point spline, ends locked, BIC vs a k=0 zero-sag baseline then k=1/2/3;
+RMSE > 2.5 px is discarded so a spline cannot fit picture content. (c)
+multi-scale refine at ≤800 then ~2000 or full-res; 60 px bows on a ~3000 px
+side remap under the 2%/3% displacement caps, 0.5% content budget, and 1.5%
+geometric backstop. (d) cheap ≤960 early exit before full detection; the
+early-exit decision equals the full-path decision on every suite fixture.
+All-background geometric loss of 0.82% is allowed because the 0.5% budget is
+content-only.
 
 B. Linear (offset + tilt) correction is **omitted** (option (i)). A uniform
 border the same colour as the bed is indistinguishable from bed under the
@@ -146,7 +166,8 @@ varying streak must leave a residual streak ≤ 2 px at save scale, and extra
 content loss ≤ 0.5% **per print** and geometric loss ≤ 1.5%. Preview-vs-save
 bounds are in preview pixels: MAE < 0.5, corner max ≤ 1.0, curve p95 ≤ 1.0
 (save-scale distances divided by the save/preview scale). On a bowed edge the
-**curved** residual must be ≤ 2 px at save scale. A leftover constant or
-tilted strip is **reported per edge, not failed**. A straight, strip-less, or
-busy print is byte-identical to OFF. Real-scan validation is local and
-off-repo.
+**curved** residual must be ≤ 2 full-res px. A leftover constant or tilted
+strip is **reported per edge, not failed**. A 3 px bow on a 1500 px side
+remaps; noisy, picture-edge, strip, wedge, uniform-border, and busy fixtures
+stay byte-identical to OFF. Early-exit modes match the full path on every
+suite fixture. Real-scan validation is local and off-repo.
