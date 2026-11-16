@@ -25,11 +25,12 @@ from test_bowed_edges import synthetic_curved_rectangle  # noqa: E402
 from test_crop_detection import synthetic_print  # noqa: E402
 
 SIZES = ((1200, 900), (3000, 2200), (4500, 3400))
-# Single-edge bows that qualify: ≥ BOW_DEPTH_FRAC, ≤ 2% displacement, content ≤ 0.5% / geometric ≤ 1.5%.
+# Single-edge bows that qualify: ≥ BOW_DEPTH_FRAC (0.4%), displacement 2% or 3%
+# when the sag is scanner background, content ≤ 0.5% / geometric ≤ 1.5%.
 BOW_FIXTURES = {
-    (1200, 900): (80, 4.5),
-    (3000, 2200): (180, 12),
-    (4500, 3400): (280, 18),
+    (1200, 900): (80, 8),
+    (3000, 2200): (180, 16),
+    (4500, 3400): (280, 22),
 }
 
 

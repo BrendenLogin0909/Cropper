@@ -1,15 +1,17 @@
 """Follow bowed print edges after the four-corner homography.
 
-Default ON. An edge is remapped only with positive evidence: a scanner-background
-band outside the curve, a chord-relative quadratic sag deeper than BOW_DEPTH_FRAC
-of the side, and a consistent inward sag. Depth is a fraction of the side after
-a linear detrend (a linear wedge or uniform strip is ~0). Picture-content
-gradients never count. Qualify/skip runs once, at the full-res warp; preview
-scales those params and does not re-gate or refine. A poor quadratic fit is
-left straight (no trim, even when the background match is strong). Remap is
-restricted to the affected edge band(s). Predicted extra area loss is a
-per-print budget: content loss ≤ AREA_LOSS_FRAC, with a geometric backstop of
-GEOMETRIC_LOSS_FRAC. Largest-loss edges are dropped until both are satisfied.
+Default ON. An edge is remapped only with positive evidence. Quadratic sag
+must exceed BOW_DEPTH_FRAC of the side (chord-relative), keep a consistent
+inward sign, and have a background-band WIDTH that tracks the fitted sag
+(Pearson ≥ BAND_TRACK_CORR). Displacement is DISPLACEMENT_CAP_FRAC, or
+DISPLACEMENT_BACKGROUND_FRAC when the pulled pixels are scanner background.
+Qualify/skip runs once at the full-res warp; preview scales those params.
+Poor quadratic fit stays straight. Per-print content loss ≤ AREA_LOSS_FRAC,
+geometric backstop GEOMETRIC_LOSS_FRAC; largest-loss edges drop first.
+
+A linear (offset + tilt) bed-strip term is not applied: the 80% background
+rule plus the ΔE content measure cannot tell a matching-colour print border
+from a scanner-bed strip, and there is no blind fallback.
 """
 from __future__ import annotations
 
@@ -30,16 +32,22 @@ BACKGROUND_DE = 14.0
 # the fitted curve.
 BACKGROUND_BAND_FRAC = 0.30
 # Minimum quadratic sag as a fraction of the side, after linear detrend.
-# Below this the edge is treated as straight. 0.2% is ~2 px on a 1000 px side
-# and ~8 px on a 4000 px side, so a 10–12 px bow at 4500 qualifies at every size.
-BOW_DEPTH_FRAC = 0.002
-# Interior sag samples that must share one sign (inward).
+# Below this the edge is treated as straight. 0.4% is ~4 px on a 1000 px side
+# and ~16 px on a 4000 px side.
+BOW_DEPTH_FRAC = 0.004
+# Pearson correlation between background-band width and the fitted sag. A real
+# bow widens toward the middle with the curve; noise and picture edges do not.
+BAND_TRACK_CORR = 0.75
+# Interior sag samples that must share one sign (inward). Asymmetric bows are
+# allowed; the peak need not be centred.
 SIGN_FRAC = 0.80
 # Clip fitted bow depth to this fraction of the edge length.
 DEPTH_CAP_FRAC = 0.03
-# Skip the edge (straight warp) if any pixel would move more than this fraction
-# of the edge length.
+# Skip the edge if any pixel would move more than this fraction of the side.
+# Raised to DISPLACEMENT_BACKGROUND_FRAC only when the pulled pixels are
+# scanner background under BACKGROUND_DE.
 DISPLACEMENT_CAP_FRAC = 0.02
+DISPLACEMENT_BACKGROUND_FRAC = 0.03
 # Per-print CONTENT loss: sag pixels that do not match the ring background Lab
 # (ΔE > BACKGROUND_DE). Scanner-bed in the sag does not count.
 AREA_LOSS_FRAC = 0.005
@@ -310,8 +318,25 @@ def _consistent_inward_sag(curve: np.ndarray) -> bool:
     return True
 
 
+def _band_track_correlation(band: np.ndarray, sag: np.ndarray) -> float:
+    """Pearson correlation of background-band width vs fitted sag (interior)."""
+    n = min(int(band.shape[0]), int(sag.shape[0]))
+    if n < MIN_SAMPLES:
+        return 0.0
+    lo = int(round(0.04 * n))
+    hi = int(round(0.96 * n))
+    widths = np.asarray(band[:n][lo:hi], dtype=np.float64)
+    profile = np.asarray(sag[:n][lo:hi], dtype=np.float64)
+    if widths.size < MIN_SAMPLES or float(profile.max()) < 0.5:
+        return 0.0
+    if float(widths.std()) < 0.25 or float(profile.std()) < 0.25:
+        return 0.0
+    corr = np.corrcoef(widths, profile)[0, 1]
+    return 0.0 if not np.isfinite(corr) else float(corr)
+
+
 def _geometry_ok(curve: np.ndarray, side: str, width: int, height: int) -> bool:
-    """Chord-relative sag depth and 2% displacement skip. Area is per-print later."""
+    """Chord-relative sag depth and inward sign. Displacement is applied later."""
     edge_length = float(width if side in {'top', 'bottom'} else height)
     other = float(height if side in {'top', 'bottom'} else width)
     if edge_length < 2 or other < 2:
@@ -322,7 +347,23 @@ def _geometry_ok(curve: np.ndarray, side: str, width: int, height: int) -> bool:
         return False
     if not _consistent_inward_sag(curve):
         return False
-    if peak > DISPLACEMENT_CAP_FRAC * edge_length:
+    if peak > DISPLACEMENT_BACKGROUND_FRAC * edge_length:
+        return False
+    return True
+
+
+def _displacement_allows(curve: np.ndarray, side: str, width: int, height: int, lab: np.ndarray, background: np.ndarray) -> bool:
+    """2% cap, or 3% when the pulled pixels are scanner background."""
+    edge_length = float(width if side in {'top', 'bottom'} else height)
+    peak = float(curve.max()) if curve.size else 0.0
+    if peak <= DISPLACEMENT_CAP_FRAC * edge_length:
+        return True
+    if peak > DISPLACEMENT_BACKGROUND_FRAC * edge_length:
+        return False
+    geometric, content = _sag_loss_fractions(lab, curve, side, background, width, height)
+    if geometric <= 0.0:
+        return False
+    if content / geometric > 0.05:
         return False
     return True
 
@@ -356,15 +397,27 @@ def _sag_loss_fractions(
     return geometric, content_frac
 
 
-def _qualify_edge(curve: np.ndarray, side: str, width: int, height: int, lab: np.ndarray, background: np.ndarray) -> tuple[np.ndarray, str, float, float]:
-    """Return (chord-relative sag or zeros, mode, geometric fraction, content fraction)."""
+def _qualify_edge(
+    curve: np.ndarray,
+    band: np.ndarray,
+    side: str,
+    width: int,
+    height: int,
+    lab: np.ndarray,
+    background: np.ndarray,
+) -> tuple[np.ndarray, str, float, float]:
+    """Return (applied sag or zeros, mode, geometric fraction, content fraction)."""
     zeros = np.zeros_like(curve)
     if not _geometry_ok(curve, side, width, height):
         return zeros, 'none', 0.0, 0.0
-    if _background_band_fraction(lab, side, curve, background) < BACKGROUND_BAND_FRAC:
+    sag = np.clip(_quadratic_sag(curve), 0.0, None)
+    if _band_track_correlation(band, sag) < BAND_TRACK_CORR:
+        return zeros, 'none', 0.0, 0.0
+    if _background_band_fraction(lab, side, sag, background) < BACKGROUND_BAND_FRAC:
+        return zeros, 'none', 0.0, 0.0
+    if not _displacement_allows(sag, side, width, height, lab, background):
         return zeros, 'none', 0.0, 0.0
     edge_length = float(width if side in {'top', 'bottom'} else height)
-    sag = np.clip(_quadratic_sag(curve), 0.0, None)
     capped = np.minimum(sag, DEPTH_CAP_FRAC * edge_length)
     geometric, content = _sag_loss_fractions(lab, capped, side, background, width, height)
     return capped, 'curve', geometric, content
@@ -444,19 +497,24 @@ def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = N
         return empty
     lab = _to_lab(rgb)
     refined = {}
+    bands = {}
     for side in ('top', 'bottom', 'left', 'right'):
         if side not in candidates:
             refined[side] = np.zeros_like(coarse[side])
+            bands[side] = np.zeros_like(coarse[side])
             continue
         hits = _refine_edge(lab, side, coarse[side], background_lab, scale)
         fitted, mode = _fit_quadratic(hits)
         refined[side] = fitted if mode == 'curve' else np.zeros_like(hits)
+        bands[side] = hits
     modes = {}
     applied = {}
     geometric = {}
     content = {}
     for side in ('top', 'bottom', 'left', 'right'):
-        curve, mode, geo, cont = _qualify_edge(refined[side], side, full_w, full_h, lab, background_lab)
+        curve, mode, geo, cont = _qualify_edge(
+            refined[side], bands[side], side, full_w, full_h, lab, background_lab,
+        )
         applied[side] = curve
         modes[side] = mode
         geometric[side] = geo

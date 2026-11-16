@@ -52,22 +52,28 @@ crop, restore, or enhance evicts that resolved path from both LRUs, and the
 client Map drops that path so the next P refetches. Save/export still uses the
 full-resolution decode. After the homography, warp may follow bowed print edges.
 **Straighten bowed edges is on by default.** It runs after the four-corner warp
-on both preview and save. An edge remaps only with all three of: a scanner-bed
+on both preview and save. Quadratic sag remaps only with all of: a scanner-bed
 Lab band outside the fitted curve along ≥ ~30% of the side (`BACKGROUND_DE` 14,
 `BACKGROUND_BAND_FRAC` 0.30; background = median Lab of a sparse ring of
 full-resolution samples just outside the crop quad, falling back to a ≤
 `BACKGROUND_MAX` (400 px) outside-median), full-resolution **quadratic sag**
-≥ `BOW_DEPTH_FRAC` (0.2% of the side) measured relative to the chord between the locked
-endpoints (a linear wedge or uniform strip is ~0 sag), and consistent
-inward sag (`SIGN_FRAC` 0.80). Picture-content gradients never count.
-Unqualified edges stay exactly straight; if none qualify, output is
-byte-identical to OFF. Poor quadratic fit is left straight — **there is no
-trim**, even when the background match is strong. Fitted sag is clipped to
-`DEPTH_CAP_FRAC` (3% of the side). If any pixel would move more than
-`DISPLACEMENT_CAP_FRAC` (2% of the side), that edge is skipped (straight warp).
-Predicted extra area loss is a **per-print** budget: after edges qualify,
-content loss (sag pixels that do not match the ring Lab within `BACKGROUND_DE`)
-must stay ≤ `AREA_LOSS_FRAC` (0.5%), and geometric sag area ≤
+≥ `BOW_DEPTH_FRAC` (0.4% of the side) measured relative to the chord between the locked
+endpoints, consistent inward sag (`SIGN_FRAC` 0.80; the peak need not be
+centred), and a background-band WIDTH that tracks that sag (Pearson
+correlation ≥ `BAND_TRACK_CORR` 0.75 — a real bow widens toward the middle;
+noise and picture edges do not). Picture-content gradients never count.
+A linear (offset + tilt) bed-strip term is **not applied**. The 80%
+background rule plus the ΔE content measure cannot tell a matching-colour
+print border from a scanner-bed strip (synthetic probe below); there is no
+blind fallback and no workaround. Unqualified edges stay exactly straight; if none
+qualify, output is byte-identical to OFF. Poor quadratic fit is left
+straight — there is no unguarded trim. Fitted sag is clipped to
+`DEPTH_CAP_FRAC` (3% of the side). Displacement is skipped above
+`DISPLACEMENT_CAP_FRAC` (2% of the side), or `DISPLACEMENT_BACKGROUND_FRAC`
+(3%) when the pixels being pulled out are scanner background under
+`BACKGROUND_DE`. Predicted extra area loss is a **per-print** budget: after
+edges qualify, content loss (sag pixels that do not match the ring Lab within
+`BACKGROUND_DE`) must stay ≤ `AREA_LOSS_FRAC` (0.5%), and geometric sag area ≤
 `GEOMETRIC_LOSS_FRAC` (1.5%). Largest-loss edges are dropped until both hold;
 if that removes them all, output is byte-identical to OFF. The ≤800 px estimate
 is refined at full resolution in a `REFINE_BAND_PX` (6 px,
@@ -100,6 +106,25 @@ pixel; the 3√2 Euclidean is the same step on both axes). Bounds: MAE < 0.5,
 corner max ≤ 1.0 preview px, curve p95 ≤ 1.0 preview px. `docs/` is not on this
 branch; this ADR lives here until #16's DECISIONS.md.
 
+A. Straight-edge false positives: `BOW_DEPTH_FRAC` is 0.4% of the side. The
+background-band WIDTH must track the fitted sag (Pearson ≥ `BAND_TRACK_CORR`
+0.75). A passing bow fixture remaps; a noisy or picture-edge fixture stays
+straight.
+
+B. Linear (offset + tilt) correction is **not shipped**. On a synthetic 3000×2200
+print with a 15 px uniform border the same Lab as the bed (no print-edge line
+or shadow), every stated guard passes: background evidence along the top
+strip = 1.00 (need ≥ 0.80); strip content = 0 (need ≤ 0.0005); per-side
+geometric ≈ 0.0053; 15 px is under the 2% cap. Applying the term ate the
+left and right borders (15.0 px, area 0.00528 each; remaining geometric
+0.01057 after the 1.5% backstop dropped top and bottom). The 80% rule plus
+the content measure cannot tell that border from bed, so the linear term is
+omitted. No workaround.
+
+C. Displacement cap is 3% (matching the depth cap) only where the pulled
+pixels are background under `BACKGROUND_DE`; elsewhere it stays 2%. Asymmetric
+bows are allowed when the sag sign is consistent along the edge.
+
 ## PLAN
 
 Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal;
@@ -117,6 +142,7 @@ area loss ≤ 0.1%. A qualifying bowed print on scanner background with a thin
 varying streak must leave a residual streak ≤ 2 px at save scale, and extra
 content loss ≤ 0.5% **per print** and geometric loss ≤ 1.5%. Preview-vs-save
 bounds are in preview pixels: MAE < 0.5, corner max ≤ 1.0, curve p95 ≤ 1.0
-(save-scale distances divided by the save/preview scale). A straight print with
-a 3–6 px uniform strip or a 0–8 px linear wedge on one edge is byte-identical
-to OFF. Real-scan validation is local and off-repo.
+(save-scale distances divided by the save/preview scale). A straight print,
+a 3–6 px uniform strip, a 0–8 px linear wedge, a matching-colour print
+border, and busy content-to-edge fixtures are byte-identical to OFF. Real-scan
+validation is local and off-repo.

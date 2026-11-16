@@ -14,12 +14,12 @@ from server import warp
 
 PAGE = (203, 185, 154)
 PRINT = (37, 72, 140)
-# Qualifying single-edge bows: ≥ BOW_DEPTH_FRAC, ≤ 2% displacement, ≤ 0.5% area.
-# Fitted mean is a bit above a 2/3 parabola, so 5 px at 1200×900 trips 0.5%.
-QUALIFY_1200 = (1200, 900, 80, 4.5)
-QUALIFY_2000 = (2000, 1500, 140, 8)
-QUALIFY_4500 = (4500, 3400, 280, 18)
-# 10–12 px at 4500 used to skip on the 1400 preview (3 px < 4 px) while save remapped.
+# Qualifying single-edge bows: ≥ BOW_DEPTH_FRAC (0.4%), displacement 2% or 3%
+# when the sag is scanner background, content ≤ 0.5%.
+QUALIFY_1200 = (1200, 900, 80, 8)
+QUALIFY_2000 = (2000, 1500, 140, 12)
+QUALIFY_4500 = (4500, 3400, 280, 22)
+# 10–12 px at 4500 is 0.28% of the side: same-decision skip at 0.4% depth.
 QUALIFY_4500_SHALLOW = (4500, 3400, 280, 11)
 
 
@@ -114,7 +114,7 @@ def synthetic_content_to_edges(kind, width=900, height=700, margin=48):
     return Image.fromarray(pixels), corners
 
 
-def synthetic_bowed_with_streak(width=1200, height=900, margin=80, bow=4.5, streak=2):
+def synthetic_bowed_with_streak(width=1200, height=900, margin=80, bow=8, streak=2):
     """Bowed print on PAGE with a thin varying streak in the top concavity."""
     image, corners = synthetic_curved_rectangle(
         width=width, height=height, margin=margin, bow=bow, sides=('top',),
@@ -161,15 +161,100 @@ def synthetic_uniform_strip(width=1200, height=900, margin=80, inset=5):
     return Image.fromarray(pixels), corners
 
 
-def synthetic_linear_wedge(width=1200, height=900, margin=80, wedge=8):
-    """Straight print whose top PAGE depth goes 0 → `wedge` px left to right."""
+def synthetic_linear_wedge(width=1200, height=900, margin=80, start=0, wedge=8):
+    """Straight print whose top PAGE depth goes `start` → `wedge` px left to right."""
     image, corners = synthetic_straight_print(width, height, margin)
     pixels = np.asarray(image).copy()
     inner_w = max(1, width - 2 * margin)
     for x in range(margin, width - margin):
-        depth = int(round(wedge * (x - margin) / max(inner_w - 1, 1)))
+        t = (x - margin) / max(inner_w - 1, 1)
+        depth = int(round(start + (wedge - start) * t))
         if depth > 0:
             pixels[margin:margin + depth, x] = PAGE
+    return Image.fromarray(pixels), corners
+
+
+def synthetic_matching_print_border(width=3000, height=2200, margin=80, border=15):
+    """Photo with a uniform print border the same colour as the scanner bed.
+
+    Locked corners sit on the outer print rectangle, so the warped crop starts
+    on the border. There is no print-edge line or shadow separating border
+    from bed.
+    """
+    pixels = np.zeros((height, width, 3), np.uint8)
+    pixels[:] = PAGE
+    inner = margin + border
+    pixels[inner:height - inner, inner:width - inner] = PRINT
+    corners = [
+        [float(margin), float(margin)],
+        [float(width - 1 - margin), float(margin)],
+        [float(width - 1 - margin), float(height - 1 - margin)],
+        [float(margin), float(height - 1 - margin)],
+    ]
+    return Image.fromarray(pixels), corners
+
+
+def synthetic_noisy_straight_edge(width=2000, height=1500, margin=140, amplitude=10, seed=1):
+    """Straight print whose top PAGE bite is uncorrelated noise, not a bow."""
+    image, corners = synthetic_straight_print(width, height, margin)
+    pixels = np.asarray(image).copy()
+    rng = np.random.RandomState(seed)
+    for x in range(margin, width - margin):
+        depth = int(rng.randint(0, amplitude + 1))
+        if depth:
+            pixels[margin:margin + depth, x] = PAGE
+    return Image.fromarray(pixels), corners
+
+
+def synthetic_picture_edge(width=2000, height=1500, margin=140, bow=16):
+    """Straight print whose *content* has a curved dark edge near the top.
+
+    The locked crop starts on PRINT. A picture-edge curve is not a bed bow.
+    """
+    image, corners = synthetic_straight_print(width, height, margin)
+    pixels = np.asarray(image).copy()
+    inner_w = max(1, width - 2 * margin)
+    xs = np.arange(width)
+    t = np.clip((xs - margin) / inner_w, 0.0, 1.0)
+    curve = margin + 8 + 4.0 * t * (1.0 - t) * bow
+    for x in range(margin, width - margin):
+        y = int(round(curve[x]))
+        lo = max(margin, y - 2)
+        hi = min(height - margin, y + 3)
+        pixels[lo:hi, x] = (18, 18, 22)
+    return Image.fromarray(pixels), corners
+
+
+def synthetic_asymmetric_bow(width=3000, height=3400, margin=80, bow=60, peak_t=0.35, streak=True):
+    """Inward bow peaking off-centre. Sag is PAGE when streak, else content."""
+    pixels = np.zeros((height, width, 3), np.uint8)
+    pixels[:] = PAGE
+    xs = np.arange(width)
+    inner_w = max(1, width - 2 * margin)
+    t = np.clip((xs - margin) / inner_w, 0.0, 1.0)
+    peak_t = min(max(float(peak_t), 0.05), 0.95)
+    bow_x = (t / peak_t) * ((1.0 - t) / (1.0 - peak_t)) * bow
+    top = margin + bow_x
+    content = (72, 48, 36)
+    yy = np.arange(height)[:, None]
+    inside = (
+        (yy >= top[None, :])
+        & (yy <= height - 1 - margin)
+        & (xs[None, :] >= margin)
+        & (xs[None, :] <= width - 1 - margin)
+    )
+    pixels[inside] = PRINT
+    if not streak:
+        pixels[margin:height - margin, margin:width - margin] = PRINT
+        for x in range(margin, width - margin):
+            edge = int(np.ceil(top[x]))
+            pixels[margin:min(edge, height - margin), x] = content
+    corners = [
+        [float(margin), float(margin)],
+        [float(width - 1 - margin), float(margin)],
+        [float(width - 1 - margin), float(height - 1 - margin)],
+        [float(margin), float(height - 1 - margin)],
+    ]
     return Image.fromarray(pixels), corners
 
 
@@ -338,18 +423,21 @@ class BowedEdgeTests(unittest.TestCase):
     def test_documented_caps(self):
         self.assertEqual(bowed_edges.DEPTH_CAP_FRAC, 0.03)
         self.assertEqual(bowed_edges.DISPLACEMENT_CAP_FRAC, 0.02)
+        self.assertEqual(bowed_edges.DISPLACEMENT_BACKGROUND_FRAC, 0.03)
         self.assertEqual(bowed_edges.AREA_LOSS_FRAC, 0.005)
         self.assertEqual(bowed_edges.GEOMETRIC_LOSS_FRAC, 0.015)
         self.assertEqual(bowed_edges.BACKGROUND_DE, 14.0)
         self.assertEqual(bowed_edges.BACKGROUND_BAND_FRAC, 0.30)
-        self.assertEqual(bowed_edges.BOW_DEPTH_FRAC, 0.002)
+        self.assertEqual(bowed_edges.BOW_DEPTH_FRAC, 0.004)
+        self.assertEqual(bowed_edges.BAND_TRACK_CORR, 0.75)
+        self.assertFalse(hasattr(bowed_edges, 'LINEAR_CAP_FRAC'))
         self.assertEqual(bowed_edges.BACKGROUND_MAX, 400)
         self.assertFalse(hasattr(bowed_edges, 'TRIM_CAP_FRAC'))
         self.assertFalse(hasattr(bowed_edges, 'BOW_DEPTH_PX'))
 
     def test_default_on_clears_inward_bow_page_margin(self):
         image, corners = synthetic_curved_rectangle(
-            width=1200, height=900, margin=80, bow=4.5, sides=('top',),
+            width=1200, height=900, margin=80, bow=8, sides=('top',),
         )
         result = warp(image, corners)
         self.assertTrue(closer_to_print(mid_strip_mean(result, 'top')))
@@ -358,7 +446,7 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertLessEqual(pixel_area_loss(off, result), bowed_edges.AREA_LOSS_FRAC)
 
     def test_off_matches_legacy_homography_bytes(self):
-        image, corners = synthetic_curved_rectangle(width=1200, height=900, margin=80, bow=4.5, sides=('top',))
+        image, corners = synthetic_curved_rectangle(width=1200, height=900, margin=80, bow=8, sides=('top',))
         off = warp(image, corners, straighten_bowed_edges=False)
         legacy = legacy_warp(image, corners)
         self.assertEqual(off.size, legacy.size)
@@ -495,9 +583,33 @@ class BowedEdgeTests(unittest.TestCase):
                 self._assert_preview_vs_save(width, height, margin, bow)
 
     def test_preview_and_save_same_decision_on_shallow_4500_bow(self):
-        """10–12 px bow at 4500: one full-res decision, both paths remap."""
-        pair = self._assert_preview_vs_save(*QUALIFY_4500_SHALLOW)
-        self.assertEqual(pair['save_modes']['top'], 'curve')
+        """10–12 px bow at 4500 is 0.28% of the side: both paths skip at 0.4%."""
+        full, corners = synthetic_curved_rectangle(
+            width=QUALIFY_4500_SHALLOW[0],
+            height=QUALIFY_4500_SHALLOW[1],
+            margin=QUALIFY_4500_SHALLOW[2],
+            bow=QUALIFY_4500_SHALLOW[3],
+            sides=('top',),
+        )
+        preview = crop_cache._preview_resize(full)
+        scaled = [
+            [x * preview.width / full.width, y * preview.height / full.height]
+            for x, y in corners
+        ]
+        full_off = warp(full, corners, straighten_bowed_edges=False)
+        preview_off = warp(preview, scaled, straighten_bowed_edges=False)
+        bg = source_background(full, corners)
+        save_curves = bowed_edges.detect_edge_curves(full_off, bg)
+        preview_curves = bowed_edges.scale_curves(save_curves, full_off.size, preview_off.size)
+        self.assertEqual(save_curves['modes'], preview_curves['modes'])
+        self.assertEqual(save_curves['modes']['top'], 'none')
+        on = warp(full, corners, straighten_bowed_edges=True)
+        self.assertEqual(on.tobytes(), full_off.tobytes())
+        previewed = warp(
+            preview, scaled, straighten_bowed_edges=True,
+            curve_source=full, curve_points=corners,
+        )
+        self.assertEqual(previewed.tobytes(), preview_off.tobytes())
 
     def test_preview_and_save_share_scaled_curve_params(self):
         """Preview applies the save curve, scaled, not a 1400-only refit."""
@@ -537,19 +649,28 @@ class BowedEdgeTests(unittest.TestCase):
                 self.assertEqual(bowed_edges.apply_curves(full_off, save_curves).tobytes(), saved.tobytes())
 
     def test_displacement_cap_skips_edge(self):
-        """Skip when peak > DISPLACEMENT_CAP_FRAC of the side (2%), even if depth < 3%."""
-        # Narrow crop: 2% of width ≈ 6 px, bow=8 exceeds that and stays under 3% and 0.5% area.
+        """PAGE sag between 2% and 3% remaps; sag above 3% skips."""
         image, corners = synthetic_curved_rectangle(
             width=400, height=1400, margin=50, bow=8, sides=('top',),
         )
         off = warp(image, corners, straighten_bowed_edges=False)
         on = warp(image, corners, straighten_bowed_edges=True)
         self.assertGreater(8, bowed_edges.DISPLACEMENT_CAP_FRAC * off.width)
-        self.assertLessEqual(8, bowed_edges.DEPTH_CAP_FRAC * off.width)
+        self.assertLessEqual(8, bowed_edges.DISPLACEMENT_BACKGROUND_FRAC * off.width)
         bg = source_background(image, corners)
         curves = bowed_edges.detect_edge_curves(off, bg)
-        self.assertEqual(curves['modes']['top'], 'none')
-        self.assertEqual(on.tobytes(), off.tobytes())
+        self.assertEqual(curves['modes']['top'], 'curve')
+        self.assertNotEqual(on.tobytes(), off.tobytes())
+
+        over, over_corners = synthetic_curved_rectangle(
+            width=400, height=1400, margin=50, bow=12, sides=('top',),
+        )
+        over_off = warp(over, over_corners, straighten_bowed_edges=False)
+        over_on = warp(over, over_corners, straighten_bowed_edges=True)
+        self.assertGreater(12, bowed_edges.DISPLACEMENT_BACKGROUND_FRAC * over_off.width)
+        over_curves = bowed_edges.detect_edge_curves(over_off, source_background(over, over_corners))
+        self.assertEqual(over_curves['modes']['top'], 'none')
+        self.assertEqual(over_on.tobytes(), over_off.tobytes())
 
         wide, wide_corners = synthetic_curved_rectangle(
             width=1200, height=1400, margin=50, bow=8, sides=('top',),
@@ -592,6 +713,15 @@ class BowedEdgeTests(unittest.TestCase):
                 bg = source_background(image, corners)
                 curves = bowed_edges.detect_edge_curves(off, bg)
                 self.assertEqual(set(curves['modes'].values()), {'none'})
+
+    def test_straight_print_is_byte_identical_to_off(self):
+        image, corners = synthetic_straight_print()
+        on = warp(image, corners, straighten_bowed_edges=True)
+        off = warp(image, corners, straighten_bowed_edges=False)
+        self.assertEqual(on.tobytes(), off.tobytes())
+        bg = source_background(image, corners)
+        curves = bowed_edges.detect_edge_curves(off, bg)
+        self.assertEqual(set(curves['modes'].values()), {'none'})
 
     def test_uniform_strip_is_byte_identical_to_off(self):
         for inset in (3, 5, 6):
@@ -714,7 +844,7 @@ class BowedEdgeTests(unittest.TestCase):
 
     def test_edge_strip_checks_stay_under_budget(self):
         image, corners = synthetic_curved_rectangle(
-            width=3000, height=2200, margin=180, bow=12, sides=('top',),
+            width=3000, height=2200, margin=180, bow=16, sides=('top',),
         )
         warped = warp(image, corners, straighten_bowed_edges=False)
         bg = source_background(image, corners)
@@ -740,6 +870,120 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertTrue(bowed_edges.enabled(None))
         self.assertFalse(bowed_edges.enabled({'straightenBowedEdges': False}))
         self.assertTrue(bowed_edges.enabled({'straightenBowedEdges': False}, {'straighten_bowed_edges': True}))
+
+    def test_band_track_correlation_threshold(self):
+        """Documented Pearson gate: band width must track fitted sag."""
+        n = 400
+        t = np.linspace(0.0, 1.0, n)
+        sag = 4.0 * t * (1.0 - t) * 20.0
+        self.assertGreaterEqual(bowed_edges._band_track_correlation(sag, sag), bowed_edges.BAND_TRACK_CORR)
+        rng = np.random.RandomState(2)
+        noise = rng.uniform(0.0, 12.0, size=n)
+        self.assertLess(bowed_edges._band_track_correlation(noise, sag), bowed_edges.BAND_TRACK_CORR)
+
+    def test_bow_band_tracks_sag(self):
+        image, corners = synthetic_curved_rectangle(
+            width=2000, height=1500, margin=140, bow=12, sides=('top',),
+        )
+        off = warp(image, corners, straighten_bowed_edges=False)
+        bg = source_background(image, corners)
+        rgb = np.asarray(off)
+        lab = bowed_edges._to_lab(rgb)
+        raw = bowed_edges._raw_offsets(lab, bg)
+        fitted, mode = bowed_edges._fit_quadratic(raw['top'])
+        self.assertEqual(mode, 'curve')
+        sag = np.clip(bowed_edges._quadratic_sag(fitted), 0.0, None)
+        corr = bowed_edges._band_track_correlation(raw['top'], sag)
+        self.assertGreaterEqual(corr, bowed_edges.BAND_TRACK_CORR)
+        curves = bowed_edges.detect_edge_curves(off, bg)
+        self.assertEqual(curves['modes']['top'], 'curve')
+        self._band_track_report = {'corr': corr, 'mode': curves['modes']['top']}
+
+    def test_noisy_and_picture_edge_do_not_qualify(self):
+        noisy, noisy_corners = synthetic_noisy_straight_edge()
+        noisy_off = warp(noisy, noisy_corners, straighten_bowed_edges=False)
+        noisy_on = warp(noisy, noisy_corners, straighten_bowed_edges=True)
+        noisy_bg = source_background(noisy, noisy_corners)
+        noisy_curves = bowed_edges.detect_edge_curves(noisy_off, noisy_bg)
+        self.assertEqual(noisy_curves['modes']['top'], 'none')
+        self.assertEqual(noisy_on.tobytes(), noisy_off.tobytes())
+
+        picture, picture_corners = synthetic_picture_edge()
+        picture_off = warp(picture, picture_corners, straighten_bowed_edges=False)
+        picture_on = warp(picture, picture_corners, straighten_bowed_edges=True)
+        picture_bg = source_background(picture, picture_corners)
+        picture_curves = bowed_edges.detect_edge_curves(picture_off, picture_bg)
+        self.assertEqual(picture_curves['modes']['top'], 'none')
+        self.assertEqual(picture_on.tobytes(), picture_off.tobytes())
+        rgb = np.asarray(noisy_off)
+        lab = bowed_edges._to_lab(rgb)
+        raw = bowed_edges._raw_offsets(lab, noisy_bg)
+        fitted, _mode = bowed_edges._fit_quadratic(raw['top'])
+        sag = np.clip(bowed_edges._quadratic_sag(fitted), 0.0, None)
+        corr = bowed_edges._band_track_correlation(raw['top'], sag)
+        self._false_bow_report = {
+            'noisy_corr': corr,
+            'noisy_modes': dict(noisy_curves['modes']),
+            'picture_modes': dict(picture_curves['modes']),
+        }
+
+    def test_matching_print_border_is_not_removed(self):
+        """Matching-colour print border stays; linear strip removal is not shipped."""
+        image, corners = synthetic_matching_print_border()
+        off = warp(image, corners, straighten_bowed_edges=False)
+        on = warp(image, corners, straighten_bowed_edges=True)
+        bg = source_background(image, corners)
+        curves = bowed_edges.detect_edge_curves(off, bg)
+        lab = bowed_edges._to_lab(np.asarray(off))
+        strip = np.full(off.width, 15.0)
+        top_frac = bowed_edges._background_band_fraction(lab, 'top', strip, bg)
+        geo, content = bowed_edges._sag_loss_fractions(lab, strip, 'top', bg, off.width, off.height)
+        self._border_probe = {
+            'modes': dict(curves['modes']),
+            'content_loss': float(curves['content_loss']),
+            'geometric_loss': float(curves['geometric_loss']),
+            'top_background_frac': float(top_frac),
+            'top_strip_content': float(content),
+            'top_strip_geometric': float(geo),
+            'top_residual_on': residual_nonprint_depth(on, 'top'),
+            'top_residual_off': residual_nonprint_depth(off, 'top'),
+        }
+        self.assertGreaterEqual(top_frac, 0.80)
+        self.assertLessEqual(content, 0.0005)
+        self.assertEqual(set(curves['modes'].values()), {'none'})
+        self.assertEqual(on.tobytes(), off.tobytes())
+
+    def test_asymmetric_bow_background_raises_displacement_cap(self):
+        """60 px asymmetric bow on ~3000 px: streak qualifies (≤2 px); no streak skips."""
+        with_streak, with_corners = synthetic_asymmetric_bow(streak=True)
+        with_off = warp(with_streak, with_corners, straighten_bowed_edges=False)
+        with_on = warp(with_streak, with_corners, straighten_bowed_edges=True)
+        with_bg = source_background(with_streak, with_corners)
+        with_curves = bowed_edges.detect_edge_curves(with_off, with_bg)
+        side = with_off.width
+        self.assertGreater(60, bowed_edges.DISPLACEMENT_CAP_FRAC * side)
+        self.assertLessEqual(60, bowed_edges.DISPLACEMENT_BACKGROUND_FRAC * side)
+        self.assertEqual(with_curves['modes']['top'], 'curve')
+        self.assertLessEqual(residual_nonprint_depth(with_on, 'top'), 2.0)
+        self.assertLessEqual(with_curves['content_loss'], bowed_edges.AREA_LOSS_FRAC)
+
+        without, without_corners = synthetic_asymmetric_bow(streak=False)
+        without_off = warp(without, without_corners, straighten_bowed_edges=False)
+        without_on = warp(without, without_corners, straighten_bowed_edges=True)
+        without_bg = source_background(without, without_corners)
+        without_curves = bowed_edges.detect_edge_curves(without_off, without_bg)
+        self.assertEqual(without_curves['modes']['top'], 'none')
+        self.assertEqual(without_on.tobytes(), without_off.tobytes())
+        self._asymmetric_report = {
+            'with_modes': dict(with_curves['modes']),
+            'with_peak': float(with_curves['top'].max()),
+            'with_residual': residual_nonprint_depth(with_on, 'top'),
+            'with_content': float(with_curves['content_loss']),
+            'without_modes': dict(without_curves['modes']),
+            'side': side,
+            'cap2': bowed_edges.DISPLACEMENT_CAP_FRAC * side,
+            'cap3': bowed_edges.DISPLACEMENT_BACKGROUND_FRAC * side,
+        }
 
 
 if __name__ == '__main__':
