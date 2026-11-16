@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from PIL import Image
@@ -42,15 +43,25 @@ class CropSpeedTests(unittest.TestCase):
         crop_cache.reset()
 
     def post(self, endpoint, body):
+        status, payload = self.post_status(endpoint, body)
+        if status >= 400:
+            raise AssertionError(f'{endpoint} -> {status}: {payload}')
+        return payload
+
+    def post_status(self, endpoint, body):
         request = Request(
             self.base + endpoint,
             json.dumps(body).encode(),
             {'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': self.tab, 'Content-Type': 'application/json'},
         )
-        with urlopen(request) as response:
-            if 'json' in response.headers.get('Content-Type', ''):
-                return json.load(response)
-            return response.read()
+        try:
+            with urlopen(request) as response:
+                payload = json.load(response) if 'json' in response.headers.get('Content-Type', '') else response.read()
+                return response.status, payload
+        except HTTPError as exc:
+            payload = json.loads(exc.read().decode())
+            exc.close()
+            return exc.code, payload
 
     def get(self, endpoint):
         request = Request(self.base + endpoint, headers={'X-Cropper-Token': server.TOKEN, 'X-Cropper-Tab': self.tab})
@@ -125,8 +136,81 @@ class CropSpeedTests(unittest.TestCase):
 
     def test_save_still_loads_full_resolution(self):
         path = self.jpeg_source('save.jpg', (3000, 2200))
-        image, _ = server.load_image(path)
-        self.assertEqual(image.size, (3000, 2200))
+        result = self.post('/api/crop', {
+            'path': str(path),
+            'points': [[0, 0], [2999, 0], [2999, 2199], [0, 2199]],
+            'rotation': 0,
+        })
+        saved = Path(result['path'])
+        with Image.open(saved) as image:
+            self.assertEqual(image.size, (result['width'], result['height']))
+            self.assertGreater(max(image.size), 2000)
+            self.assertGreater(min(image.size), 1500)
+
+    def test_crop_overwrite_evicts_prediction_caches_and_refetches(self):
+        path = self.png_source('overwrite.png', size=(640, 480))
+        first = self.post('/api/crop-corners', {'path': str(path)})
+        self.assertTrue(first['candidates'])
+        resolved = str(path.resolve())
+        self.assertTrue(crop_cache.RESULT_CACHE.contains_resolved(resolved))
+        self.assertTrue(crop_cache.IMAGE_CACHE.contains_resolved(resolved))
+        original = path.read_bytes()
+        app_settings.save_settings({
+            'filename_template': '{name}{suffix}{ext}',
+            'conflict_policy': 'skip',
+            'replace_original': True,
+            'backup_originals': True,
+        })
+        corners = [[120, 100], [520, 100], [520, 380], [120, 380]]
+        status, refusal = self.post_status('/api/crop', {
+            'path': str(path), 'points': corners, 'rotation': 0,
+        })
+        self.assertEqual(status, 409)
+        status, cropped = self.post_status('/api/crop', {
+            'path': str(path), 'points': corners, 'rotation': 0,
+            'confirm_replace': True,
+            'confirmation_token': refusal['confirmation_token'],
+            'batch_id': refusal['batch_id'],
+        })
+        self.assertEqual(status, 200)
+        self.assertNotEqual(path.read_bytes(), original)
+        self.assertFalse(crop_cache.RESULT_CACHE.contains_resolved(resolved))
+        self.assertFalse(crop_cache.IMAGE_CACHE.contains_resolved(resolved))
+        second = self.post('/api/crop-corners', {'path': str(path)})
+        self.assertNotEqual(first['candidates'], second['candidates'])
+
+    def test_begin_batch_resets_caches_and_prefetch_queue(self):
+        path = self.png_source('batch.png')
+        self.post('/api/crop-corners', {'path': str(path)})
+        self.assertGreater(len(crop_cache.RESULT_CACHE), 0)
+        self.post('/api/begin-batch', {'path': str(self.root)})
+        self.assertEqual(len(crop_cache.RESULT_CACHE), 0)
+        self.assertEqual(len(crop_cache.IMAGE_CACHE), 0)
+
+    def test_prefetch_abort_event_stops_detect_and_skips_cache_put(self):
+        path = self.png_source('abort-prefetch.png')
+        started = threading.Event()
+
+        def slow_predict(*args, abort=None, **kwargs):
+            started.set()
+            deadline = time.time() + 4
+            while time.time() < deadline:
+                if abort is not None and abort():
+                    return {'candidates': [], 'elapsed_ms': 0, 'aborted': True}
+                time.sleep(0.01)
+            return {'candidates': [{'points': [[1, 1], [10, 1], [10, 10], [1, 10]], 'score': 1}], 'elapsed_ms': 0}
+
+        with patch.object(crop_detection, 'predict_corners', slow_predict):
+            crop_cache.queue_prefetch([path])
+            self.assertTrue(started.wait(3))
+            crop_cache.queue_prefetch([])
+            deadline = time.time() + 2
+            while time.time() < deadline and crop_cache.prefetch_aborted():
+                if len(crop_cache.RESULT_CACHE) == 0:
+                    break
+                time.sleep(0.02)
+            time.sleep(0.15)
+            self.assertEqual(len(crop_cache.RESULT_CACHE), 0)
 
     def test_prefetch_lands_in_result_lru(self):
         path = self.png_source('prefetch.png')

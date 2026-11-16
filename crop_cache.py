@@ -61,6 +61,17 @@ class ImagePreviewCache:
             }
             self.bytes_used += nbytes
 
+    def evict_resolved(self, resolved: str) -> None:
+        with self._lock:
+            drop = [key for key in self._data if key[0] == resolved]
+            for key in drop:
+                old = self._data.pop(key)
+                self.bytes_used = max(0, self.bytes_used - old['nbytes'])
+
+    def contains_resolved(self, resolved: str) -> bool:
+        with self._lock:
+            return any(key[0] == resolved for key in self._data)
+
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
@@ -106,6 +117,16 @@ class ResultCache:
                 self._data.popitem(last=False)
             self._data[key] = payload
 
+    def evict_resolved(self, resolved: str) -> None:
+        with self._lock:
+            drop = [key for key in self._data if key[0] == resolved]
+            for key in drop:
+                del self._data[key]
+
+    def contains_resolved(self, resolved: str) -> bool:
+        with self._lock:
+            return any(key[0] == resolved for key in self._data)
+
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
@@ -130,9 +151,18 @@ def reset() -> None:
     RESULT_CACHE.clear()
     with _prefetch_cv:
         _prefetch_queue.clear()
+        _prefetch_cv.notify_all()
     with _foreground_lock:
         global _foreground
         _foreground = 0
+    _abort.set()
+
+
+def evict_path(path: Path) -> None:
+    """Drop both LRUs for a resolved path after our own write."""
+    resolved = str(Path(path).resolve())
+    IMAGE_CACHE.evict_resolved(resolved)
+    RESULT_CACHE.evict_resolved(resolved)
     _abort.set()
 
 
@@ -147,12 +177,14 @@ def end_foreground() -> None:
     global _foreground
     with _foreground_lock:
         _foreground = max(0, _foreground - 1)
-    if _foreground == 0:
-        _abort.clear()
 
 
 def _foreground_busy() -> bool:
     return _foreground > 0
+
+
+def prefetch_aborted() -> bool:
+    return _abort.is_set() or _foreground_busy()
 
 
 def fill_from_full_image(path: Path, image: Image.Image) -> None:
@@ -204,10 +236,21 @@ def predict_cached(path: Path, target=None, foreground: bool = True) -> dict:
         cached = RESULT_CACHE.get(path, target)
         if cached is not None:
             return cached
+        try:
+            identity = file_identity(path)
+        except OSError:
+            identity = None
         detect, original_size, _ = decode_detection_image(path, allow_draft=True)
-        abort = _foreground_busy if not foreground else None
+        abort = prefetch_aborted if not foreground else None
         result = crop_detection.predict_corners(detect, target, original_size=original_size, abort=abort)
-        if result.get('aborted'):
+        if result.get('aborted') or (not foreground and prefetch_aborted()):
+            result = dict(result)
+            result['aborted'] = True
+            return result
+        try:
+            if identity is not None and file_identity(path) != identity:
+                return result
+        except OSError:
             return result
         RESULT_CACHE.put(path, target, result)
         return result
@@ -218,6 +261,7 @@ def predict_cached(path: Path, target=None, foreground: bool = True) -> dict:
 
 def queue_prefetch(paths: list[Path]) -> None:
     _ensure_worker()
+    _abort.set()
     with _prefetch_cv:
         _prefetch_queue.clear()
         _prefetch_queue.extend(paths)
@@ -240,12 +284,13 @@ def _prefetch_worker() -> None:
             while not _prefetch_queue:
                 _prefetch_cv.wait()
             path = _prefetch_queue.pop(0)
-        if _foreground_busy():
-            continue
+        with _foreground_lock:
+            if _foreground:
+                continue
+            _abort.clear()
         try:
             if RESULT_CACHE.get(path, None) is not None:
                 continue
-            _abort.clear()
             predict_cached(path, None, foreground=False)
         except Exception:
             continue

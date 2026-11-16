@@ -269,6 +269,8 @@ def save_image(source: Path, points: list[list[float]], settings: dict, rotation
     image, info = load_image(source)
     cropped = warp(image, points, rotation, aspect_ratio)
     destination = stage_files.file_results([source], [rendered_bytes(cropped, source.suffix, info)], 'crop')[0]
+    crop_cache.evict_path(source)
+    crop_cache.evict_path(destination)
     return destination, cropped.size
 
 
@@ -422,6 +424,9 @@ def save_merged_image(front_path: Path, back_path: Path, settings: dict, name_so
     merged = merge_front_and_back(front, back, back_rotation)
     stage_files.commit([plan], [rendered_bytes(merged, source_for_name.suffix, front_info)])
     stage_files.remember_protected_outputs([plan])
+    crop_cache.evict_path(front_path)
+    crop_cache.evict_path(back_path)
+    crop_cache.evict_path(destination)
     return destination, merged.size
 
 
@@ -448,6 +453,8 @@ def save_enhanced_image(source: Path, settings: dict, allowed_roots=None) -> tup
             payloads.append(rendered_bytes(merged, composite.suffix, composite_info))
         sources.append(composite)
     outputs = stage_files.file_results(sources, payloads, 'enhance')
+    for path in (*sources, *outputs):
+        crop_cache.evict_path(path)
     if link:
         try:
             approve_link(outputs[0], outputs[1], link['split'], link['layout'],
@@ -468,6 +475,9 @@ def save_restored_image(source: Path, operation: str, strokes: list | None = Non
         if not useful_change(changes):
             return None, restored.size, changes, None
         destination = stage_files.file_results([source], [rendered_bytes(restored, source.suffix, info)], 'enhance')[0]
+    crop_cache.evict_path(source)
+    if destination is not None:
+        crop_cache.evict_path(destination)
     archived = planned['snapshots'][0] if planned.get('snapshots') else None
     return destination, restored.size, changes, archived
 
@@ -1592,6 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.json(200, {"cancelled": True, "path": None})
                     return
                 path = register_allowed_root(chosen, tab_id)
+                crop_cache.reset()
                 batch_id = begin_tab_batch(tab_id, folder=path)
                 self.json(200, {
                     "cancelled": False, "path": str(path), "batch_id": batch_id,
@@ -1603,6 +1614,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not tab_id or not tab_is_registered(tab_id, TOKEN):
                     raise ValueError("This browser tab must register a random id first.")
                 payload = data if isinstance(data, dict) else {}
+                crop_cache.reset()
                 batch_id = begin_tab_batch(tab_id, folder=payload.get("path"))
                 self.json(200, {"batch_id": batch_id, **_snapshot_public(tab_id)})
                 return

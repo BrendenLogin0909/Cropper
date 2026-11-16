@@ -33,5 +33,8 @@ image fills a decoded 960/1400 preview cache; JPEG cache misses may draft-decode
 to ~960 px. Prediction results are LRU-cached on the server and in a small client
 Map. Opening also prefetches the current and next image on one background worker.
 Cancelling predict (C, Z, Backspace, Whole image) aborts the in-flight request.
-Save/export still uses the full-resolution decode. Run
+Switching photo or folder also aborts; begin-batch/folder change resets the
+server caches and prefetch queue. Saving a crop, restore, or enhance evicts that
+resolved path from both LRUs, and the client Map drops that path so the next P
+refetches. Save/export still uses the full-resolution decode. Run
 `python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.

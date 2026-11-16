@@ -612,7 +612,7 @@ async function saveEnhancedBatch() {
     if (archived.has(path)) continue;
     if (state.enhance.stop) break;
     $('enhance-progress').textContent = `Saving ${index + 1} of ${paths.length}…`;
-    try { const result=await api('/api/enhance', { path, settings: batchSettings, ...extra }); if (result.protected_message) protectedNote = result.protected_message; for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved); if (result.archived_path) archived.add(moved);} saved++; }
+    try { const result=await api('/api/enhance', { path, settings: batchSettings, ...extra }); if (result.protected_message) protectedNote = result.protected_message; forgetPredictionsForPath(path); if (result.path) forgetPredictionsForPath(result.path); for(const moved of result.source_paths || [path]) {state.enhance.selected.delete(moved); if (result.archived_path) archived.add(moved); forgetPredictionsForPath(moved);} saved++; }
     catch (error) { failed.push(`${path.split(/[\\/]/).pop()}: ${error.message}`); if (offerChooseOutputFolder(error)) state.enhance.stop = true; }
     refreshEnhanceTiles(); renderEnhanceControls();
   }
@@ -748,6 +748,8 @@ async function saveRestorationBatch() {
       state.restore.selected.delete(path);
       if (result.skipped) { state.restore.notNeeded.add(path); skipped++; }
       else {
+        forgetPredictionsForPath(path);
+        if (result.path) forgetPredictionsForPath(result.path);
         if (result.protected_message) protectedNote = result.protected_message;
         if (result.archived_path) archived.add(path);
         saved++;
@@ -926,6 +928,7 @@ async function loadFolder(path, preserve = false) {
   if (state.chatgpt.queuedPaths.size && path !== state.folder) { toast('Start or clear queued GPT photos before changing folders.', true); return; }
   if (state.enhance.busy) { toast('Stop or finish the enhancement batch before changing folders.', true); return; }
   if (state.restore.busy) { toast('Stop or finish the restoration batch before changing folders.', true); return; }
+  invalidateInFlightPredict();
   const ticket = ++state.folderLoadId;
   try {
     await api('/api/begin-batch', { path });
@@ -1006,6 +1009,7 @@ function clearEditor() {
 }
 async function openImage(index) {
   if (index < 0 || index >= state.images.length) return;
+  invalidateInFlightPredict();
   state.folderLoadId += 1;
   const ticket = ++state.requestId; state.index = index; state.points = []; state.rotation = 0; endZoom();
   state.width = 0; state.height = 0;
@@ -1119,12 +1123,15 @@ function rememberPrediction(entry) {
     cropPredictionCache.delete(cropPredictionCache.keys().next().value);
   }
 }
+function forgetPredictionsForPath(path) {
+  if (!path) { cropPredictionCache.clear(); return; }
+  for (const [key, entry] of [...cropPredictionCache]) {
+    if (entry.path === path) cropPredictionCache.delete(key);
+  }
+}
 function forgetCurrentPrediction(item) {
   if (!item) { cropPredictionCache.clear(); return; }
-  const base = predictionBaseKey(item);
-  for (const [key, entry] of [...cropPredictionCache]) {
-    if (entry.baseKey === base) cropPredictionCache.delete(key);
-  }
+  forgetPredictionsForPath(item.path);
 }
 function invalidateInFlightPredict() {
   cropPredictionRequest++;
@@ -1157,7 +1164,7 @@ async function predictCropCorners() {
         throw error;
       }
       if (stale()) return;
-      cache = {key,baseKey,candidates:result.candidates,index:-1};
+      cache = {key,baseKey,path:item.path,candidates:result.candidates,index:-1};
       rememberPrediction(cache);
     }
     if (stale()) return;
@@ -1210,6 +1217,9 @@ async function cropSave() {
     const result = await api('/api/crop', { path: state.images[sourceIndex].path, points: state.points.map(p=>[p.x,p.y]), rotation: state.rotation, aspect_ratio: cropAspectRatio(), settings:{...settings,stage_routing:stageRoutingEnabled()}, ...extra });
     $('save-error').classList.add('hidden');
     toast(result.protected_message || `Saved ${result.name} · ${result.width} × ${result.height} px`);
+    forgetPredictionsForPath(state.images[sourceIndex].path);
+    if (result.path) forgetPredictionsForPath(result.path);
+    if (!result.source_moved && state.images[sourceIndex]) state.images[sourceIndex].modified = Date.now();
     await refreshStageFolders();
     if (result.source_moved) {
       state.images.splice(sourceIndex,1);state.index=-1;state.points=[];renderImages();

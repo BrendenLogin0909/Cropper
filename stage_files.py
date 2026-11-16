@@ -1280,4 +1280,10 @@ def file_results(sources: list[Path], payloads: list[bytes], operation: str,
             encoded.append(payload)
     outputs = commit(plans, encoded)
     remember_protected_outputs(plans)
+    try:
+        import crop_cache
+        for path in list(sources) + [path for path in outputs if path is not None]:
+            crop_cache.evict_path(path)
+    except Exception:
+        pass
     return outputs

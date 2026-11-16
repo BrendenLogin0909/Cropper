@@ -1276,3 +1276,50 @@ test('a stale load failure shows no toast and does not reset the current image',
   assert.equal(h.els['empty-state'].classList.contains('hidden'), true);
   assert.equal(h.messages.length, 0);
 });
+
+test('switching photo aborts in-flight predict and does not leave Finding corners stuck', async () => {
+  let abortSeen = false;
+  const h = shortcutHarness((url, body, options) => {
+    if (String(url).includes('/api/crop-corners')) {
+      return new Promise((_, reject) => {
+        const signal = options && options.signal;
+        const fail = () => {
+          abortSeen = true;
+          const error = new Error('The operation was aborted.');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (!signal) return;
+        if (signal.aborted) { fail(); return; }
+        signal.addEventListener('abort', fail);
+      });
+    }
+    if (String(url).startsWith('/api/info')) return {width: 800, height: 500};
+    if (String(url).includes('crop-prefetch')) return {queued: 0};
+    return {};
+  });
+  const predictSpan = {textContent: 'Predict corners'};
+  h.els['predict-corners'].querySelector = () => predictSpan;
+  h.context.updateControls = function () {
+    predictSpan.textContent = vm.runInContext('cropPredictionBusy', h.context) ? 'Finding corners…' : 'Predict corners';
+  };
+  h.context.assignImage = async () => {};
+  h.state.images = twoImages();
+  h.state.width = 600;
+  h.state.height = 400;
+  h.els['image-layer'].classList.remove('hidden');
+  const pending = h.context.predictCropCorners();
+  await Promise.resolve();
+  assert.equal(vm.runInContext('cropPredictionBusy', h.context), true);
+  assert.equal(predictSpan.textContent, 'Finding corners…');
+  const opening = h.context.openImage(1);
+  await pending;
+  assert.equal(abortSeen, true);
+  assert.equal(vm.runInContext('cropPredictionBusy', h.context), false);
+  assert.equal(predictSpan.textContent, 'Predict corners');
+  assert.equal(h.state.points.length, 0);
+  assert.equal(h.messages.length, 0);
+  await opening;
+  assert.equal(h.state.index, 1);
+  assert.equal(h.state.points.length, 0);
+});

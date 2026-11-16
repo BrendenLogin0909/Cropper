@@ -46,6 +46,7 @@ function loadFolderHarness({ api, refresh, openImage }) {
     state,
     settings: { autoNext: false, aspect: 'auto' },
     localStorage: { setItem() {}, getItem() { return null; } },
+    Date,
     colorRequest: 0,
     colorScanning: false,
     colorScanFolder: '',
@@ -78,6 +79,8 @@ function loadFolderHarness({ api, refresh, openImage }) {
     refreshChatgptPending: refresh,
     openImage,
     resetFolderNeedsPickChrome() {},
+    invalidateInFlightPredict() { context.predictInvalidated = (context.predictInvalidated || 0) + 1; },
+    forgetPredictionsForPath() {},
     api: async (route, body) => {
       if (route === '/api/crop') posts.push(body);
       return api(route, body);
@@ -94,7 +97,7 @@ function loadFolderHarness({ api, refresh, openImage }) {
     `${app.slice(orderedStart, orderedEnd)}\n${app.slice(cropStart, cropEnd)}\ncropSave`,
     context,
   );
-  return { loadFolder, cropSave, state, posts, wasCleared: () => cleared };
+  return { loadFolder, cropSave, state, posts, context, wasCleared: () => cleared };
 }
 
 test('stale loadFolder cannot clear a photo opened during refreshChatgptPending', async () => {
@@ -198,4 +201,27 @@ test('changing folder clears crop points so save cannot write them onto the new 
   await cropSave();
   assert.deepEqual(posts, []);
   assert.notEqual(state.images[0]?.path, '/photos/a.png');
+});
+
+test('loadFolder aborts an in-flight predict before listing the new folder', async () => {
+  const { loadFolder, state, context } = loadFolderHarness({
+    api: async (route) => {
+      if (String(route).startsWith('/api/begin-batch')) return { batch_id: 'batch-3' };
+      if (String(route).startsWith('/api/list')) {
+        return {
+          path: '/photos/b',
+          parent: '/photos',
+          images: [{ path: '/photos/b/c.png', name: 'c.png', bytes: 20 }],
+          folders: [],
+        };
+      }
+      throw new Error(`unexpected ${route}`);
+    },
+    refresh: async () => {},
+    openImage: async () => {},
+  });
+  state.folder = '/photos';
+  state.images = [{ path: '/photos/a.png', name: 'a.png', bytes: 12 }];
+  await loadFolder('/photos/b');
+  assert.equal(context.predictInvalidated, 1);
 });
