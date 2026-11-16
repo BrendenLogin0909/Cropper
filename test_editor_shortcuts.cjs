@@ -127,6 +127,9 @@ function shortcutHarness(api) {
   if (code.includes('function releaseCropShortcutFocus')) {
     vm.runInContext(extractBlock(code, 'function releaseCropShortcutFocus') + ';', context);
   }
+  if (code.includes('function cropEnterActivatesFocusedControl')) {
+    vm.runInContext(extractBlock(code, 'function cropEnterActivatesFocusedControl') + ';', context);
+  }
   vm.runInContext(extractBlock(code, 'function saveSettings') + ';', context);
   vm.runInContext(extractBlock(code, 'async function openImage') + ';', context);
   vm.runInContext(
@@ -1109,4 +1112,79 @@ test('Auto-next still blurs after a change', () => {
   h.autoNext.dispatch('input');
   assert.equal(h.context.document.activeElement, h.body);
   assert.equal(h.context.settings.autoNext, false);
+});
+
+test('Enter on a focused crop button activates that button and does not save', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const button = makeControl('BUTTON');
+  let clicks = 0;
+  button.addEventListener('click', () => { clicks += 1; });
+  h.setActive(button);
+  const event = h.dispatch({key: 'Enter'});
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(h.context.saveCalls, 0);
+  if (!event.defaultPrevented) button.dispatch('click');
+  assert.equal(clicks, 1);
+});
+
+test('Backspace with a modifier, with repeat, or while loading does not clear points', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.points = [{x: 1, y: 1}];
+  const alt = await h.press({key: 'Backspace', altKey: true});
+  const shift = await h.press({key: 'Backspace', shiftKey: true});
+  const repeat = await h.press({key: 'Backspace', repeat: true});
+  assert.equal(alt.defaultPrevented, false);
+  assert.equal(shift.defaultPrevented, false);
+  assert.equal(repeat.defaultPrevented, false);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.context.clearCalls, 0);
+  let releaseInfo;
+  const loading = shortcutHarness((url) => {
+    if (String(url).startsWith('/api/info')) return new Promise((resolve) => { releaseInfo = resolve; });
+    return twoCandidates;
+  });
+  loading.state.images = twoImages();
+  const opening = loading.context.openImage(1);
+  await Promise.resolve();
+  loading.state.points = [{x: 4, y: 4}];
+  const duringLoad = await loading.press({key: 'Backspace'});
+  assert.equal(loading.state.points.length, 1);
+  assert.equal(loading.context.clearCalls, 0);
+  assert.equal(duringLoad.defaultPrevented, true);
+  releaseInfo({width: 800, height: 500});
+  await opening;
+});
+
+test('Backspace in crop view still preventDefaults', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.points = [{x: 1, y: 1}];
+  const event = await h.press({key: 'Backspace'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 1);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('a stale load failure shows no toast and does not reset the current image', async () => {
+  let fail;
+  const h = shortcutHarness((url) => {
+    if (String(url).startsWith('/api/info')) return {width: 800, height: 500};
+    return twoCandidates;
+  });
+  h.context.assignImage = () => new Promise((_, reject) => { fail = reject; });
+  h.state.images = twoImages();
+  const opening = h.context.openImage(0);
+  await Promise.resolve();
+  await Promise.resolve();
+  h.state.requestId += 1;
+  h.state.width = 900;
+  h.state.height = 700;
+  h.els['image-layer'].classList.remove('hidden');
+  h.els['empty-state'].classList.add('hidden');
+  fail(new Error('decode failed'));
+  await opening;
+  assert.equal(h.state.width, 900);
+  assert.equal(h.state.height, 700);
+  assert.equal(h.els['image-layer'].classList.contains('hidden'), false);
+  assert.equal(h.els['empty-state'].classList.contains('hidden'), true);
+  assert.equal(h.messages.length, 0);
 });

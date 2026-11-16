@@ -385,6 +385,20 @@ function releaseCropShortcutFocus(el) {
   const type = String(el.type || '').toLowerCase();
   if (tag === 'SELECT' || tag === 'BUTTON' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio'))) el.blur();
 }
+function cropEnterActivatesFocusedControl(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === 'BUTTON' || tag === 'SUMMARY') return true;
+  if (tag === 'A' && (el.href || el.getAttribute?.('href'))) return true;
+  if (tag === 'INPUT') {
+    const type = String(el.type || '').toLowerCase();
+    return type === 'button' || type === 'submit' || type === 'checkbox' || type === 'radio';
+  }
+  const role = el.getAttribute?.('role');
+  if (role === 'button' || role === 'link') return true;
+  const tabindex = el.getAttribute?.('tabindex');
+  return tabindex != null && Number(tabindex) >= 0;
+}
 function saveSettings(event) {
   settings.autoNext = $('auto-next').checked;
   settings.aspect = $('crop-aspect').value; settings.customAspect = $('crop-aspect-custom').value.trim();
@@ -1017,12 +1031,11 @@ async function openImage(index) {
     $('image-subtitle').textContent = `${info.width.toLocaleString()} × ${info.height.toLocaleString()} px  ·  ${formatBytes(item.bytes)}`;
     fitImage(); renderOverlay(); updateControls();
   } catch (error) {
-    if (ticket === state.requestId) {
-      state.width = 0; state.height = 0;
-      $('image-layer').classList.add('hidden');
-      $('empty-state').classList.remove('hidden');
-      updateControls();
-    }
+    if (ticket !== state.requestId) return;
+    state.width = 0; state.height = 0;
+    $('image-layer').classList.add('hidden');
+    $('empty-state').classList.remove('hidden');
+    updateControls();
     if (!handleOutsideAllowedFolder(error)) toast(error.message, true);
   }
 }
@@ -2172,18 +2185,25 @@ function wire() {
       const key=event.key.toLowerCase();
       if(key==='p'){event.preventDefault();predictCropCorners();return;}
       if(key==='w'){event.preventDefault();selectWholeImage();return;}
+      if(key==='backspace'){
+        event.preventDefault();
+        if(cropImageReady())clearCropPoints();
+        return;
+      }
       if(cropImageReady()){
         if(key==='c'){event.preventDefault();clearCropPoints();return;}
         if(key==='z'){event.preventDefault();undoCropPoint();return;}
         if(key==='r'){event.preventDefault();rotateCrop(90);return;}
         if(key==='a'){event.preventDefault();openImage(state.index-1);return;}
         if(key==='d'){event.preventDefault();openImage(state.index+1);return;}
-        if(key==='enter'){event.preventDefault();cropSave();return;}
+        if(key==='enter'){
+          if(cropEnterActivatesFocusedControl(document.activeElement))return;
+          event.preventDefault();cropSave();return;
+        }
       }
     }
     if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
     else if(event.key==='ArrowRight'){event.preventDefault();openImage(state.index+1);}
-    else if(event.key==='Backspace'){event.preventDefault();clearCropPoints();}
   });
   document.addEventListener('keyup',event=>{if(event.key==='Shift')endZoom();}); window.addEventListener('blur',endZoom);
   $('canvas-shell').addEventListener('wheel',event=>{if(event.shiftKey)event.preventDefault();},{passive:false});
