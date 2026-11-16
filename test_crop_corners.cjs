@@ -45,8 +45,8 @@ test('client prediction cache is a bounded Map and predict passes an AbortSignal
   assert.match(code,/signal: controller.signal/);
   assert.match(code,/cropPredictionAbort.abort/);
   assert.match(code,/forgetPredictionsForPath\(state\.images\[sourceIndex\]\.path\)/);
-  assert.match(code,/async function openImage\(index\) \{\n  if \(index < 0[^\n]+\n  invalidateInFlightPredict\(\);/);
-  assert.match(code,/if \(state\.restore\.busy\) \{ toast\('Stop or finish the restoration batch before changing folders\.', true\); return; \}\n  invalidateInFlightPredict\(\);/);
+  assert.match(code,/async function openImage\(index\) \{\r?\n  if \(index < 0[^\r\n]+\r?\n  invalidateInFlightPredict\(\);/);
+  assert.match(code,/if \(state\.restore\.busy\) \{ toast\('Stop or finish the restoration batch before changing folders\.', true\); return; \}\r?\n  invalidateInFlightPredict\(\);/);
 });
 test('cycles candidates without additional requests; clears all points',async()=>{
   let calls=0;
