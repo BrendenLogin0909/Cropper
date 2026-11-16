@@ -16,6 +16,7 @@ from PIL import Image
 DETECT_MAX = 800
 STRIP_FRAC = 0.16
 MIN_SAMPLES = 12
+# Working-copy pixels (long side is at most DETECT_MAX, 800). Not full-res.
 STRAIGHT_PX = 1.25
 SAFETY_FRAC = 0.12
 TRIM_CAP_FRAC = 0.025

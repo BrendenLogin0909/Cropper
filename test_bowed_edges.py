@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -138,8 +139,8 @@ class BowedEdgeTests(unittest.TestCase):
             legacy_warp(image2, corners2, 90).tobytes(),
         )
 
-    def test_preview_path_matches_saved_output(self):
-        full, corners = synthetic_curved_rectangle(width=2000, height=1500, margin=140, bow=48)
+    def _assert_preview_vs_save(self, width, height, margin, bow):
+        full, corners = synthetic_curved_rectangle(width=width, height=height, margin=margin, bow=bow)
         preview = full.copy()
         preview.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
         scaled = [
@@ -152,12 +153,13 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertTrue(closer_to_print(mid_strip_mean(saved, 'top')))
         saved_small = saved.resize(previewed.size, Image.Resampling.LANCZOS)
         diff = np.abs(np.asarray(previewed, dtype=np.int16) - np.asarray(saved_small, dtype=np.int16))
-        # Measured 1400-cache vs full-res on synthetic bowed fixtures (2000×1500,
-        # 1200×900, 3000×2200): pixel MAE 0.061 (largest size 0.091), p95 0.00;
-        # print-corner max 1.41 px / p95 1.19 px; edge-curve max 1.00 / p95 1.00 px
-        # after upscaling the preview warp to save size. Isolated resample spikes
-        # reach ~46 px but do not move the mean. Tolerance is ~5× measured MAE
-        # and ~2× measured corner/curve p95.
+        # Measured 1400-cache vs full-res on synthetic bowed fixtures:
+        # 1200×900 MAE 0.0 / corner 0.0 / curve p95 0.0 (no downscale; 1200 < 1400)
+        # 2000×1500 MAE 0.076 / corner max 1.41 / curve p95 1.00
+        # 4500×3400 MAE 0.107 / corner max 0.0 / curve p95 1.00
+        # Isolated resample spikes exist but do not move the mean. Tolerance is
+        # MAE < 0.5 (~5× largest measured), corner max ≤ 3.0 px, curve p95 ≤ 2.5 px
+        # (~2× measured).
         self.assertLess(float(diff.mean()), 0.5)
         previewed_up = previewed.resize(saved.size, Image.Resampling.LANCZOS)
         print_c = np.array(PRINT, dtype=np.float64)
@@ -210,6 +212,56 @@ class BowedEdgeTests(unittest.TestCase):
         ])
         self.assertLessEqual(float(corner_d.max()), 3.0)
         self.assertLessEqual(float(np.percentile(curve_d, 95)), 2.5)
+
+    def test_preview_path_matches_saved_output(self):
+        for width, height, margin, bow in (
+            (1200, 900, 80, 28),
+            (2000, 1500, 140, 48),
+            (4500, 3400, 280, 90),
+        ):
+            with self.subTest(size=f'{width}x{height}'):
+                self._assert_preview_vs_save(width, height, margin, bow)
+
+    def test_straight_px_boundary_skips_or_applies_remap(self):
+        """STRAIGHT_PX is working-copy pixels (long side <= DETECT_MAX 800)."""
+        width, height = 200, 160
+        xs = np.arange(width, dtype=np.float64)
+        t = xs / (width - 1)
+        image = Image.new('RGB', (width, height), PAGE)
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((16, 16, width - 17, height - 17), fill=PRINT)
+
+        def curves_for_peak(peak):
+            raw = 4.0 * t * (1.0 - t) * peak
+            fitted, mode = bowed_edges._fit_edge(raw, height)
+            zeros = np.zeros(height, dtype=np.float64)
+            return fitted, mode, {
+                'top': fitted,
+                'bottom': fitted,
+                'left': zeros,
+                'right': zeros,
+                'modes': {'top': mode, 'bottom': mode, 'left': 'none', 'right': 'none'},
+                'elapsed_s': 0.0,
+                'scale': 1.0,
+            }
+
+        fitted, mode, curves = curves_for_peak(1.24)
+        self.assertEqual(mode, 'none')
+        self.assertEqual(float(fitted.max()), 0.0)
+        with patch.object(bowed_edges, 'detect_edge_curves', return_value=curves):
+            skipped = bowed_edges.straighten_bowed_print(image)
+        self.assertIs(skipped, image)
+
+        fitted, mode, curves = curves_for_peak(1.26)
+        self.assertEqual(mode, 'curve')
+        self.assertGreater(float(fitted.max()), 0.0)
+        with patch.object(bowed_edges, 'detect_edge_curves', return_value=curves):
+            remapped = bowed_edges.straighten_bowed_print(image)
+        self.assertIsNot(remapped, image)
+        self.assertGreater(
+            float(np.abs(np.asarray(remapped, dtype=np.int16) - np.asarray(image, dtype=np.int16)).mean()),
+            0.0,
+        )
 
     def test_poor_fit_uses_capped_trim(self):
         image, corners = synthetic_ragged_rectangle()
