@@ -196,7 +196,7 @@ function shortcutHarness(api) {
     context.openCalls += 1;
     return realOpen(...args);
   };
-  function dispatch(partial) {
+  function makeKeyEvent(partial) {
     const event = {
       key: 'a',
       ctrlKey: false,
@@ -211,6 +211,10 @@ function shortcutHarness(api) {
       stopPropagation() { event._stopped = true; },
       ...partial,
     };
+    return event;
+  }
+  function dispatch(partial) {
+    const event = makeKeyEvent(partial);
     const focused = active;
     if (focused && focused._listeners && focused._listeners.keydown) {
       for (const fn of focused._listeners.keydown) {
@@ -218,6 +222,11 @@ function shortcutHarness(api) {
         if (event._stopped) return event;
       }
     }
+    listeners[0](event);
+    return event;
+  }
+  function dispatchDocument(partial) {
+    const event = makeKeyEvent(partial);
     listeners[0](event);
     return event;
   }
@@ -231,7 +240,7 @@ function shortcutHarness(api) {
     return event;
   }
   return {
-    state, messages, press, dispatch, flush,
+    state, messages, press, dispatch, dispatchDocument, flush,
     els, cropAspect, autoNext, cropAspectCustom, body,
     setActive(el) { active = el; },
     setFolderModalHidden(hidden) { folderModalHidden = hidden; },
@@ -1109,6 +1118,24 @@ test('a pointer-driven Output proportions change releases focus so P and W work'
   const selectEvent = await h.press({key: 'w'});
   assert.equal(selectEvent.defaultPrevented, true);
   assert.equal(h.context.selectCalls, 1);
+});
+
+test('document handler SELECT guard skips save and navigation for Enter and Escape', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.setActive(h.cropAspect);
+  const enter = h.dispatchDocument({key: 'Enter', target: h.cropAspect});
+  assert.equal(enter.defaultPrevented, false);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  const escape = h.dispatchDocument({key: 'Escape', target: h.cropAspect});
+  assert.equal(escape.defaultPrevented, false);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
 });
 
 test('Enter and Escape on Output proportions go through the document handler, release focus, and do not save', () => {
