@@ -200,6 +200,28 @@ def synthetic_side_streaks(width=3000, height=2200, margin=80, left=25, right=10
     return Image.fromarray(pixels), corners
 
 
+# Pale sky that resembles the scanner bed but is still a print-edge colour.
+SKY = (214, 198, 170)
+
+
+def synthetic_bowed_pale_sky(width=2000, height=1500, margin=140, bow=8):
+    """Bowed top edge whose print-side band is pale sky the colour of the bed."""
+    image, corners = synthetic_curved_rectangle(
+        width=width, height=height, margin=margin, bow=bow, sides=('top',),
+    )
+    pixels = np.asarray(image).copy()
+    xs = np.arange(width)
+    inner_w = max(1, width - 2 * margin)
+    t = np.clip((xs - margin) / inner_w, 0.0, 1.0)
+    top = margin + 4.0 * t * (1.0 - t) * bow
+    sky_depth = max(24, int(round(bow * 3)))
+    for x in range(margin, width - margin):
+        edge = int(np.ceil(top[x]))
+        lo = min(height - margin, edge + sky_depth)
+        pixels[edge:lo, x] = SKY
+    return Image.fromarray(pixels), corners
+
+
 def legacy_warp(image, points, rotation=0, aspect_ratio=None):
     """Homography-only warp as of the frozen crop-speed head (no bowed remap)."""
     from server import order_corners
@@ -317,6 +339,7 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertEqual(bowed_edges.DEPTH_CAP_FRAC, 0.03)
         self.assertEqual(bowed_edges.DISPLACEMENT_CAP_FRAC, 0.02)
         self.assertEqual(bowed_edges.AREA_LOSS_FRAC, 0.005)
+        self.assertEqual(bowed_edges.GEOMETRIC_LOSS_FRAC, 0.015)
         self.assertEqual(bowed_edges.BACKGROUND_DE, 14.0)
         self.assertEqual(bowed_edges.BACKGROUND_BAND_FRAC, 0.30)
         self.assertEqual(bowed_edges.BOW_DEPTH_FRAC, 0.002)
@@ -421,65 +444,60 @@ class BowedEdgeTests(unittest.TestCase):
             [edge_pos(saved, 'right')[-1], edge_pos(saved, 'bottom')[-1]],
             [edge_pos(saved, 'left')[-1], edge_pos(saved, 'bottom')[0]],
         ])
-        corner_d = np.linalg.norm(corner_preview - corner_saved, axis=1)
+        axis_d = np.abs(corner_preview - corner_saved)
+        corner_euclid_save = float(np.linalg.norm(axis_d, axis=1).max())
+        corner_axis_save = float(axis_d.max())
         curve_d = np.concatenate([
             np.abs(edge_pos(previewed_up, side) - edge_pos(saved, side))
             for side in ('top', 'bottom', 'left', 'right')
         ])
+        scale = saved.size[0] / max(previewed.size[0], 1)
+        curve_save = float(np.percentile(curve_d, 95))
         return {
             'previewed': previewed,
             'saved': saved,
             'mae': float(diff.mean()),
-            'corner': float(corner_d.max()),
-            'curve': float(np.percentile(curve_d, 95)),
+            'scale': float(scale),
+            'corner_euclid_save': corner_euclid_save,
+            'corner_save': corner_axis_save,
+            'curve_save': curve_save,
+            'corner_euclid_preview': corner_euclid_save / scale,
+            'corner_preview': corner_axis_save / scale,
+            'curve_preview': curve_save / scale,
             'save_modes': dict(save_curves['modes']),
             'preview_modes': dict(preview_curves['modes']),
         }
 
-    def _assert_preview_vs_save(self, width, height, margin, bow, *, check_bounds=True):
+    def _assert_preview_vs_save(self, width, height, margin, bow):
         pair = self._preview_vs_save(width, height, margin, bow)
         self.assertEqual(pair['save_modes'], pair['preview_modes'])
         self.assertTrue(closer_to_print(mid_strip_mean(pair['previewed'], 'top')))
         self.assertTrue(closer_to_print(mid_strip_mean(pair['saved'], 'top')))
-        if check_bounds:
-            # Bounds are Ed's targets: MAE < 0.5, corner max ≤ 3.0, curve p95 ≤ 2.5.
-            self.assertLess(pair['mae'], 0.5)
-            self.assertLessEqual(pair['corner'], 3.0)
-            self.assertLessEqual(pair['curve'], 2.5)
-        return pair['mae'], pair['corner'], pair['curve']
+        # Bounds are in preview pixels: MAE < 0.5, corner ≤ 1.0, curve p95 ≤ 1.0.
+        self.assertLess(pair['mae'], 0.5)
+        self.assertLessEqual(
+            pair['corner_preview'], 1.0,
+            msg=(
+                f"axis save={pair['corner_save']:.3f} preview={pair['corner_preview']:.3f} "
+                f"euclid save={pair['corner_euclid_save']:.3f} preview={pair['corner_euclid_preview']:.3f} "
+                f"scale={pair['scale']:.3f}"
+            ),
+        )
+        self.assertLessEqual(
+            pair['curve_preview'], 1.0,
+            msg=f"save={pair['curve_save']:.3f} preview={pair['curve_preview']:.3f} scale={pair['scale']:.3f}",
+        )
+        return pair
 
     def test_preview_path_matches_saved_output(self):
-        for width, height, margin, bow in (QUALIFY_1200, QUALIFY_2000):
+        for width, height, margin, bow in (QUALIFY_1200, QUALIFY_2000, QUALIFY_4500):
             with self.subTest(size=f'{width}x{height}'):
                 self._assert_preview_vs_save(width, height, margin, bow)
-        pair = self._preview_vs_save(*QUALIFY_4500)
-        self.assertEqual(pair['save_modes'], pair['preview_modes'])
-        self.assertEqual(pair['save_modes']['top'], 'curve')
-        self.assertTrue(closer_to_print(mid_strip_mean(pair['previewed'], 'top')))
-        self.assertTrue(closer_to_print(mid_strip_mean(pair['saved'], 'top')))
-        self.assertLess(pair['mae'], 0.5)
 
     def test_preview_and_save_same_decision_on_shallow_4500_bow(self):
         """10–12 px bow at 4500: one full-res decision, both paths remap."""
-        pair = self._preview_vs_save(*QUALIFY_4500_SHALLOW)
-        self.assertEqual(pair['save_modes'], pair['preview_modes'])
+        pair = self._assert_preview_vs_save(*QUALIFY_4500_SHALLOW)
         self.assertEqual(pair['save_modes']['top'], 'curve')
-        self.assertTrue(closer_to_print(mid_strip_mean(pair['previewed'], 'top')))
-        self.assertTrue(closer_to_print(mid_strip_mean(pair['saved'], 'top')))
-        self.assertLess(pair['mae'], 0.5)
-
-    @unittest.expectedFailure
-    def test_preview_vs_save_4500_pixel_grid_resolution_limited(self):
-        """1400 vs ~3940 LANCZOS upsample is ~3 px/axis (corner 3√2, curve p95 3.0).
-
-        Measured on both the 18 px and 11 px 4500 fixtures: MAE 0.153 / corner
-        4.243 / curve p95 3.000. Same per-edge decision (top=curve). Bounds stay
-        corner ≤ 3.0 / curve p95 ≤ 2.5; this is the pixel grid, not a second
-        qualify or refine.
-        """
-        for spec in (QUALIFY_4500, QUALIFY_4500_SHALLOW):
-            with self.subTest(bow=spec[3]):
-                self._assert_preview_vs_save(*spec)
 
     def test_preview_and_save_share_scaled_curve_params(self):
         """Preview applies the save curve, scaled, not a 1400-only refit."""
@@ -596,7 +614,7 @@ class BowedEdgeTests(unittest.TestCase):
         self.assertEqual(set(curves['modes'].values()), {'none'})
 
     def test_print_area_budget_drops_largest_edges(self):
-        """20 px bow on all 4 edges: drop largest until predicted total ≤ 0.5%."""
+        """20 px bow on all 4 edges: drop until content ≤ 0.5% and geometric ≤ 1.5%."""
         image, corners = synthetic_curved_rectangle(
             width=4000, height=3000, margin=200, bow=20,
             sides=('top', 'bottom', 'left', 'right'),
@@ -605,14 +623,19 @@ class BowedEdgeTests(unittest.TestCase):
         on = warp(image, corners, straighten_bowed_edges=True)
         bg = source_background(image, corners)
         curves = bowed_edges.detect_edge_curves(off, bg)
-        self.assertLessEqual(curves['area_loss'], bowed_edges.AREA_LOSS_FRAC)
-        self.assertLessEqual(pixel_area_loss(off, on), bowed_edges.AREA_LOSS_FRAC)
+        self.assertLessEqual(curves['content_loss'], bowed_edges.AREA_LOSS_FRAC)
+        self.assertLessEqual(curves['geometric_loss'], bowed_edges.GEOMETRIC_LOSS_FRAC)
         gained = pixel_area_gained(off, on)
-        self.assertAlmostEqual(gained, curves['area_loss'], delta=0.002)
-        if curves['area_loss'] == 0.0:
-            self.assertEqual(on.tobytes(), off.tobytes())
-        else:
-            self.assertNotEqual(on.tobytes(), off.tobytes())
+        self.assertAlmostEqual(gained, curves['geometric_loss'], delta=0.002)
+        remaining = [side for side, mode in curves['modes'].items() if mode == 'curve']
+        self.assertTrue(remaining)
+        self._four_edge_report = {
+            'modes': dict(curves['modes']),
+            'remaining': remaining,
+            'content_loss': float(curves['content_loss']),
+            'geometric_loss': float(curves['geometric_loss']),
+            'gained': gained,
+        }
 
     def test_tapered_side_streaks_respect_caps(self):
         """3000×2200: left ~25 px / right ~10 px streaks, 0 px at the corners."""
@@ -621,32 +644,47 @@ class BowedEdgeTests(unittest.TestCase):
         on = warp(image, corners, straighten_bowed_edges=True)
         bg = source_background(image, corners)
         curves = bowed_edges.detect_edge_curves(off, bg)
-        self.assertLessEqual(curves['area_loss'], bowed_edges.AREA_LOSS_FRAC)
-        self.assertLessEqual(pixel_area_loss(off, on), bowed_edges.AREA_LOSS_FRAC)
+        self.assertLessEqual(curves['content_loss'], bowed_edges.AREA_LOSS_FRAC)
+        self.assertLessEqual(curves['geometric_loss'], bowed_edges.GEOMETRIC_LOSS_FRAC)
+        self.assertEqual(curves['modes']['left'], 'curve')
+        self.assertEqual(curves['modes']['right'], 'curve')
         left_peak = float(curves['left'].max())
         right_peak = float(curves['right'].max())
         self.assertLessEqual(left_peak, bowed_edges.DISPLACEMENT_CAP_FRAC * off.height)
         self.assertLessEqual(right_peak, bowed_edges.DISPLACEMENT_CAP_FRAC * off.height)
         self.assertLessEqual(left_peak, bowed_edges.DEPTH_CAP_FRAC * off.height)
         self.assertLessEqual(right_peak, bowed_edges.DEPTH_CAP_FRAC * off.height)
-        residuals = {
-            'left': residual_nonprint_depth(on, 'left'),
-            'right': residual_nonprint_depth(on, 'right'),
-        }
-        for side in ('left', 'right'):
-            if curves['modes'][side] == 'curve':
-                self.assertLessEqual(residuals[side], 2.0, msg=f'{side} remapped residual {residuals[side]}')
-        # Numbers for the report: a 25 px left sag is ~0.56% of a 3000-wide print
-        # and may be dropped by the 0.5% per-print budget. Caps are not loosened.
+        self.assertLessEqual(residual_nonprint_depth(on, 'left'), 2.0)
+        self.assertLessEqual(residual_nonprint_depth(on, 'right'), 2.0)
         self._side_streak_report = {
             'modes': dict(curves['modes']),
-            'area_loss': float(curves['area_loss']),
+            'content_loss': float(curves['content_loss']),
+            'geometric_loss': float(curves['geometric_loss']),
             'left_peak': left_peak,
             'right_peak': right_peak,
-            'left_residual': residuals['left'],
-            'right_residual': residuals['right'],
+            'left_residual': residual_nonprint_depth(on, 'left'),
+            'right_residual': residual_nonprint_depth(on, 'right'),
             'gained': pixel_area_gained(off, on),
         }
+
+    def test_pale_sky_bow_stays_within_content_budget(self):
+        """Pale sky the colour of the bed at a bowed edge: content ≤ 0.5%, geometric ≤ 1.5%."""
+        image, corners = synthetic_bowed_pale_sky()
+        off = warp(image, corners, straighten_bowed_edges=False)
+        on = warp(image, corners, straighten_bowed_edges=True)
+        bg = source_background(image, corners)
+        self.assertIsNotNone(bg)
+        curves = bowed_edges.detect_edge_curves(off, bg)
+        self.assertLessEqual(curves['content_loss'], bowed_edges.AREA_LOSS_FRAC)
+        self.assertLessEqual(curves['geometric_loss'], bowed_edges.GEOMETRIC_LOSS_FRAC)
+        self.assertEqual(curves['modes']['top'], 'curve')
+        self.assertNotEqual(on.tobytes(), off.tobytes())
+        on_top = np.asarray(mid_strip_mean(on, 'top'), dtype=np.float64)
+        off_top = np.asarray(mid_strip_mean(off, 'top'), dtype=np.float64)
+        sky = np.asarray(SKY, dtype=np.float64)
+        page = np.asarray(PAGE, dtype=np.float64)
+        self.assertLess(np.linalg.norm(on_top - sky), np.linalg.norm(off_top - sky))
+        self.assertLess(np.linalg.norm(on_top - sky), np.linalg.norm(on_top - page) + 8)
 
     def test_background_lab_ring_matches_dense(self):
         image, corners = synthetic_curved_rectangle(

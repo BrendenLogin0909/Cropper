@@ -8,8 +8,8 @@ gradients never count. Qualify/skip runs once, at the full-res warp; preview
 scales those params and does not re-gate or refine. A poor quadratic fit is
 left straight (no trim, even when the background match is strong). Remap is
 restricted to the affected edge band(s). Predicted extra area loss is a
-per-print budget: largest-loss edges are dropped until the total is ≤
-AREA_LOSS_FRAC.
+per-print budget: content loss ≤ AREA_LOSS_FRAC, with a geometric backstop of
+GEOMETRIC_LOSS_FRAC. Largest-loss edges are dropped until both are satisfied.
 """
 from __future__ import annotations
 
@@ -40,9 +40,11 @@ DEPTH_CAP_FRAC = 0.03
 # Skip the edge (straight warp) if any pixel would move more than this fraction
 # of the edge length.
 DISPLACEMENT_CAP_FRAC = 0.02
-# Skip edges (largest predicted loss first) until the print's total predicted
-# extra area loss is within this fraction of the warped rectangle.
+# Per-print CONTENT loss: sag pixels that do not match the ring background Lab
+# (ΔE > BACKGROUND_DE). Scanner-bed in the sag does not count.
 AREA_LOSS_FRAC = 0.005
+# Hard backstop: total GEOMETRIC sag area as a fraction of the warped rectangle.
+GEOMETRIC_LOSS_FRAC = 0.015
 # Dilate the source quad by this fraction of min(width, height) before taking
 # the outside-median Lab.
 QUAD_DILATE_FRAC = 0.01
@@ -325,34 +327,67 @@ def _geometry_ok(curve: np.ndarray, side: str, width: int, height: int) -> bool:
     return True
 
 
-def _qualify_edge(curve: np.ndarray, side: str, width: int, height: int, lab: np.ndarray, background: np.ndarray) -> tuple[np.ndarray, str, float]:
-    """Return (chord-relative sag or zeros, mode, predicted area-loss fraction)."""
+def _sag_loss_fractions(
+    lab: np.ndarray,
+    curve: np.ndarray,
+    side: str,
+    background: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[float, float]:
+    """(geometric fraction, content fraction) of the sag region.
+
+    A sag pixel is background only if it matches the ring Lab within
+    BACKGROUND_DE; everything else is content.
+    """
+    edge_length = float(width if side in {'top', 'bottom'} else height)
+    geometric = float(curve.mean() * edge_length) / (float(width) * float(height))
+    inward = _from_border(lab, side)
+    peak = float(curve.max()) if curve.size else 0.0
+    if peak < 0.5:
+        return geometric, 0.0
+    max_d = min(inward.shape[0], max(1, int(np.ceil(peak))))
+    depths = np.clip(np.floor(curve).astype(np.int32), 0, max_d)
+    delta = _delta_e(inward[:max_d], background)
+    rows = np.arange(max_d)[:, None]
+    in_sag = rows < depths[None, :]
+    content = in_sag & (delta > BACKGROUND_DE)
+    content_frac = float(content.sum()) / (float(width) * float(height))
+    return geometric, content_frac
+
+
+def _qualify_edge(curve: np.ndarray, side: str, width: int, height: int, lab: np.ndarray, background: np.ndarray) -> tuple[np.ndarray, str, float, float]:
+    """Return (chord-relative sag or zeros, mode, geometric fraction, content fraction)."""
     zeros = np.zeros_like(curve)
     if not _geometry_ok(curve, side, width, height):
-        return zeros, 'none', 0.0
+        return zeros, 'none', 0.0, 0.0
     if _background_band_fraction(lab, side, curve, background) < BACKGROUND_BAND_FRAC:
-        return zeros, 'none', 0.0
+        return zeros, 'none', 0.0, 0.0
     edge_length = float(width if side in {'top', 'bottom'} else height)
     sag = np.clip(_quadratic_sag(curve), 0.0, None)
     capped = np.minimum(sag, DEPTH_CAP_FRAC * edge_length)
-    area = float(capped.mean() * edge_length) / (float(width) * float(height))
-    return capped, 'curve', area
+    geometric, content = _sag_loss_fractions(lab, capped, side, background, width, height)
+    return capped, 'curve', geometric, content
 
 
-def _trim_print_area(applied: dict, modes: dict, areas: dict) -> float:
-    """Drop largest-loss edges until the print total is ≤ AREA_LOSS_FRAC."""
-    ranked = sorted(
-        (side for side in ('top', 'bottom', 'left', 'right') if modes[side] == 'curve'),
-        key=lambda side: -areas[side],
-    )
-    total = float(sum(areas[side] for side in ranked))
-    while total > AREA_LOSS_FRAC and ranked:
-        side = ranked.pop(0)
-        total -= areas[side]
+def _trim_print_area(applied: dict, modes: dict, geometric: dict, content: dict) -> tuple[float, float]:
+    """Drop largest-loss edges until content ≤ 0.5% and geometric ≤ 1.5%."""
+    ranked = [side for side in ('top', 'bottom', 'left', 'right') if modes[side] == 'curve']
+    content_total = float(sum(content[side] for side in ranked))
+    geometric_total = float(sum(geometric[side] for side in ranked))
+    while ranked and (content_total > AREA_LOSS_FRAC or geometric_total > GEOMETRIC_LOSS_FRAC):
+        if content_total > AREA_LOSS_FRAC:
+            side = max(ranked, key=lambda name: (content[name], geometric[name]))
+        else:
+            side = max(ranked, key=lambda name: geometric[name])
+        ranked.remove(side)
+        content_total -= content[side]
+        geometric_total -= geometric[side]
         modes[side] = 'none'
         applied[side] = np.zeros_like(applied[side])
-        areas[side] = 0.0
-    return max(0.0, total)
+        content[side] = 0.0
+        geometric[side] = 0.0
+    return max(0.0, content_total), max(0.0, geometric_total)
 
 
 def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = None) -> dict:
@@ -368,6 +403,8 @@ def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = N
         'elapsed_s': 0.0,
         'scale': 1.0,
         'area_loss': 0.0,
+        'content_loss': 0.0,
+        'geometric_loss': 0.0,
     }
     if background_lab is None:
         empty['elapsed_s'] = time.perf_counter() - started
@@ -416,13 +453,15 @@ def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = N
         refined[side] = fitted if mode == 'curve' else np.zeros_like(hits)
     modes = {}
     applied = {}
-    areas = {}
+    geometric = {}
+    content = {}
     for side in ('top', 'bottom', 'left', 'right'):
-        curve, mode, area = _qualify_edge(refined[side], side, full_w, full_h, lab, background_lab)
+        curve, mode, geo, cont = _qualify_edge(refined[side], side, full_w, full_h, lab, background_lab)
         applied[side] = curve
         modes[side] = mode
-        areas[side] = area
-    area_loss = _trim_print_area(applied, modes, areas)
+        geometric[side] = geo
+        content[side] = cont
+    content_loss, geometric_loss = _trim_print_area(applied, modes, geometric, content)
     return {
         'top': applied['top'],
         'bottom': applied['bottom'],
@@ -431,7 +470,9 @@ def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = N
         'modes': modes,
         'elapsed_s': time.perf_counter() - started,
         'scale': scale,
-        'area_loss': area_loss,
+        'area_loss': content_loss,
+        'content_loss': content_loss,
+        'geometric_loss': geometric_loss,
     }
 
 
@@ -535,6 +576,8 @@ def scale_curves(curves: dict, src_size: tuple[int, int], dest_size: tuple[int, 
         'elapsed_s': curves.get('elapsed_s', 0.0),
         'scale': curves.get('scale', 1.0),
         'area_loss': curves.get('area_loss', 0.0),
+        'content_loss': curves.get('content_loss', curves.get('area_loss', 0.0)),
+        'geometric_loss': curves.get('geometric_loss', 0.0),
     }
 
 

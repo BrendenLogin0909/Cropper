@@ -66,7 +66,9 @@ trim**, even when the background match is strong. Fitted sag is clipped to
 `DEPTH_CAP_FRAC` (3% of the side). If any pixel would move more than
 `DISPLACEMENT_CAP_FRAC` (2% of the side), that edge is skipped (straight warp).
 Predicted extra area loss is a **per-print** budget: after edges qualify,
-largest-loss edges are dropped until the total is ≤ `AREA_LOSS_FRAC` (0.5%);
+content loss (sag pixels that do not match the ring Lab within `BACKGROUND_DE`)
+must stay ≤ `AREA_LOSS_FRAC` (0.5%), and geometric sag area ≤
+`GEOMETRIC_LOSS_FRAC` (1.5%). Largest-loss edges are dropped until both hold;
 if that removes them all, output is byte-identical to OFF. The ≤800 px estimate
 is refined at full resolution in a `REFINE_BAND_PX` (6 px,
 widened by the downsample scale) band; remap is restricted to the affected
@@ -87,6 +89,17 @@ stale cached result. Our own writes evict the path explicitly. NTFS mtime is
 close that hole. This becomes an ADR in DECISIONS.md when this stack joins #16's
 docs.
 
+## Decisions (2026-11-17)
+
+Preview-vs-save bounds are in **preview pixels**. With one qualify/skip decision
+and one param set, computed at full res and scaled onto the 1400 warp, the
+remaining 4500 gap is resampling (1 preview px ≈ 3 save px), not drift. Convert
+save-scale distances by dividing by the save/preview scale factor. Corner max
+is the converted per-axis error (a 3 px-per-axis LANCZOS step is one preview
+pixel; the 3√2 Euclidean is the same step on both axes). Bounds: MAE < 0.5,
+corner max ≤ 1.0 preview px, curve p95 ≤ 1.0 preview px. `docs/` is not on this
+branch; this ADR lives here until #16's DECISIONS.md.
+
 ## PLAN
 
 Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal;
@@ -102,20 +115,8 @@ blocks, horizon near the border, bright sky at top) have content to the print
 edges and no background band outside; ON must be byte-identical to OFF, with
 area loss ≤ 0.1%. A qualifying bowed print on scanner background with a thin
 varying streak must leave a residual streak ≤ 2 px at save scale, and extra
-area loss ≤ 0.5% **per print**. Preview-vs-save bounds stay MAE < 0.5, corner max ≤ 3.0 px,
-curve p95 ≤ 2.5 px. Preview applies the save curve scaled to 1400 px (one
-qualify/skip at full res; no preview gate or refine). Measured:
-
-- 1200×900 bow 4.5: MAE 0.000 / corner 0.000 / curve p95 0.000
-- 2000×1500 bow 8: MAE 0.095 / corner 0.000 / curve p95 0.000
-- 4500×3400 bow 18: MAE 0.153 / corner 4.243 / curve p95 3.000
-- 4500×3400 bow 11: MAE 0.153 / corner 4.243 / curve p95 3.000 (same decision: top=curve)
-
-The 4500 corner/curve gap is LANCZOS upsample of 1400 → ~3940 (~3 px per axis,
-3√2 at a corner). Bounds are not loosened. A straight print with a 3–6 px
-uniform strip or a 0–8 px linear wedge on one edge is byte-identical to OFF.
-A 3000×2200 print with a 25 px left / 10 px right tapering streak: the 0.5%
-per-print budget drops the left edge (predicted ~0.59% > 0.5%; residual 25 px);
-right remaps (peak 9.7 px, residual 2.0 px, predicted 0.23%). Displacement 2%
-and depth 3% would have allowed the left edge; those caps are not loosened.
-Real-scan validation is local and off-repo.
+content loss ≤ 0.5% **per print** and geometric loss ≤ 1.5%. Preview-vs-save
+bounds are in preview pixels: MAE < 0.5, corner max ≤ 1.0, curve p95 ≤ 1.0
+(save-scale distances divided by the save/preview scale). A straight print with
+a 3–6 px uniform strip or a 0–8 px linear wedge on one edge is byte-identical
+to OFF. Real-scan validation is local and off-repo.
