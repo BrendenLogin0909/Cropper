@@ -5,6 +5,8 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PIL import Image, ImageOps
 
 import crop_detection
@@ -165,6 +167,7 @@ FILL_WAIT_SECONDS = 30.0
 
 class _FillFlight:
     def __init__(self) -> None:
+        self.detect_ready = threading.Event()
         self.done = threading.Event()
         self.error: BaseException | None = None
 
@@ -219,22 +222,42 @@ def _put_if_current(
 
 
 def _release_inflight(resolved: str, flight: _FillFlight) -> None:
+    flight.detect_ready.set()
     flight.done.set()
     with _fill_lock:
         if _inflight_fills.get(resolved) is flight:
             del _inflight_fills[resolved]
 
 
-def wait_for_pending_fill(path: Path, timeout: float | None = None) -> bool:
-    """Wait for an in-progress fill. Returns False on timeout; re-raises the leader's error."""
+def _mark_detect_ready(resolved: str) -> None:
+    with _fill_lock:
+        flight = _inflight_fills.get(resolved)
+    if flight is not None:
+        flight.detect_ready.set()
+
+
+def _set_flight_error(resolved: str, exc: BaseException) -> None:
+    with _fill_lock:
+        flight = _inflight_fills.get(resolved)
+    if flight is not None and flight.error is None:
+        flight.error = exc
+
+
+def wait_for_pending_fill(path: Path, timeout: float | None = None, *, stage: str = 'done') -> bool:
+    """Wait for an in-progress fill. Returns False on timeout; re-raises the leader's error.
+
+    stage='detect' returns as soon as the 960 px entry is published (or the
+    leader fails before that). stage='done' waits for the 1400 px preview too.
+    """
     with _fill_lock:
         flight = _inflight_fills.get(_resolved_str(path))
     if flight is None:
         return True
+    event = flight.detect_ready if stage == 'detect' else flight.done
     limit = FILL_WAIT_SECONDS if timeout is None else timeout
-    if not flight.done.wait(limit):
+    if not event.wait(limit):
         return False
-    if flight.error is not None:
+    if flight.error is not None and IMAGE_CACHE.get(path) is None:
         raise flight.error
     return True
 
@@ -256,6 +279,7 @@ def reset() -> None:
         flights = list(_inflight_fills.values())
         _inflight_fills.clear()
     for flight in flights:
+        flight.detect_ready.set()
         flight.done.set()
 
 
@@ -274,6 +298,7 @@ def evict_path(path: Path) -> None:
         IMAGE_CACHE.evict_resolved(resolved)
         RESULT_CACHE.evict_resolved(resolved)
     if flight is not None:
+        flight.detect_ready.set()
         flight.done.set()
 
 
@@ -300,18 +325,40 @@ def prefetch_aborted() -> bool:
     return _abort.is_set() or _foreground_busy()
 
 
+def _preview_resize(image: Image.Image) -> Image.Image:
+    """1400 px live-preview image. INTER_AREA. Does not change the 960 detect path."""
+    rgb = image if image.mode == 'RGB' else image.convert('RGB')
+    width, height = rgb.size
+    longest = max(width, height)
+    if longest <= PREVIEW_SIZE:
+        return rgb.copy()
+    scale = PREVIEW_SIZE / longest
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    resized = cv2.resize(np.asarray(rgb), size, interpolation=cv2.INTER_AREA)
+    return Image.fromarray(resized)
+
+
 def fill_from_full_image(path: Path, image: Image.Image) -> None:
+    """Publish the 960 detect image, then the 1400 preview, each under _put_if_current."""
     identity, generation = _capture_fill_guard(path)
-    detect = crop_detection.detection_preview(image)
-    preview = image.copy()
-    preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
-    _put_if_current(path, detect, preview, image.size, identity, generation)
+    resolved = _resolved_str(path)
+    try:
+        detect = crop_detection.detection_preview(image)
+        _put_if_current(path, detect, None, image.size, identity, generation)
+        _mark_detect_ready(resolved)
+        preview = _preview_resize(image)
+        _put_if_current(path, detect, preview, image.size, identity, generation)
+    except Exception as exc:
+        _set_flight_error(resolved, exc)
+        _mark_detect_ready(resolved)
+        raise
 
 
 def fill_from_full_image_exclusive(path: Path, image: Image.Image) -> None:
     """Fill IMAGE_CACHE, waiting for an in-progress fill of the same path instead of decoding twice."""
     waited = wait_for_pending_fill(path)
-    if IMAGE_CACHE.get(path) is not None:
+    cached = IMAGE_CACHE.get(path)
+    if cached is not None and cached['preview'] is not None:
         return
     resolved = _resolved_str(path)
     with _fill_lock:
@@ -334,10 +381,12 @@ def fill_from_full_image_exclusive(path: Path, image: Image.Image) -> None:
             raise flight.error
         return
     try:
-        if IMAGE_CACHE.get(path) is None:
+        cached = IMAGE_CACHE.get(path)
+        if cached is None or cached['preview'] is None:
             fill_from_full_image(path, image)
     except Exception as exc:
-        flight.error = exc
+        if flight.error is None:
+            flight.error = exc
         raise
     finally:
         _release_inflight(resolved, flight)
@@ -345,25 +394,32 @@ def fill_from_full_image_exclusive(path: Path, image: Image.Image) -> None:
 
 def _decode_put_detection(path: Path) -> tuple[Image.Image, tuple[int, int]]:
     identity, generation = _capture_fill_guard(path)
-    with Image.open(path) as source:
-        original_size = source.size
-        orientation = source.getexif().get(274)
-        if orientation in {5, 6, 7, 8}:
-            original_size = (original_size[1], original_size[0])
-        image = ImageOps.exif_transpose(source).convert('RGB')
-    detect = crop_detection.detection_preview(image)
-    preview = image.copy()
-    preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
-    _put_if_current(path, detect, preview, original_size, identity, generation)
-    cached = IMAGE_CACHE.get(path)
-    if cached is not None:
-        return cached['detect'], cached['original_size']
-    return detect, original_size
+    resolved = _resolved_str(path)
+    try:
+        with Image.open(path) as source:
+            original_size = source.size
+            orientation = source.getexif().get(274)
+            if orientation in {5, 6, 7, 8}:
+                original_size = (original_size[1], original_size[0])
+            image = ImageOps.exif_transpose(source).convert('RGB')
+        detect = crop_detection.detection_preview(image)
+        _put_if_current(path, detect, None, original_size, identity, generation)
+        _mark_detect_ready(resolved)
+        preview = _preview_resize(image)
+        _put_if_current(path, detect, preview, original_size, identity, generation)
+        cached = IMAGE_CACHE.get(path)
+        if cached is not None:
+            return cached['detect'], cached['original_size']
+        return detect, original_size
+    except Exception as exc:
+        _set_flight_error(resolved, exc)
+        _mark_detect_ready(resolved)
+        raise
 
 
 def decode_detection_image(path: Path) -> tuple[Image.Image, tuple[int, int]]:
     """Full-decode (or reuse) the 960 px detect image. Draft JPEG decode is gone."""
-    waited = wait_for_pending_fill(path)
+    waited = wait_for_pending_fill(path, stage='detect')
     cached = IMAGE_CACHE.get(path)
     if cached is not None:
         return cached['detect'], cached['original_size']
