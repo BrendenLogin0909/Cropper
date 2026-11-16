@@ -72,7 +72,7 @@
         <section class="live-crop-preview" aria-labelledby="live-preview-title">
           <div class="live-preview-head"><div><div class="eyebrow">LIVE RESULT</div><h2 id="live-preview-title">Straightened preview</h2></div><span id="live-preview-ratio">—</span></div>
           <div class="live-preview-image-wrap"><img id="live-preview-image" class="hidden" alt="Live preview of the straightened crop"><p id="live-preview-status">Select four corners to see the result here.</p></div>
-          <p class="live-preview-note">Updates automatically when you move a corner or change the output proportions.</p>
+          <p class="live-preview-note">Updates automatically when you move a corner, change output proportions, or toggle straighten bowed edges.</p>
         </section>
         </div>
         <div class="editor-bottom">
@@ -133,6 +133,7 @@
           <p class="aspect-note">Choose the physical print’s shape, where known; portrait and landscape are handled automatically. Four corners alone cannot prove it. For a 6 × 4 in family print, choose 2:3. Always check the preview. To correct an older crop, open it, choose Whole image, and save a new copy.</p>
         </div>
         <div class="settings-spacer"></div>
+        <label class="toggle-line"><input type="checkbox" id="straighten-bowed-edges" checked><span class="switch"></span><span>Straighten bowed edges</span></label>
         <label class="toggle-line"><input type="checkbox" id="auto-next" checked><span class="switch"></span><span>Move to next image after saving</span></label>
         <button class="button button-primary save-button" id="save" title="Crop and save (Enter)" disabled><span>Crop &amp; save</span><span>↗</span></button>
         <div id="save-error" class="save-error hidden" role="alert"><strong>Couldn’t save this crop</strong><p id="save-error-detail"></p><button id="save-choose-output" class="button button-quiet">Choose another output folder</button></div>
