@@ -41,8 +41,10 @@ function makeControl(tag, extra = {}) {
     },
     querySelector: () => ({textContent: ''}),
     addEventListener(type, fn) { (el._listeners[type] ||= []).push(fn); },
-    dispatch(type) {
-      for (const fn of el._listeners[type] || []) fn({currentTarget: el, target: el});
+    dispatch(type, extra = {}) {
+      const event = {currentTarget: el, target: el, defaultPrevented: false, preventDefault() { event.defaultPrevented = true; }, stopPropagation() { event._stopped = true; }, ...extra};
+      for (const fn of el._listeners[type] || []) fn(event);
+      return event;
     },
   };
   return el;
@@ -612,6 +614,7 @@ test('changing Output proportions then P still predicts', async () => {
   h.bindSettings();
   h.setActive(h.cropAspect);
   h.cropAspect.value = '2:3';
+  h.cropAspect.dispatch('pointerdown');
   h.cropAspect.dispatch('input');
   const event = await h.press({key: 'p'});
   assert.equal(event.defaultPrevented, true);
@@ -1040,4 +1043,70 @@ test('typing in crop-aspect-custom keeps focus', () => {
   assert.equal(field.blurred, undefined);
   assert.equal(h.context.document.activeElement, field);
   assert.equal(h.context.settings.customAspect, '4:5');
+});
+
+test('two ArrowDowns on Output proportions keep focus and step 2:3 to 3:4 then 4:5', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.setActive(h.cropAspect);
+  h.cropAspect.value = '2:3';
+  h.cropAspect.dispatch('keydown', {key: 'ArrowDown'});
+  h.cropAspect.value = '3:4';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  assert.equal(h.context.settings.aspect, '3:4');
+  const blocked = h.dispatch({key: 'p'});
+  assert.equal(blocked.defaultPrevented, false);
+  h.cropAspect.dispatch('keydown', {key: 'ArrowDown'});
+  h.cropAspect.value = '4:5';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  assert.equal(h.context.settings.aspect, '4:5');
+});
+
+test('a pointer-driven Output proportions change releases focus so P and W work', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  h.bindSettings();
+  h.setActive(h.cropAspect);
+  h.cropAspect.value = '2:3';
+  h.cropAspect.dispatch('pointerdown');
+  h.cropAspect.value = '3:4';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.body);
+  const predictEvent = await h.press({key: 'p'});
+  assert.equal(predictEvent.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  h.setActive(h.cropAspect);
+  h.cropAspect.dispatch('mousedown');
+  h.cropAspect.value = '4:5';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.body);
+  const selectEvent = await h.press({key: 'w'});
+  assert.equal(selectEvent.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+});
+
+test('Enter and Escape release focus from Output proportions', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.setActive(h.cropAspect);
+  const enter = h.cropAspect.dispatch('keydown', {key: 'Enter'});
+  assert.equal(enter.defaultPrevented, true);
+  assert.equal(h.context.document.activeElement, h.body);
+  h.setActive(h.cropAspect);
+  const escape = h.cropAspect.dispatch('keydown', {key: 'Escape'});
+  assert.equal(escape.defaultPrevented, true);
+  assert.equal(h.context.document.activeElement, h.body);
+});
+
+test('Auto-next still blurs after a change', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.setActive(h.autoNext);
+  h.autoNext.checked = false;
+  h.autoNext.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.body);
+  assert.equal(h.context.settings.autoNext, false);
 });

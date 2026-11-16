@@ -385,17 +385,36 @@ function releaseCropShortcutFocus(el) {
   const type = String(el.type || '').toLowerCase();
   if (tag === 'SELECT' || tag === 'BUTTON' || (tag === 'INPUT' && (type === 'checkbox' || type === 'radio'))) el.blur();
 }
-function saveSettings() {
+function saveSettings(event) {
   settings.autoNext = $('auto-next').checked;
   settings.aspect = $('crop-aspect').value; settings.customAspect = $('crop-aspect-custom').value.trim();
   localStorage.setItem('cropper-settings', JSON.stringify(settings));
   $('crop-aspect-custom-field').classList.toggle('hidden', settings.aspect !== 'custom');
   $('save-error').classList.add('hidden'); updateControls();
+  const source = event && event.currentTarget;
+  if (source === $('crop-aspect')) {
+    if (source._cropPointer) {
+      source._cropPointer = false;
+      releaseCropShortcutFocus(source);
+    }
+    return;
+  }
   releaseCropShortcutFocus(document.activeElement);
 }
 function loadSettings() {
   $('auto-next').checked = settings.autoNext;
   $('crop-aspect').value = settings.aspect; $('crop-aspect-custom').value = settings.customAspect;
+  const aspect = $('crop-aspect');
+  const markPointer = () => { aspect._cropPointer = true; };
+  aspect.addEventListener('pointerdown', markPointer);
+  aspect.addEventListener('mousedown', markPointer);
+  aspect.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      releaseCropShortcutFocus(aspect);
+    }
+  });
   document.querySelectorAll('#auto-next, #crop-aspect, #crop-aspect-custom').forEach(input => input.addEventListener('input', saveSettings));
   saveSettings();
 }
