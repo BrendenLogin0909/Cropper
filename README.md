@@ -100,7 +100,7 @@ Dust/noise/sharpening operations retain their algorithms and use auto-improvemen
 filing: input from 1.5, archive to 2. Cropped, output to 1.6 with _e. An unnecessary
 repair leaves the source unchanged. No operation creates a nested Before folder.
 
-## Scan-set migration — 15 October 2026
+## Scan-set migration
 
 174 nested legacy files moved into sibling folders; 84 unchanged skipped-auto
 snapshots added. All 258 destinations were SHA-256 verified. Four empty legacy

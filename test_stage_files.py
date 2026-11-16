@@ -154,7 +154,7 @@ class StageFilesTests(unittest.TestCase):
 
     def test_comment_cannot_replace_archive_filename(self):
         with TemporaryDirectory() as tmp:
-            root=Path(tmp);source=self.source(root,stages.CROP_QUEUE,'2026-10-13 10.17.33_c.jpg')
+            root=Path(tmp);source=self.source(root,stages.CROP_QUEUE,'scan_source_c.jpg')
             planned=stages.plan(source,'restore')
             planned['snapshots'][1]=root/stages.SKIP_ENHANCE/'The man has a white moustache.jpg'
             with self.assertRaisesRegex(ValueError,'Archive filename must match'):

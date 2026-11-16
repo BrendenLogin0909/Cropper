@@ -113,7 +113,7 @@ class StageServerTests(unittest.TestCase):
         self.edit.assert_not_called()
 
     def test_resubmit_comment_preserves_original_archive_names(self):
-        source=self.source(stages.CROP_QUEUE,'2026-10-13 10.17.33_c.jpg')
+        source=self.source(stages.CROP_QUEUE,'scan_source_c.jpg')
         original=source.read_bytes()
         first=self.post('/api/chatgpt-generate',{'front_path':str(source),'stage_routing':True})
         comment='The man has a white moustache, not a shiny upper lip. Preserve his expression and everything else.'
@@ -122,7 +122,7 @@ class StageServerTests(unittest.TestCase):
         for folder in [stages.CROPPED,stages.SKIP_ENHANCE]:
             self.assertEqual([p.name for p in (self.root/folder).iterdir()],[source.name])
             self.assertEqual((self.root/folder/source.name).read_bytes(),original)
-        self.assertTrue((self.root/stages.AI_QUEUE/'2026-10-13 10.17.33_c_ai.png').exists())
+        self.assertTrue((self.root/stages.AI_QUEUE/'scan_source_c_ai.png').exists())
         self.assertFalse(source.exists())
         self.assertEqual(self.edit.call_count,2)
 
