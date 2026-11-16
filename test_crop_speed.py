@@ -304,6 +304,82 @@ class CropSpeedTests(unittest.TestCase):
         self.assertEqual(str(waiter_errors[0]), 'fill exploded')
         self.assertEqual(len(previews), 1)
 
+    def test_same_identity_evict_during_put_does_not_leave_cached_entry(self):
+        """evict_path between the identity/generation check and IMAGE_CACHE.put.
+
+        Identity is unchanged (the coarse-mtime case generation exists for).
+        A hooked put starts evict_path on another thread before the real put.
+        After both finish the path must not remain cached: on 9c6dce9 the put
+        overwrites the evict; with an atomic check+put the evict wins.
+        """
+        path = self.png_source('same-id-evict.png', size=(200, 160))
+        image, _ = server.load_image(path)
+        evict_started = threading.Event()
+        evict_finished = threading.Event()
+        evict_threads = []
+        original_put = crop_cache.IMAGE_CACHE.put
+
+        def racing_put(*args, **kwargs):
+            def do_evict():
+                evict_started.set()
+                crop_cache.evict_path(path)
+                evict_finished.set()
+
+            worker = threading.Thread(target=do_evict, name='evict-during-put')
+            worker.start()
+            evict_threads.append(worker)
+            self.assertTrue(evict_started.wait(2), 'evict_path never started')
+            # Old code has already dropped _fill_lock, so evict finishes here
+            # and the subsequent put stores start-identity pixels. New code
+            # still holds _fill_lock, so this wait times out and evict runs
+            # only after put returns and the lock is released.
+            evict_finished.wait(0.2)
+            return original_put(*args, **kwargs)
+
+        with patch.object(crop_cache.IMAGE_CACHE, 'put', racing_put):
+            crop_cache.fill_from_full_image(path, image)
+        for worker in evict_threads:
+            worker.join(2)
+            self.assertFalse(worker.is_alive(), 'evict_path deadlocked with IMAGE_CACHE.put')
+        self.assertTrue(evict_threads, 'IMAGE_CACHE.put was never called')
+        self.assertTrue(evict_finished.is_set(), 'evict_path did not finish')
+        self.assertIsNone(
+            crop_cache.IMAGE_CACHE.get(path),
+            'same-identity evict_path was overwritten by a later put',
+        )
+        self.assertFalse(crop_cache.IMAGE_CACHE.contains_resolved(str(path.resolve())))
+
+    def test_concurrent_fill_and_evict_do_not_deadlock(self):
+        path = self.png_source('fill-evict-deadlock.png', size=(320, 240))
+        image, _ = server.load_image(path)
+        stop = threading.Event()
+        errors = []
+
+        def filler():
+            try:
+                while not stop.wait(0.001):
+                    crop_cache.fill_from_full_image(path, image)
+            except Exception as exc:
+                errors.append(exc)
+
+        def evictor():
+            try:
+                while not stop.wait(0.001):
+                    crop_cache.evict_path(path)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=filler, name=f'fill-{i}') for i in range(3)]
+        threads += [threading.Thread(target=evictor, name=f'evict-{i}') for i in range(3)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.4)
+        stop.set()
+        for thread in threads:
+            thread.join(2)
+            self.assertFalse(thread.is_alive(), f'{thread.name} did not finish; deadlock')
+        self.assertFalse(errors, errors)
+
     def test_fill_waiter_times_out_and_decodes_itself(self):
         path = self.png_source('fill-timeout.png', size=(400, 300))
         started = threading.Event()
