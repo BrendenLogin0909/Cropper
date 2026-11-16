@@ -37,6 +37,7 @@ from photo_pairs import read_links, approve_link, suggestions, accept_linked
 from restore import OPERATIONS, preview_dust_marks, restore, useful_change
 import stage_files
 import crop_cache
+import bowed_edges
 
 
 HERE = Path(__file__).resolve().parent
@@ -227,7 +228,7 @@ def load_image(path: Path) -> tuple[Image.Image, dict]:
     return image, original_info
 
 
-def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspect_ratio: float | None = None) -> Image.Image:
+def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspect_ratio: float | None = None, straighten_bowed_edges: bool = True) -> Image.Image:
     corners = order_corners(points)
     width, height = image.size
     if np.any(corners[:, 0] < 0) or np.any(corners[:, 0] >= width) or np.any(corners[:, 1] < 0) or np.any(corners[:, 1] >= height):
@@ -251,6 +252,8 @@ def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspec
     matrix = cv2.getPerspectiveTransform(corners, target)
     result = cv2.warpPerspective(np.asarray(image), matrix, (out_width, out_height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     output = Image.fromarray(result)
+    if straighten_bowed_edges:
+        output = bowed_edges.straighten_bowed_print(output)
     if rotation == 90:
         output = output.transpose(Image.Transpose.ROTATE_270)
     elif rotation == -90:
@@ -263,11 +266,9 @@ def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspec
 
 
 
-
-
 def save_image(source: Path, points: list[list[float]], settings: dict, rotation: int, aspect_ratio: float | None = None) -> tuple[Path, tuple[int, int]]:
     image, info = load_image(source)
-    cropped = warp(image, points, rotation, aspect_ratio)
+    cropped = warp(image, points, rotation, aspect_ratio, bowed_edges.enabled(settings))
     destination = stage_files.file_results([source], [rendered_bytes(cropped, source.suffix, info)], 'crop')[0]
     crop_cache.evict_path(source)
     crop_cache.evict_path(destination)
@@ -1755,7 +1756,7 @@ class Handler(BaseHTTPRequestHandler):
                 image = cached['preview']
                 original_width, original_height = cached['original_size']
                 scaled = [[float(x) * image.width / original_width, float(y) * image.height / original_height] for x, y in data.get("points", [])]
-                preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"))
+                preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"), bowed_edges.enabled(data.get("settings"), data))
                 payload = io.BytesIO()
                 preview.save(payload, format="JPEG", quality=89, optimize=True)
                 self.reply(200, payload.getvalue(), "image/jpeg")

@@ -71,11 +71,13 @@ function shortcutHarness(api) {
   const listeners = [];
   const cropAspect = makeControl('SELECT', {value: 'auto'});
   const autoNext = makeControl('INPUT', {type: 'checkbox', checked: true});
+  const straightenBowed = makeControl('INPUT', {type: 'checkbox', checked: true});
   const cropAspectCustom = makeControl('INPUT', {type: 'text', value: '2:3'});
   const imageLayer = makeControl('DIV');
   const els = {
     'crop-aspect': cropAspect,
     'auto-next': autoNext,
+    'straighten-bowed-edges': straightenBowed,
     'crop-aspect-custom': cropAspectCustom,
     'crop-aspect-custom-field': makeControl('LABEL', {hidden: true}),
     'save-error': makeControl('DIV', {hidden: true}),
@@ -90,10 +92,11 @@ function shortcutHarness(api) {
   };
   cropAspect.blur = () => { if (active === cropAspect) active = body; };
   autoNext.blur = () => { if (active === autoNext) active = body; };
+  straightenBowed.blur = () => { if (active === straightenBowed) active = body; };
   cropAspectCustom.blur = () => { cropAspectCustom.blurred = true; if (active === cropAspectCustom) active = body; };
   const context = {
     state,
-    settings: {autoNext: true, aspect: 'auto', customAspect: '2:3'},
+    settings: {autoNext: true, aspect: 'auto', customAspect: '2:3', straightenBowedEdges: true},
     localStorage: {setItem() {}, getItem() { return null; }},
     api,
     formatBytes: (n) => `${n}`,
@@ -107,6 +110,7 @@ function shortcutHarness(api) {
       addEventListener(type, fn) { if (type === 'keydown') listeners.push(fn); },
       querySelector(sel) { return sel === 'dialog[open]' ? openDialog : null; },
       querySelectorAll(sel) {
+        if (sel === '#auto-next, #straighten-bowed-edges, #crop-aspect, #crop-aspect-custom') return [autoNext, straightenBowed, cropAspect, cropAspectCustom];
         if (sel === '#auto-next, #crop-aspect, #crop-aspect-custom') return [autoNext, cropAspect, cropAspectCustom];
         if (sel === '.image-tile') return [];
         return [];
@@ -241,7 +245,7 @@ function shortcutHarness(api) {
   }
   return {
     state, messages, press, dispatch, dispatchDocument, flush,
-    els, cropAspect, autoNext, cropAspectCustom, body,
+    els, cropAspect, autoNext, cropAspectCustom, straightenBowed, body,
     setActive(el) { active = el; },
     setFolderModalHidden(hidden) { folderModalHidden = hidden; },
     setOpenDialog(el) { openDialog = el; },
@@ -667,6 +671,21 @@ test('ticking Auto-next then P still predicts', async () => {
   assert.equal(h.context.predictCalls, 1);
   assert.equal(calls, 1);
   assert.equal(h.state.points[0].x, 10);
+});
+
+test('straighten bowed edges defaults on and turning it off still allows P', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  h.bindSettings();
+  assert.equal(h.context.settings.straightenBowedEdges, true);
+  h.setActive(h.straightenBowed);
+  h.straightenBowed.checked = false;
+  h.straightenBowed.dispatch('input');
+  assert.equal(h.context.settings.straightenBowedEdges, false);
+  const event = await h.press({key: 'p'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
 });
 
 const letterKeys = [

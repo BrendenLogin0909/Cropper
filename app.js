@@ -7,7 +7,7 @@ const RESTORE_INFO = {
   sharpen: { title: 'Detail & clarity', output: '1.6. TBP Auto-Improved', archive: '2. Cropped', description: 'Finds photos with faded gray tones or soft edges, then restores a measured tonal range and clarifies existing detail. Clear photos are skipped. It cannot recreate detail missing from an out-of-focus image.' }
 };
 const stored = JSON.parse(localStorage.getItem('cropper-settings') || '{}');
-const settings = { autoNext: stored.autoNext !== false, aspect: stored.aspect || 'auto', customAspect: stored.customAspect || '2:3' };
+const settings = { autoNext: stored.autoNext !== false, aspect: stored.aspect || 'auto', customAspect: stored.customAspect || '2:3', straightenBowedEdges: stored.straightenBowedEdges !== false };
 const storedMerge = JSON.parse(localStorage.getItem('cropper-merge-settings') || '{}');
 const mergeSettings = { rotation: String(storedMerge.rotation || 0), nameSource: storedMerge.nameSource || 'back' };
 const enhanceSettings = {};
@@ -396,6 +396,7 @@ function cropEnterActivatesFocusedControl(el) {
 }
 function saveSettings(event) {
   settings.autoNext = $('auto-next').checked;
+  settings.straightenBowedEdges = $('straighten-bowed-edges').checked;
   settings.aspect = $('crop-aspect').value; settings.customAspect = $('crop-aspect-custom').value.trim();
   localStorage.setItem('cropper-settings', JSON.stringify(settings));
   $('crop-aspect-custom-field').classList.toggle('hidden', settings.aspect !== 'custom');
@@ -412,6 +413,7 @@ function saveSettings(event) {
 }
 function loadSettings() {
   $('auto-next').checked = settings.autoNext;
+  $('straighten-bowed-edges').checked = settings.straightenBowedEdges !== false;
   $('crop-aspect').value = settings.aspect; $('crop-aspect-custom').value = settings.customAspect;
   const aspect = $('crop-aspect');
   const markPointer = () => { aspect._cropPointer = true; };
@@ -425,7 +427,7 @@ function loadSettings() {
       releaseCropShortcutFocus(aspect);
     }
   });
-  document.querySelectorAll('#auto-next, #crop-aspect, #crop-aspect-custom').forEach(input => input.addEventListener('input', saveSettings));
+  document.querySelectorAll('#auto-next, #straighten-bowed-edges, #crop-aspect, #crop-aspect-custom').forEach(input => input.addEventListener('input', saveSettings));
   saveSettings();
 }
 function validSettings() {
@@ -1256,11 +1258,12 @@ function scheduleLiveCropPreview() {
   $('live-preview-ratio').textContent = previewRatioLabel();
   const source = state.images[state.index];
   const points = state.points.map(point => [point.x, point.y]); const rotation = state.rotation; const aspectRatio = cropAspectRatio();
-  cropPreviewTimer = setTimeout(() => renderLiveCropPreview(ticket, source, points, rotation, aspectRatio), 180);
+  const straightenBowedEdges = settings.straightenBowedEdges !== false;
+  cropPreviewTimer = setTimeout(() => renderLiveCropPreview(ticket, source, points, rotation, aspectRatio, straightenBowedEdges), 180);
 }
-async function renderLiveCropPreview(ticket, source, points, rotation, aspectRatio) {
+async function renderLiveCropPreview(ticket, source, points, rotation, aspectRatio, straightenBowedEdges) {
   try {
-    const response = await fetch('/api/crop-preview', { method:'POST', headers:requestHeaders({'Content-Type':'application/json'}), body:JSON.stringify({path:source.path,points,rotation,aspect_ratio:aspectRatio}) });
+    const response = await fetch('/api/crop-preview', { method:'POST', headers:requestHeaders({'Content-Type':'application/json'}), body:JSON.stringify({path:source.path,points,rotation,aspect_ratio:aspectRatio,straighten_bowed_edges:straightenBowedEdges,settings:{straightenBowedEdges}}) });
     if (!response.ok) throw new Error((await response.json()).error || 'Could not make the preview.');
     const blob = await response.blob();
     if (ticket !== cropPreviewRequest) return;

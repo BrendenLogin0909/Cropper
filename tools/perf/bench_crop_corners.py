@@ -16,9 +16,11 @@ if str(ROOT) not in sys.path:
 
 from PIL import Image  # noqa: E402
 
+import bowed_edges  # noqa: E402
 import crop_cache  # noqa: E402
 import crop_detection  # noqa: E402
 import server  # noqa: E402
+from test_bowed_edges import synthetic_curved_rectangle  # noqa: E402
 from test_crop_detection import synthetic_print  # noqa: E402
 
 SIZES = ((1200, 900), (3000, 2200), (4500, 3400))
@@ -45,7 +47,8 @@ def report(label: str, samples: list[float]) -> str:
 def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     path = folder / f'synthetic_{width}x{height}.jpg'
     synthetic_print(width, height).save(path, format='JPEG', quality=90)
-    decode, resize, detect, cold, cached, opens, previews = [], [], [], [], [], [], []
+    decode, resize, detect, cold, cached, opens = [], [], [], [], [], []
+    preview_off, preview_on, warp_off, warp_on = [], [], [], []
     points = [[width * 0.18, height * 0.16], [width * 0.82, height * 0.16], [width * 0.82, height * 0.84], [width * 0.18, height * 0.84]]
     for _ in range(runs):
         crop_cache.reset()
@@ -83,11 +86,15 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
         original_size = filled['original_size']
         scaled = [[x * preview_src.width / original_size[0], y * preview_src.height / original_size[1]] for x, y in points]
 
-        def do_preview():
-            warped = server.warp(preview_src, scaled, 0, None)
+        def encode_preview(straighten):
+            warped = server.warp(preview_src, scaled, 0, None, straighten)
             buf = BytesIO()
             warped.save(buf, format='JPEG', quality=89, optimize=True)
-        previews.append(time_ms(do_preview))
+
+        preview_off.append(time_ms(lambda: encode_preview(False)))
+        preview_on.append(time_ms(lambda: encode_preview(True)))
+        warp_off.append(time_ms(lambda: server.warp(image, points, 0, None, False)))
+        warp_on.append(time_ms(lambda: server.warp(image, points, 0, None, True)))
 
         crop_cache.reset()
         cold.append(time_ms(lambda: crop_cache.predict_cached(path, None, foreground=True)))
@@ -98,9 +105,27 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     print(report('resize-960', resize))
     print(report('detect', detect))
     print(report('open', opens))
-    print(report('preview-1400', previews))
+    print(report('preview-off', preview_off))
+    print(report('preview-on', preview_on))
+    print(report('warp-off', warp_off))
+    print(report('warp-on', warp_on))
     print(report('server cold', cold))
     print(report('server cached', cached))
+    print()
+
+
+def bench_bowed(width: int, height: int, runs: int) -> None:
+    image, corners = synthetic_curved_rectangle(width, height, margin=max(48, min(width, height) // 12), bow=max(18, min(width, height) // 40))
+    warped = server.warp(image, corners, straighten_bowed_edges=False)
+    strips, remaps = [], []
+    for _ in range(runs):
+        def do_strips():
+            do_strips.curves = bowed_edges.detect_edge_curves(warped)
+        strips.append(time_ms(do_strips))
+        remaps.append(time_ms(lambda: bowed_edges.straighten_bowed_print(warped)))
+    print(f'## bowed-edge {width}x{height}')
+    print(report('edge-strips', strips))
+    print(report('remap', remaps))
     print()
 
 
@@ -112,11 +137,18 @@ def main() -> int:
     parser.add_argument('--runs', type=int, default=7, help='repetitions per size')
     args = parser.parse_args()
     print(f'Synthetic crop-corner bench, runs={args.runs}')
-    print('Fixtures stay in a temp dir and are deleted afterwards.\n')
+    print('Fixtures stay in a temp dir and are deleted afterwards.')
+    print('server cold is full-decode predict (bowed flag is not in the cache key).')
+    print('preview-off matches 26e94c5 live preview; preview-on adds the curve warp.')
+    print('edge-strips budget is ≤ 400 ms / image on top of that full decode.\n')
     with tempfile.TemporaryDirectory(prefix='cropper-bench-') as raw:
         folder = Path(raw)
         for width, height in SIZES:
             bench_size(width, height, max(1, args.runs), folder)
+        print('## bowed-edge strip checks (budget ≤ 400 ms / image)')
+        print()
+        for width, height in SIZES:
+            bench_bowed(width, height, max(1, args.runs))
     return 0
 
 

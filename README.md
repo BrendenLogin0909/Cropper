@@ -56,7 +56,10 @@ Whole image (W) selects the full frame (Ctrl+Shift+A is an alternate). Re-crop f
 
 Choose output proportions using the physical print size when known. Perspective
 corners alone cannot establish the correct aspect ratio. The live preview helps
-check proportions before writing a full-resolution image.
+check proportions before writing a full-resolution image. Straighten bowed edges
+is on by default: after the four-corner warp, Cropper follows a quadratic fit of
+each print edge (with a capped trim if the fit is poor). Turn it off in Save
+settings for the previous homography-only crop. Preview and save share that path.
 
 ## Front + Back
 
@@ -140,5 +143,8 @@ python tools/perf/bench_crop_corners.py --runs 7
 ```
 
 It prints p50/p95 for decode, 960 px resize, detect, open (JPEG response path,
-before preview-cache fill), live-preview warp of the cached 1400 px image, and
-cold vs cached server time at 1200×900, 3000×2200 and 4500×3400.
+before preview-cache fill), live-preview warp of the cached 1400 px image with
+and without bowed-edge straighten, cold vs cached server predict, and warp on/off
+at 1200×900, 3000×2200 and 4500×3400, then edge-strip and remap times for
+synthetic bowed rectangles (budget ≤ 400 ms per image for the strip check, on
+top of the full-decode cold predict).

@@ -40,8 +40,14 @@ in-flight request. Switching photo or folder also aborts; begin-batch/folder
 change resets the server caches and prefetch queue. Saving a crop, restore, or
 enhance evicts that resolved path from both LRUs, and the client Map drops that
 path so the next P refetches. Save/export still uses the full-resolution decode.
-Run `python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.
+After the homography, warp may follow bowed print edges (quadratic per edge,
+Coons remap, capped trim on a poor fit). That step is on by default and skipped
+when the toggle is off, so the off path matches the previous warp. The flag is
+not part of the corner-prediction cache key. Run
+`python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.
 
 ## PLAN
 
-Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal; follow-up (re-measure with step 3 curve warp).
+Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal;
+re-measure with step 3 curve warp (synthetic cache-hit preview-1400 with the
+remap is reported in the bowed-edges PR).
