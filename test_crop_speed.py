@@ -10,6 +10,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import numpy as np
 from PIL import Image
 
 import app_settings
@@ -264,13 +265,13 @@ class CropSpeedTests(unittest.TestCase):
             self.assertTrue(release_error.wait(4), 'error was not released')
             raise RuntimeError('fill exploded')
 
-        def wrapped_wait(wait_path, timeout=None):
+        def wrapped_wait(wait_path, timeout=None, **kwargs):
             resolved = crop_cache._resolved_str(wait_path)
             with crop_cache._fill_lock:
                 inflight = crop_cache._inflight_fills.get(resolved)
             if inflight is not None:
                 waiter_waiting.set()
-            return real_wait(wait_path, timeout)
+            return real_wait(wait_path, timeout, **kwargs)
 
         leader_errors = []
         waiter_errors = []
@@ -566,6 +567,105 @@ class CropSpeedTests(unittest.TestCase):
         cached = crop_cache.RESULT_CACHE.get(path, None)
         self.assertIsNotNone(cached)
         self.assertIn('candidates', cached)
+
+    def test_predict_returns_after_detect_before_preview(self):
+        """A predict waiting on an in-flight fill returns once 960 is published.
+
+        The 1400 build stays blocked. Fail-old on 3180cdc: detect and preview
+        were one put, so blocking the 1400 resize also blocked the 960 publish.
+        """
+        path = self.jpeg_source('detect-first.jpg', (2400, 1800))
+        image, _ = server.load_image(path)
+        started = threading.Event()
+        release = threading.Event()
+        predicted = []
+        errors = []
+
+        if hasattr(crop_cache, '_preview_resize'):
+            real = crop_cache._preview_resize
+
+            def blocked_preview(img):
+                started.set()
+                self.assertTrue(release.wait(6), 'preview resize was not released')
+                return real(img)
+
+            patch_target = (crop_cache, '_preview_resize', blocked_preview)
+        else:
+            real_thumb = Image.Image.thumbnail
+
+            def blocked_thumb(self_img, size, resample=Image.Resampling.BICUBIC, **kwargs):
+                if size == (crop_cache.PREVIEW_SIZE, crop_cache.PREVIEW_SIZE):
+                    started.set()
+                    self.assertTrue(release.wait(6), 'preview thumbnail was not released')
+                return real_thumb(self_img, size, resample, **kwargs)
+
+            patch_target = (Image.Image, 'thumbnail', blocked_thumb)
+
+        with patch.object(*patch_target):
+            def leader():
+                try:
+                    crop_cache.fill_from_full_image_exclusive(path, image)
+                except Exception as exc:
+                    errors.append(exc)
+
+            lead = threading.Thread(target=leader)
+            lead.start()
+            self.assertTrue(started.wait(5), '1400 preview build never started')
+
+            def predict():
+                try:
+                    predicted.append(crop_cache.predict_cached(path, None, foreground=True))
+                except Exception as exc:
+                    errors.append(exc)
+
+            predictor = threading.Thread(target=predict)
+            predictor.start()
+            predictor.join(4)
+            self.assertFalse(errors, errors)
+            self.assertTrue(predicted, 'predict did not return while the 1400 build was blocked')
+            cached = crop_cache.IMAGE_CACHE.get(path)
+            self.assertIsNotNone(cached)
+            self.assertIsNotNone(cached['detect'])
+            self.assertIsNone(cached['preview'], '1400 preview was published before predict returned')
+            self.assertTrue(lead.is_alive(), 'fill finished before predict used the 960 entry')
+            release.set()
+            lead.join(6)
+            predictor.join(2)
+            self.assertFalse(lead.is_alive())
+            self.assertFalse(errors, errors)
+            full, _ = server.load_image(path)
+            expected = crop_detection.predict_corners(full)
+            self.assertEqual(predicted[0]['candidates'], expected['candidates'])
+
+    def test_evict_between_detect_and_preview_leaves_nothing_stale(self):
+        path = self.jpeg_source('evict-between.jpg', (2400, 1800))
+        image, _ = server.load_image(path)
+        before = crop_cache.file_identity(path)
+        real = crop_cache._preview_resize
+        evicted = []
+
+        def evict_then_resize(img):
+            cached = crop_cache.IMAGE_CACHE.get(path)
+            evicted.append(cached is not None and cached['detect'] is not None)
+            crop_cache.evict_path(path)
+            return real(img)
+
+        with patch.object(crop_cache, '_preview_resize', evict_then_resize):
+            crop_cache.fill_from_full_image(path, image)
+        self.assertTrue(evicted and evicted[0], '960 entry was not published before the 1400 build')
+        self.assertEqual(crop_cache.file_identity(path), before)
+        self.assertIsNone(crop_cache.IMAGE_CACHE.get(path))
+        self.assertFalse(crop_cache.IMAGE_CACHE.contains_resolved(str(path.resolve())))
+
+    def test_preview_resize_stays_close_to_lanczos(self):
+        image = synthetic_print(3000, 2200)
+        lanczos = image.copy()
+        lanczos.thumbnail((crop_cache.PREVIEW_SIZE, crop_cache.PREVIEW_SIZE), Image.Resampling.LANCZOS)
+        area = crop_cache._preview_resize(image)
+        self.assertEqual(area.size, lanczos.size)
+        diff = float(np.abs(np.asarray(area, dtype=np.int16) - np.asarray(lanczos, dtype=np.int16)).mean())
+        # Measured INTER_AREA vs LANCZOS on synthetic_print 3000×2200: 0.389. Bound ~2×.
+        self.assertLess(diff, 0.8, f'preview MAE {diff:.3f}')
 
     def test_decoded_preview_cache_evicts_at_memory_cap(self):
         tiny = crop_cache.ImagePreviewCache(memory_cap=20_000)

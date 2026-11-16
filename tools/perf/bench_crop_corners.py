@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 import tempfile
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -53,7 +54,7 @@ def report(label: str, samples: list[float]) -> str:
 def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     path = folder / f'synthetic_{width}x{height}.jpg'
     synthetic_print(width, height).save(path, format='JPEG', quality=90)
-    decode, resize, detect, cold, cached, opens = [], [], [], [], [], []
+    decode, resize, detect, cold, cold_open, cached, opens = [], [], [], [], [], [], []
     preview_off, preview_on, warp_off, warp_on = [], [], [], []
     points = [[width * 0.18, height * 0.16], [width * 0.82, height * 0.16], [width * 0.82, height * 0.84], [width * 0.18, height * 0.84]]
     for _ in range(runs):
@@ -103,6 +104,20 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
         warp_on.append(time_ms(lambda: server.warp(image, points, 0, None, True)))
 
         crop_cache.reset()
+        opened_for_press, _ = server.load_image(path)
+
+        def do_cold_open():
+            filler = threading.Thread(
+                target=crop_cache.fill_from_full_image_exclusive,
+                args=(path, opened_for_press),
+                daemon=True,
+            )
+            filler.start()
+            crop_cache.predict_cached(path, None, foreground=True)
+            filler.join()
+
+        cold_open.append(time_ms(do_cold_open))
+        crop_cache.reset()
         cold.append(time_ms(lambda: crop_cache.predict_cached(path, None, foreground=True)))
         cached.append(time_ms(lambda: crop_cache.predict_cached(path, None, foreground=True)))
 
@@ -115,6 +130,7 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     print(report('preview-on', preview_on))
     print(report('warp-off', warp_off))
     print(report('warp-on', warp_on))
+    print(report('cold-open', cold_open))
     print(report('server cold', cold))
     print(report('server cached', cached))
     print()
@@ -152,6 +168,7 @@ def main() -> int:
     print(f'Synthetic crop-corner bench, runs={args.runs}')
     print('Fixtures stay in a temp dir and are deleted afterwards.')
     print('server cold is full-decode predict (bowed flag is not in the cache key).')
+    print('cold-open is predict pressed immediately after open, overlapping the in-flight fill.')
     print('preview-off matches 26e94c5 live preview; preview-on adds the conservative warp.')
     print('straight warp-on extra vs off target ≤ +50 ms (no-qualify ≈ zero remap).')
     print('bowed warp-on extra vs off target ≤ +500 ms p95 at 4500 px.\n')
