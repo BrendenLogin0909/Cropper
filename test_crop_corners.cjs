@@ -6,11 +6,17 @@ const code=fs.readFileSync(__dirname+'/app.js','utf8');
 function harness(api) {
   const state={index:0,width:600,height:400,busy:false,requestId:1,points:[],images:[{path:'photo.jpg',modified:1}]};
   const messages=[];
-  const context={state,api,$:()=>({classList:{contains:()=>false}}),endZoom(){},updateControls(){},renderOverlay(){},toast:m=>messages.push(m)};
+  const context={state,api,$:()=>({classList:{contains:()=>false}}),endZoom(){},updateControls(){},renderOverlay(){},toast:m=>messages.push(m),Map,AbortController,JSON,Set};
   vm.createContext(context);
-  vm.runInContext(code.slice(code.indexOf('let cropPredictionCache ='),code.indexOf('function selectWholeImage(')),context);
+  vm.runInContext(code.slice(code.indexOf('const CROP_PREDICTION_CACHE_LIMIT'),code.indexOf('function selectWholeImage(')),context);
   return {state,messages,predict:()=>vm.runInContext('predictCropCorners()',context),clear:()=>vm.runInContext('clearCropPoints()',context)};
 }
+test('client prediction cache is a bounded Map and predict passes an AbortSignal',()=>{
+  assert.match(code,/CROP_PREDICTION_CACHE_LIMIT = 32/);
+  assert.match(code,/cropPredictionCache = new Map/);
+  assert.match(code,/signal: controller.signal/);
+  assert.match(code,/cropPredictionAbort.abort/);
+});
 test('cycles candidates without additional requests; clears all points',async()=>{
   let calls=0;
   const h=harness(async()=>{calls++;return {candidates:[{points:[[10,10],[300,10],[300,300],[10,300]]},{points:[[320,10],[550,10],[550,300],[320,300]]}]};});
@@ -39,6 +45,22 @@ test('late predict for image A is dropped after image B is current',async()=>{
   h.state.images[0]={path:'other.jpg',modified:2};
   h.state.width=800;h.state.height=600;
   release({candidates:[{points:[[1,1],[2,1],[2,2],[1,2]]}]});await request;
+  assert.equal(h.state.points.length,0);
+});
+test('cancelled predict aborts the in-flight request',async()=>{
+  let abortSeen=false;
+  const h=harness((url,body,options)=>new Promise((_,reject)=>{
+    const signal=options&&options.signal;
+    if(!signal)return;
+    const fail=()=>{abortSeen=true;const error=new Error('The operation was aborted.');error.name='AbortError';reject(error);};
+    if(signal.aborted){fail();return;}
+    signal.addEventListener('abort',fail);
+  }));
+  h.state.images=[{path:'photo.jpg',modified:1,bytes:10}];
+  const request=h.predict();
+  h.clear();
+  await request;
+  assert.equal(abortSeen,true);
   assert.equal(h.state.points.length,0);
 });
 test('old backend gives an explicit restart message without modifying points',async()=>{

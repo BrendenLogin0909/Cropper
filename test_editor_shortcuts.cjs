@@ -125,6 +125,11 @@ function shortcutHarness(api) {
     updateControls() {},
     renderOverlay() {},
     toast: (message) => messages.push(message),
+    Map,
+    AbortController,
+    JSON,
+    Set,
+    Promise,
     startZoom() {},
     openImage() {},
     cropSave() { context.saveCalls += 1; },
@@ -140,7 +145,7 @@ function shortcutHarness(api) {
   vm.runInContext(extractBlock(code, 'function saveSettings') + ';', context);
   vm.runInContext(extractBlock(code, 'async function openImage') + ';', context);
   vm.runInContext(
-    code.slice(code.indexOf('let cropPredictionCache ='), code.indexOf('async function cropSave(')),
+    code.slice(code.indexOf('const CROP_PREDICTION_CACHE_LIMIT'), code.indexOf('async function cropSave(')),
     context,
   );
   vm.runInContext(extractBlock(code, "document.addEventListener('keydown'") + ');', context);

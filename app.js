@@ -312,13 +312,13 @@ async function ensureOverwriteConfirmed(paths, operation) {
   }
   return extra;
 }
-async function api(path, body) {
+async function api(path, body, options = {}) {
   if ((body?.stage_routing || body?.settings?.stage_routing || path === '/api/stage-finish') && !state.stageRoutingAvailable) {
     throw new Error('Flat stage routing needs the updated server. Finish active batches, restart Cropper on 8767, then refresh. No request was sent.');
   }
   let payload = body;
   for (;;) {
-    const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: requestHeaders(payload === null || payload === undefined ? {} : { 'Content-Type': 'application/json' }), ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }) });
+    const response = await fetch(path, { method: payload === undefined ? 'GET' : 'POST', headers: requestHeaders(payload === null || payload === undefined ? {} : { 'Content-Type': 'application/json' }), ...(payload === undefined || payload === null ? {} : { body: JSON.stringify(payload) }), ...(options.signal ? { signal: options.signal } : {}) });
     const data = await response.json();
     if (response.status === 409 && payload && typeof payload === 'object' && data.code === 'overwrite_confirmation_required') {
       const token = data.confirmation_token;
@@ -1026,6 +1026,8 @@ async function openImage(index) {
     $('empty-state').classList.add('hidden'); $('image-layer').classList.remove('hidden');
     $('image-subtitle').textContent = `${info.width.toLocaleString()} × ${info.height.toLocaleString()} px  ·  ${formatBytes(item.bytes)}`;
     fitImage(); renderOverlay(); updateControls();
+    const neighbor = state.images[index + 1];
+    Promise.resolve(api('/api/crop-prefetch', {paths: [item.path, neighbor && neighbor.path].filter(Boolean)})).catch(() => {});
   } catch (error) {
     if (ticket !== state.requestId) return;
     state.width = 0; state.height = 0;
@@ -1099,43 +1101,81 @@ function startZoom() {
   layer.style.transformOrigin = `${x}px ${y}px`; layer.style.transform = 'scale(3)'; state.zoom = true; $('zoom-label').classList.remove('hidden');
 }
 function endZoom() { state.zoom = false; $('image-layer').style.transform = 'scale(1)'; $('zoom-label').classList.add('hidden'); }
-let cropPredictionCache = null;
+const CROP_PREDICTION_CACHE_LIMIT = 32;
+const cropPredictionCache = new Map();
 let cropPredictionBusy = false;
 let cropPredictionRequest = 0;
+let cropPredictionAbort = null;
+function predictionCacheKey(item, target) {
+  return JSON.stringify([item.path, item.modified, item.bytes, target]);
+}
+function predictionBaseKey(item) {
+  return JSON.stringify([item.path, item.modified, item.bytes]);
+}
+function rememberPrediction(entry) {
+  cropPredictionCache.delete(entry.key);
+  cropPredictionCache.set(entry.key, entry);
+  while (cropPredictionCache.size > CROP_PREDICTION_CACHE_LIMIT) {
+    cropPredictionCache.delete(cropPredictionCache.keys().next().value);
+  }
+}
+function forgetCurrentPrediction(item) {
+  if (!item) { cropPredictionCache.clear(); return; }
+  const base = predictionBaseKey(item);
+  for (const [key, entry] of [...cropPredictionCache]) {
+    if (entry.baseKey === base) cropPredictionCache.delete(key);
+  }
+}
+function invalidateInFlightPredict() {
+  cropPredictionRequest++;
+  if (cropPredictionAbort) { cropPredictionAbort.abort(); cropPredictionAbort = null; }
+}
 async function predictCropCorners() {
   if (state.index < 0 || !state.width || state.busy || cropPredictionBusy || $('image-layer').classList.contains('hidden')) return;
   const item = state.images[state.index], ticket = state.requestId, imageToken = `${item.path}\0${item.modified}`;
   const target = state.points.length === 1 ? [state.points[0].x,state.points[0].y] : null;
-  const baseKey = JSON.stringify([item.path,item.modified]);
-  const key = JSON.stringify([baseKey,target]);
+  const baseKey = predictionBaseKey(item);
+  const key = predictionCacheKey(item, target);
   endZoom();
   cropPredictionBusy = true; updateControls();
+  if (cropPredictionAbort) cropPredictionAbort.abort();
+  const controller = new AbortController();
+  cropPredictionAbort = controller;
   const request = ++cropPredictionRequest;
   const stale = () => ticket !== state.requestId || request !== cropPredictionRequest || `${state.images[state.index]?.path}\0${state.images[state.index]?.modified}` !== imageToken;
   try {
-    if (!cropPredictionCache || cropPredictionCache.baseKey !== baseKey || (target && cropPredictionCache.key !== key)) {
+    let cache = cropPredictionCache.get(key);
+    if (!cache || (target && cache.key !== key)) {
+      cache = [...cropPredictionCache.values()].find(entry => entry.baseKey === baseKey && (!target || entry.key === key));
+    }
+    if (!cache || (target && cache.key !== key)) {
       let result;
-      try { result = await api('/api/crop-corners', {path:item.path,target}); }
+      try { result = await api('/api/crop-corners', {path:item.path,target}, {signal: controller.signal}); }
       catch (error) {
+        if (error && (error.name === 'AbortError' || error.message === 'The operation was aborted.')) return;
         if (error.message === 'Not found.') throw new Error('The new corner detector needs an idle Cropper backend restart. F5 alone cannot activate it.');
         throw error;
       }
       if (stale()) return;
-      cropPredictionCache = {key,baseKey,candidates:result.candidates,index:-1};
+      cache = {key,baseKey,candidates:result.candidates,index:-1};
+      rememberPrediction(cache);
     }
     if (stale()) return;
-    const cache = cropPredictionCache;
     if (!cache.candidates.length) { toast('No reliable print outline found. Place corners manually; no points were changed.',true); return; }
     cache.index = (cache.index+1) % cache.candidates.length;
     state.points = cache.candidates[cache.index].points.map(([x,y]) => ({x:Math.max(0,Math.min(state.width-1,x)),y:Math.max(0,Math.min(state.height-1,y))}));
     renderOverlay(); updateControls();
     toast(`Outline ${cache.index+1} of ${cache.candidates.length}. P cycles alternatives; C or Ctrl+Q clears. Always check the corners.`);
-  } catch (error) { toast(error.message,true); }
-  finally { cropPredictionBusy = false; updateControls(); }
+  } catch (error) {
+    if (error && (error.name === 'AbortError' || error.message === 'The operation was aborted.')) return;
+    toast(error.message,true);
+  }
+  finally { if (cropPredictionAbort === controller) cropPredictionAbort = null; cropPredictionBusy = false; updateControls(); }
 }
 function clearCropPoints() {
   if (state.busy) return;
-  cropPredictionRequest++; cropPredictionCache = null;
+  invalidateInFlightPredict();
+  forgetCurrentPrediction(state.images[state.index]);
   state.points = []; endZoom(); renderOverlay(); updateControls();
 }
 function cropImageReady() {
@@ -1143,7 +1183,7 @@ function cropImageReady() {
 }
 function undoCropPoint() {
   if (state.busy) return;
-  cropPredictionRequest++;
+  invalidateInFlightPredict();
   state.points.pop();
   renderOverlay(); updateControls();
 }
@@ -1156,7 +1196,7 @@ function rotateCrop(delta) {
 }
 function selectWholeImage() {
   if (!cropImageReady() || !state.height || state.busy) return;
-  cropPredictionRequest++;
+  invalidateInFlightPredict();
   state.points = [{ x: 0, y: 0 }, { x: state.width - 1, y: 0 }, { x: state.width - 1, y: state.height - 1 }, { x: 0, y: state.height - 1 }];
   renderOverlay(); updateControls();
 }
