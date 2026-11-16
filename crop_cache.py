@@ -154,6 +154,8 @@ _prefetch_started = False
 _foreground = 0
 _foreground_lock = threading.Lock()
 _abort = threading.Event()
+# Lock order: _fill_lock, then IMAGE_CACHE._lock / RESULT_CACHE._lock.
+# Never acquire an LRU lock and then _fill_lock.
 _fill_lock = threading.Lock()
 _inflight_fills: dict[str, '_FillFlight'] = {}
 _evict_generation: dict[str, int] = {}
@@ -199,24 +201,21 @@ def _put_if_current(
     The cache key is the identity captured when the fill started, never a
     fresh file_identity() at put time. Recomputing the key here would store
     old pixels under a new mtime/size after a mid-fill overwrite.
+
+    Re-stat, generation check, and IMAGE_CACHE.put share _fill_lock so a
+    same-identity evict_path cannot land between the check and the put.
     """
     resolved = _resolved_str(path)
-    try:
-        current = file_identity(path)
-    except OSError:
-        return False
     with _fill_lock:
+        try:
+            current = file_identity(path)
+        except OSError:
+            return False
         now = _generation(resolved)
-    if identity is None or current != identity or now != generation:
-        return False
-    IMAGE_CACHE.put(path, detect, preview, original_size, identity=identity)
-    return True
-
-
-def _bump_evict(resolved: str) -> _FillFlight | None:
-    with _fill_lock:
-        _evict_generation[resolved] = _evict_generation.get(resolved, 0) + 1
-        return _inflight_fills.pop(resolved, None)
+        if identity is None or current != identity or now != generation:
+            return False
+        IMAGE_CACHE.put(path, detect, preview, original_size, identity=identity)
+        return True
 
 
 def _release_inflight(resolved: str, flight: _FillFlight) -> None:
@@ -224,14 +223,6 @@ def _release_inflight(resolved: str, flight: _FillFlight) -> None:
     with _fill_lock:
         if _inflight_fills.get(resolved) is flight:
             del _inflight_fills[resolved]
-
-
-def _clear_inflight() -> None:
-    with _fill_lock:
-        flights = list(_inflight_fills.values())
-        _inflight_fills.clear()
-    for flight in flights:
-        flight.done.set()
 
 
 def wait_for_pending_fill(path: Path, timeout: float | None = None) -> bool:
@@ -250,8 +241,6 @@ def wait_for_pending_fill(path: Path, timeout: float | None = None) -> bool:
 
 def reset() -> None:
     global _foreground, _prefetch_generation, _global_evict_generation
-    IMAGE_CACHE.clear()
-    RESULT_CACHE.clear()
     with _prefetch_cv:
         _prefetch_queue.clear()
         _prefetch_generation += 1
@@ -262,16 +251,28 @@ def reset() -> None:
     with _fill_lock:
         _global_evict_generation += 1
         _evict_generation.clear()
-    _clear_inflight()
+        IMAGE_CACHE.clear()
+        RESULT_CACHE.clear()
+        flights = list(_inflight_fills.values())
+        _inflight_fills.clear()
+    for flight in flights:
+        flight.done.set()
 
 
 def evict_path(path: Path) -> None:
-    """Drop both LRUs for a resolved path after our own write."""
+    """Drop both LRUs for a resolved path after our own write.
+
+    Bump generation under _fill_lock before touching the LRU so a fill
+    cannot put start-identity pixels after this evict (lock order:
+    _fill_lock then IMAGE_CACHE._lock / RESULT_CACHE._lock).
+    """
     resolved = str(Path(path).resolve())
-    IMAGE_CACHE.evict_resolved(resolved)
-    RESULT_CACHE.evict_resolved(resolved)
     _abort.set()
-    flight = _bump_evict(resolved)
+    with _fill_lock:
+        _evict_generation[resolved] = _evict_generation.get(resolved, 0) + 1
+        flight = _inflight_fills.pop(resolved, None)
+        IMAGE_CACHE.evict_resolved(resolved)
+        RESULT_CACHE.evict_resolved(resolved)
     if flight is not None:
         flight.done.set()
 
