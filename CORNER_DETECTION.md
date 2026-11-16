@@ -45,10 +45,23 @@ image) aborts the in-flight request. Switching photo or folder also aborts;
 begin-batch/folder change resets the server caches and prefetch queue. Saving a
 crop, restore, or enhance evicts that resolved path from both LRUs, and the
 client Map drops that path so the next P refetches. Save/export still uses the
-full-resolution decode. After the homography, warp may follow bowed print edges
-(quadratic per edge, Coons remap, capped trim on a poor fit). **Straighten
-bowed edges is on by default.** It runs after the four-corner warp on both
-preview and save. Turn it off in Save settings (the checkbox is stored in
+full-resolution decode. After the homography, warp may follow bowed print edges.
+**Straighten bowed edges is on by default.** It runs after the four-corner warp
+on both preview and save. An edge remaps only with all three of: a scanner-bed
+Lab band outside the fitted curve along ≥ ~30% of the side (`BACKGROUND_DE` 14,
+`BACKGROUND_BAND_FRAC` 0.30; background = median Lab of a ≤ `BACKGROUND_MAX`
+(400 px) copy of the source outside a dilated quad), full-resolution bow depth
+≥ `BOW_DEPTH_PX` (4 px), and consistent
+inward sag (`SIGN_FRAC` 0.80). Picture-content gradients never count.
+Unqualified edges stay exactly straight; if none qualify, output is
+byte-identical to OFF. Poor quadratic fit is left straight — **there is no
+trim**, even when the background match is strong. Fitted depth is clipped to
+`DEPTH_CAP_FRAC` (3% of the side). If any pixel would move more than
+`DISPLACEMENT_CAP_FRAC` (2% of the side), that edge is skipped (straight warp).
+Predicted extra area loss above `AREA_LOSS_FRAC` (0.5%) also skips the edge.
+The ≤800 px estimate is refined at full resolution in a `REFINE_BAND_PX` (6 px,
+widened by the downsample scale) band; remap is restricted to the affected
+edge band. Turn it off in Save settings (the checkbox is stored in
 localStorage like auto-next). **Off matches the previous homography-only
 output** (byte-identical to the crop-speed warp). The flag is not part of the
 corner-prediction cache key. Run
@@ -64,5 +77,18 @@ docs.
 ## PLAN
 
 Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal;
-re-measure with step 3 curve warp (synthetic cache-hit preview-1400 with the
-remap is reported in the bowed-edges PR).
+re-measure with the conservative bow remap (synthetic cache-hit preview-1400
+and 4500 px save extra are reported in the bowed-edges PR). Target ≤ +50 ms p95
+on a straight save (no-qualify ≈ zero remap) and ≤ +0.5 s p95 extra on a 4500 px
+bowed save.
+
+## TESTING
+
+Synthetic fixtures only in-repo. False-positive cases (stripes, dark/light
+blocks, horizon near the border, bright sky at top) have content to the print
+edges and no background band outside; ON must be byte-identical to OFF, with
+area loss ≤ 0.1%. A qualifying bowed print on scanner background with a thin
+varying streak must leave a residual streak ≤ 2 px at save scale, and extra
+area loss ≤ 0.5%. Preview-vs-save bounds stay MAE < 0.5, corner max ≤ 6.0 px,
+curve p95 ≤ 5.0 px (measured 4500×3400 MAE 0.208 / corner 4.24 / curve p95 3.00).
+Real-scan validation is local and off-repo.

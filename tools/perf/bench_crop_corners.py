@@ -24,6 +24,12 @@ from test_bowed_edges import synthetic_curved_rectangle  # noqa: E402
 from test_crop_detection import synthetic_print  # noqa: E402
 
 SIZES = ((1200, 900), (3000, 2200), (4500, 3400))
+# Single-edge bows that qualify: ≥ BOW_DEPTH_PX, ≤ 2% displacement, ≤ 0.5% area.
+BOW_FIXTURES = {
+    (1200, 900): (80, 4.5),
+    (3000, 2200): (180, 12),
+    (4500, 3400): (280, 18),
+}
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -115,15 +121,22 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
 
 
 def bench_bowed(width: int, height: int, runs: int) -> None:
-    image, corners = synthetic_curved_rectangle(width, height, margin=max(48, min(width, height) // 12), bow=max(18, min(width, height) // 40))
+    margin, bow = BOW_FIXTURES[(width, height)]
+    image, corners = synthetic_curved_rectangle(width, height, margin=margin, bow=bow, sides=('top',))
     warped = server.warp(image, corners, straighten_bowed_edges=False)
-    strips, remaps = [], []
+    background = bowed_edges.scanner_background_lab(image, corners)
+    warp_off, warp_on, strips, remaps = [], [], [], []
     for _ in range(runs):
+        warp_off.append(time_ms(lambda: server.warp(image, corners, straighten_bowed_edges=False)))
+        warp_on.append(time_ms(lambda: server.warp(image, corners, straighten_bowed_edges=True)))
+
         def do_strips():
-            do_strips.curves = bowed_edges.detect_edge_curves(warped)
+            do_strips.curves = bowed_edges.detect_edge_curves(warped, background)
         strips.append(time_ms(do_strips))
-        remaps.append(time_ms(lambda: bowed_edges.straighten_bowed_print(warped)))
-    print(f'## bowed-edge {width}x{height}')
+        remaps.append(time_ms(lambda: bowed_edges.straighten_bowed_print(warped, background)))
+    print(f'## bowed-edge {width}x{height} (bow={bow}px top)')
+    print(report('warp-off', warp_off))
+    print(report('warp-on', warp_on))
     print(report('edge-strips', strips))
     print(report('remap', remaps))
     print()
@@ -139,13 +152,14 @@ def main() -> int:
     print(f'Synthetic crop-corner bench, runs={args.runs}')
     print('Fixtures stay in a temp dir and are deleted afterwards.')
     print('server cold is full-decode predict (bowed flag is not in the cache key).')
-    print('preview-off matches 26e94c5 live preview; preview-on adds the curve warp.')
-    print('edge-strips budget is ≤ 400 ms / image on top of that full decode.\n')
+    print('preview-off matches 26e94c5 live preview; preview-on adds the conservative warp.')
+    print('straight warp-on extra vs off target ≤ +50 ms (no-qualify ≈ zero remap).')
+    print('bowed warp-on extra vs off target ≤ +500 ms p95 at 4500 px.\n')
     with tempfile.TemporaryDirectory(prefix='cropper-bench-') as raw:
         folder = Path(raw)
         for width, height in SIZES:
             bench_size(width, height, max(1, args.runs), folder)
-        print('## bowed-edge strip checks (budget ≤ 400 ms / image)')
+        print('## bowed-edge warp (qualifying single-edge bow; skip if no evidence)')
         print()
         for width, height in SIZES:
             bench_bowed(width, height, max(1, args.runs))

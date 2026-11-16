@@ -250,10 +250,12 @@ def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspec
         raise ValueError("The crop is too large to process safely.")
     target = np.float32([[0, 0], [out_width - 1, 0], [out_width - 1, out_height - 1], [0, out_height - 1]])
     matrix = cv2.getPerspectiveTransform(corners, target)
-    result = cv2.warpPerspective(np.asarray(image), matrix, (out_width, out_height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    source_rgb = np.asarray(image)
+    result = cv2.warpPerspective(source_rgb, matrix, (out_width, out_height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     output = Image.fromarray(result)
     if straighten_bowed_edges:
-        output = bowed_edges.straighten_bowed_print(output)
+        background = bowed_edges.scanner_background_lab(image, corners, rgb=source_rgb)
+        output = bowed_edges.straighten_bowed_print(output, background_lab=background)
     if rotation == 90:
         output = output.transpose(Image.Transpose.ROTATE_270)
     elif rotation == -90:

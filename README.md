@@ -57,8 +57,11 @@ Whole image (W) selects the full frame (Ctrl+Shift+A is an alternate). Re-crop f
 Choose output proportions using the physical print size when known. Perspective
 corners alone cannot establish the correct aspect ratio. The live preview helps
 check proportions before writing a full-resolution image. Straighten bowed edges
-is on by default: after the four-corner warp, Cropper follows a quadratic fit of
-each print edge (with a capped trim if the fit is poor). Turn it off in Save
+is on by default: after the four-corner warp, Cropper remaps an edge only when a
+scanner-background band, a full-resolution bow, and a consistent inward sag all
+agree. Picture content at the border is not treated as an edge. A poor fit is
+left straight (no trim). Depth is capped at 3% of the side; an edge that would
+move any pixel more than 2% of the side is skipped. Turn it off in Save
 settings to get the previous homography-only crop; off is byte-identical to that
 older output. Preview and save share that path. No downscaled remap on save.
 
@@ -146,6 +149,6 @@ python tools/perf/bench_crop_corners.py --runs 7
 It prints p50/p95 for decode, 960 px resize, detect, open (JPEG response path,
 before preview-cache fill), live-preview warp of the cached 1400 px image with
 and without bowed-edge straighten, cold vs cached server predict, and warp on/off
-at 1200×900, 3000×2200 and 4500×3400, then edge-strip and remap times for
-synthetic bowed rectangles (budget ≤ 400 ms per image for the strip check, on
-top of the full-decode cold predict).
+at 1200×900, 3000×2200 and 4500×3400, then warp-off/on plus strip and remap times
+for synthetic bowed rectangles that qualify (target ≤ +50 ms p95 extra on a
+straight save; ≤ +0.5 s p95 extra on a 4500 px bowed save).
