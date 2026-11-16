@@ -1095,7 +1095,7 @@ async function predictCropCorners() {
     cache.index = (cache.index+1) % cache.candidates.length;
     state.points = cache.candidates[cache.index].points.map(([x,y]) => ({x:Math.max(0,Math.min(state.width-1,x)),y:Math.max(0,Math.min(state.height-1,y))}));
     renderOverlay(); updateControls();
-    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. P cycles alternatives; Ctrl+Q clears. Always check the corners.`);
+    toast(`Outline ${cache.index+1} of ${cache.candidates.length}. P cycles alternatives; C or Ctrl+Q clears. Always check the corners.`);
   } catch (error) { toast(error.message,true); }
   finally { cropPredictionBusy = false; updateControls(); }
 }
@@ -1103,6 +1103,22 @@ function clearCropPoints() {
   if (state.busy) return;
   cropPredictionRequest++; cropPredictionCache = null;
   state.points = []; endZoom(); renderOverlay(); updateControls();
+}
+function cropImageReady() {
+  return !!state.width && !$('image-layer').classList.contains('hidden');
+}
+function undoCropPoint() {
+  if (state.busy) return;
+  cropPredictionRequest++;
+  state.points.pop();
+  renderOverlay(); updateControls();
+}
+function rotateCrop(delta) {
+  if (state.busy || state.index < 0) return;
+  state.rotation = ((state.rotation + delta + 360) % 360);
+  if (state.rotation === 270) state.rotation = -90;
+  toast(`Output rotation: ${state.rotation}°`);
+  updateControls();
 }
 function selectWholeImage() {
   if (!state.width || !state.height || state.busy) return;
@@ -2089,12 +2105,12 @@ function wire() {
   $('go-parent').addEventListener('click',()=>state.parent&&loadFolder(state.parent));
   $('refresh').addEventListener('click',()=>state.folder&&loadFolder(state.folder,true));
   $('prev').addEventListener('click',()=>openImage(state.index-1)); $('next').addEventListener('click',()=>openImage(state.index+1));
-  $('undo').addEventListener('click',()=>{state.points.pop();renderOverlay();updateControls();});
-  $('reset').addEventListener('click',()=>{state.points=[];state.rotation=0;renderOverlay();updateControls();});
+  $('undo').addEventListener('click',undoCropPoint);
+  $('reset').addEventListener('click',()=>{if(state.busy)return; clearCropPoints(); state.rotation=0; updateControls();});
   $('select-whole').addEventListener('click',selectWholeImage);
   $('predict-corners').addEventListener('click',predictCropCorners);
-  $('rotate-left').addEventListener('click',()=>{state.rotation=((state.rotation-90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
-  $('rotate-right').addEventListener('click',()=>{state.rotation=((state.rotation+90+360)%360); if(state.rotation===270)state.rotation=-90; toast(`Output rotation: ${state.rotation}°`); updateControls();});
+  $('rotate-left').addEventListener('click',()=>rotateCrop(-90));
+  $('rotate-right').addEventListener('click',()=>rotateCrop(90));
   $('save').addEventListener('click',cropSave);
   for (const id of ['undo','reset','predict-corners','select-whole','rotate-left','rotate-right','save','prev','next']) {
     $(id).addEventListener('click',event=>releaseCropShortcutFocus(event.currentTarget));
@@ -2116,7 +2132,7 @@ function wire() {
     if(event.key==='Shift'){startZoom();return;}
     if(event.ctrlKey||event.metaKey){
       const key=event.key.toLowerCase();
-      if(key==='z'){event.preventDefault();if(!state.busy){state.points.pop();renderOverlay();updateControls();}}
+      if(key==='z'){event.preventDefault();undoCropPoint();}
       else if(key==='q'){event.preventDefault();clearCropPoints();}
       else if(key==='a'){
         event.preventDefault(); // crop view: do not let the browser select the page
@@ -2131,11 +2147,18 @@ function wire() {
       const key=event.key.toLowerCase();
       if(key==='p'){event.preventDefault();predictCropCorners();return;}
       if(key==='w'){event.preventDefault();selectWholeImage();return;}
+      if(cropImageReady()){
+        if(key==='c'){event.preventDefault();clearCropPoints();return;}
+        if(key==='z'){event.preventDefault();undoCropPoint();return;}
+        if(key==='r'){event.preventDefault();rotateCrop(90);return;}
+        if(key==='a'){event.preventDefault();openImage(state.index-1);return;}
+        if(key==='d'){event.preventDefault();openImage(state.index+1);return;}
+        if(key==='enter'){event.preventDefault();cropSave();return;}
+      }
     }
     if(event.key==='ArrowLeft'){event.preventDefault();openImage(state.index-1);}
     else if(event.key==='ArrowRight'){event.preventDefault();openImage(state.index+1);}
-    else if(event.key==='Enter'){event.preventDefault();cropSave();}
-    else if(event.key==='Backspace'){event.preventDefault();state.points=[];renderOverlay();updateControls();}
+    else if(event.key==='Backspace'){event.preventDefault();clearCropPoints();}
   });
   document.addEventListener('keyup',event=>{if(event.key==='Shift')endZoom();}); window.addEventListener('blur',endZoom);
   $('canvas-shell').addEventListener('wheel',event=>{if(event.shiftKey)event.preventDefault();},{passive:false});

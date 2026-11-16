@@ -7,8 +7,10 @@ neural model. No API request or image upload; the endpoint only reads the source
 - W / Whole image: select the full image boundary. Ctrl+Shift+A is an alternate.
 - On a page containing multiple photos, clear points and place one point inside
   the intended photo before predicting. Candidates must contain that point.
-- Ctrl+Q clears points and cancels application of any outstanding prediction.
-- Shift zoom and arrow-key navigation remain unchanged.
+- C or Ctrl+Q clears points and cancels application of any outstanding prediction.
+- Z or Ctrl+Z undoes the last point and cancels an outstanding prediction.
+- R rotates the crop clockwise. A and D (or the arrow keys) change image.
+- Shift zoom remains unchanged. Enter saves.
 - Inspect and adjust every suggestion before saving. Rounded corners, weak
   boundaries, internal rectangular objects and partial prints remain difficult.
 

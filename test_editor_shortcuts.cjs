@@ -51,6 +51,7 @@ function makeControl(tag, extra = {}) {
 function shortcutHarness(api) {
   const state = {
     index: 0, width: 600, height: 400, busy: false, requestId: 1, folderLoadId: 0, points: [],
+    rotation: 0,
     images: [{path: 'photo.jpg', name: 'photo.jpg', bytes: 10, modified: 1}], view: 'crop',
   };
   const messages = [];
@@ -116,7 +117,7 @@ function shortcutHarness(api) {
     toast: (message) => messages.push(message),
     startZoom() {},
     openImage() {},
-    cropSave() {},
+    cropSave() { context.saveCalls += 1; },
     closePicker() {},
   };
   vm.createContext(context);
@@ -146,6 +147,37 @@ function shortcutHarness(api) {
   };
   context.predictCalls = 0;
   context.selectCalls = 0;
+  context.undoCalls = 0;
+  context.rotateCalls = 0;
+  context.openCalls = 0;
+  context.saveCalls = 0;
+  context.clearCalls = 0;
+  if (typeof context.undoCropPoint === 'function') {
+    const realUndo = context.undoCropPoint;
+    context.undoCropPoint = function (...args) {
+      context.undoCalls += 1;
+      return realUndo(...args);
+    };
+  }
+  if (typeof context.rotateCrop === 'function') {
+    const realRotate = context.rotateCrop;
+    context.rotateCrop = function (...args) {
+      context.rotateCalls += 1;
+      return realRotate(...args);
+    };
+  }
+  if (typeof context.clearCropPoints === 'function') {
+    const realClear = context.clearCropPoints;
+    context.clearCropPoints = function (...args) {
+      context.clearCalls += 1;
+      return realClear(...args);
+    };
+  }
+  const realOpen = context.openImage;
+  context.openImage = function (...args) {
+    context.openCalls += 1;
+    return realOpen(...args);
+  };
   function dispatch(partial) {
     const event = {
       key: 'a',
@@ -338,13 +370,27 @@ test('a late predict after Whole image does not overwrite the corners', async ()
   assert.equal(viaButton.state.points[1].x, 599);
 });
 
-test('shortcut strip and tooltips mention P and W, not Ctrl+A', () => {
+test('shortcut strip and tooltips mention P, W, Z, C, R, A, D and Enter', () => {
   assert.match(html, /<kbd>P<\/kbd> predict corners/);
   assert.match(html, /<kbd>W<\/kbd> whole image/);
+  assert.match(html, /<kbd>Z<\/kbd> undo/);
+  assert.match(html, /<kbd>C<\/kbd> clear points/);
+  assert.match(html, /<kbd>R<\/kbd> rotate/);
+  assert.match(html, /<kbd>A<\/kbd> previous/);
+  assert.match(html, /<kbd>D<\/kbd> next/);
+  assert.match(html, /<kbd>ENTER<\/kbd> save/);
+  assert.doesNotMatch(html, /<kbd>S<\/kbd>/);
   assert.doesNotMatch(html, /<kbd>Ctrl<\/kbd><kbd>A<\/kbd> predict corners/);
   assert.doesNotMatch(html, /<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>A<\/kbd> whole image/);
   assert.match(html, /id="predict-corners" title="Predict the photo corners locally \(P\)"/);
   assert.match(html, /id="select-whole" title="Select the full image boundary \(W\)"/);
+  assert.match(html, /id="undo" title="Undo last point \(Z\)"/);
+  assert.match(html, /id="reset" title="Reset points and rotation"/);
+  assert.match(html, /id="rotate-right" title="Rotate crop right \(R\)"/);
+  assert.match(html, /id="prev" title="Previous image \(A\)"/);
+  assert.match(html, /id="next" title="Next image \(D\)"/);
+  assert.match(html, /id="save" title="Crop and save \(Enter\)"/);
+  assert.match(code, /\$\('undo'\)\.addEventListener\('click',undoCropPoint\)/);
 });
 
 test('P calls predict', async () => {
@@ -585,4 +631,347 @@ test('ticking Auto-next then P still predicts', async () => {
   assert.equal(h.context.predictCalls, 1);
   assert.equal(calls, 1);
   assert.equal(h.state.points[0].x, 10);
+});
+
+const letterKeys = [
+  {key: 'c'},
+  {key: 'z'},
+  {key: 'r'},
+  {key: 'a'},
+  {key: 'd'},
+  {key: 'Enter'},
+];
+
+function twoImages() {
+  return [
+    {path: 'a.jpg', name: 'a.jpg', bytes: 10, modified: 1},
+    {path: 'b.jpg', name: 'b.jpg', bytes: 20, modified: 2},
+  ];
+}
+
+test('C clears crop points through clearCropPoints', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}, {x: 3, y: 3}];
+  const event = await h.press({key: 'c'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 1);
+  assert.equal(h.state.points.length, 0);
+  const upper = await h.press({key: 'C'});
+  assert.equal(upper.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 2);
+});
+
+test('Z, Ctrl+Z and the Undo button all go through the shared undo', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  assert.equal(typeof h.context.undoCropPoint, 'function');
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}, {x: 3, y: 3}];
+  const z = await h.press({key: 'z'});
+  assert.equal(z.defaultPrevented, true);
+  assert.equal(h.context.undoCalls, 1);
+  assert.equal(h.state.points.length, 2);
+  const ctrlZ = await h.press({key: 'z', ctrlKey: true});
+  assert.equal(ctrlZ.defaultPrevented, true);
+  assert.equal(h.context.undoCalls, 2);
+  assert.equal(h.state.points.length, 1);
+  h.context.undoCropPoint();
+  assert.equal(h.context.undoCalls, 3);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('R rotates the crop clockwise', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const event = await h.press({key: 'r'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.rotateCalls, 1);
+  assert.equal(h.state.rotation, 90);
+  await h.press({key: 'R'});
+  assert.equal(h.state.rotation, 180);
+  await h.press({key: 'r'});
+  assert.equal(h.state.rotation, -90);
+  await h.press({key: 'r'});
+  assert.equal(h.state.rotation, 0);
+});
+
+test('Enter saves through cropSave', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const event = await h.press({key: 'Enter'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.saveCalls, 1);
+});
+
+test('A and D move images and drop unplaced points', async () => {
+  const h = shortcutHarness((url) => {
+    if (String(url).startsWith('/api/info')) return {width: 600, height: 400};
+    return twoCandidates;
+  });
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.state.points = [{x: 10, y: 10}, {x: 20, y: 20}];
+  const prev = h.dispatch({key: 'a'});
+  assert.equal(prev.defaultPrevented, true);
+  assert.equal(h.context.openCalls, 1);
+  assert.equal(h.state.index, 0);
+  assert.equal(h.state.points.length, 0);
+  h.state.width = 600;
+  h.state.height = 400;
+  h.els['image-layer'].classList.remove('hidden');
+  h.state.points = [{x: 30, y: 30}];
+  const next = h.dispatch({key: 'd'});
+  assert.equal(next.defaultPrevented, true);
+  assert.equal(h.context.openCalls, 2);
+  assert.equal(h.state.index, 1);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('S is not bound as a crop shortcut', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  const event = await h.press({key: 's'});
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.index, 0);
+  assert.equal(h.state.rotation, 0);
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+});
+
+test('shared undo cancels an in-flight predict so a late result is dropped', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}];
+  h.dispatch({key: 'p'});
+  const event = h.dispatch({key: 'z'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.undoCalls, 1);
+  assert.equal(h.state.points.length, 1);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.points[0].x, 1);
+});
+
+test('Ctrl+Z uses the shared undo and drops a late predict', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}];
+  h.dispatch({key: 'p'});
+  const event = h.dispatch({key: 'z', ctrlKey: true});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.undoCalls, 1);
+  assert.equal(h.state.points.length, 1);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.points[0].x, 1);
+});
+
+test('Backspace clears through clearCropPoints and drops a late predict', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}];
+  h.dispatch({key: 'p'});
+  const event = h.dispatch({key: 'Backspace'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 1);
+  assert.equal(h.state.points.length, 0);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points.length, 0);
+});
+
+test('Ctrl+Q still clears and Ctrl+A / Ctrl+Shift+A are unchanged with letter keys bound', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  h.state.images = twoImages();
+  h.state.points = [{x: 8, y: 8}];
+  const ctrlC = await h.press({key: 'c', ctrlKey: true});
+  assert.equal(ctrlC.defaultPrevented, false);
+  assert.equal(h.state.points.length, 1);
+  const ctrlQ = await h.press({key: 'q', ctrlKey: true});
+  assert.equal(ctrlQ.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 1);
+  assert.equal(h.state.points.length, 0);
+  const ctrlA = await h.press({key: 'a', ctrlKey: true});
+  assert.equal(ctrlA.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.context.openCalls, 0);
+  const ctrlShiftA = await h.press({key: 'A', ctrlKey: true, shiftKey: true});
+  assert.equal(ctrlShiftA.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+  assert.equal(h.state.points[0].x, 0);
+  const ctrlZ = await h.press({key: 'z', ctrlKey: true});
+  assert.equal(ctrlZ.defaultPrevented, true);
+  assert.equal(h.context.undoCalls, 1);
+  assert.equal(h.state.points.length, 3);
+});
+
+test('letter shortcuts ignore modifiers', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  for (const {key} of letterKeys) {
+    for (const extra of [{shiftKey: true}, {altKey: true}, {ctrlKey: true}, {metaKey: true}]) {
+      if (key === 'z' && (extra.ctrlKey || extra.metaKey)) continue;
+      if (key === 'a' && (extra.ctrlKey || extra.metaKey)) continue;
+      const event = await h.press({key, ...extra});
+      assert.equal(event.defaultPrevented, false, `${key} ${JSON.stringify(extra)}`);
+    }
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.rotation, 0);
+  assert.equal(h.state.index, 0);
+});
+
+test('letter shortcuts ignore event.repeat', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}, {x: 2, y: 2}];
+  for (const {key} of letterKeys) {
+    const event = await h.press({key, repeat: true});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 2);
+  assert.equal(h.state.rotation, 0);
+});
+
+test('letter shortcuts are ignored in input, textarea, select and contenteditable', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  for (const active of [
+    {tagName: 'INPUT', isContentEditable: false},
+    {tagName: 'TEXTAREA', isContentEditable: false},
+    {tagName: 'SELECT', isContentEditable: false},
+    {tagName: 'DIV', isContentEditable: true},
+  ]) {
+    h.setActive(active);
+    for (const {key} of letterKeys) {
+      const event = await h.press({key});
+      assert.equal(event.defaultPrevented, false, `${active.tagName} ${key}`);
+    }
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 1);
+});
+
+test('letter shortcuts are ignored while a dialog is open', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  h.setOpenDialog({tagName: 'DIALOG'});
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  h.setOpenDialog(null);
+  h.setFolderModalHidden(false);
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, `modal ${key}`);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+});
+
+test('letter shortcuts are no-ops while busy', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  h.state.busy = true;
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.rotation, 0);
+});
+
+test('letter shortcuts are ignored while an image is loading', async () => {
+  let releaseInfo;
+  const h = shortcutHarness((url) => {
+    if (String(url).startsWith('/api/info')) return new Promise((resolve) => { releaseInfo = resolve; });
+    return twoCandidates;
+  });
+  h.state.images = twoImages();
+  const opening = h.context.openImage(1);
+  await Promise.resolve();
+  assert.equal(h.state.width, 0);
+  h.state.points = [{x: 4, y: 4}];
+  h.state.rotation = 0;
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.openCalls, 1);
+  assert.equal(h.state.index, 1);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.rotation, 0);
+  releaseInfo({width: 800, height: 500});
+  await opening;
+});
+
+test('letter shortcuts are ignored during IME composition', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  for (const {key} of letterKeys) {
+    const composing = await h.press({key, isComposing: true});
+    const ime = await h.press({key, keyCode: 229});
+    assert.equal(composing.defaultPrevented, false, key);
+    assert.equal(ime.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 1);
+});
+
+test('letter shortcuts are ignored outside the crop view', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.images = twoImages();
+  h.state.points = [{x: 1, y: 1}];
+  h.state.view = 'chatgpt';
+  for (const {key} of letterKeys) {
+    const event = await h.press({key});
+    assert.equal(event.defaultPrevented, false, key);
+  }
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.context.undoCalls, 0);
+  assert.equal(h.context.rotateCalls, 0);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.state.points.length, 1);
+  assert.equal(h.state.index, 0);
 });
