@@ -49,10 +49,16 @@ test('shortcuts preserve text entry and Shift zoom, and bind Ctrl+A to predict',
   assert.match(keys,/key==='a'/);
   assert.match(keys,/!event.repeat\)predictCropCorners\(\)/);
   assert.match(keys,/event.shiftKey\)selectWholeImage\(\)/);
+  assert.match(keys,/key==='p'/);
+  assert.match(keys,/key==='w'/);
   assert.match(keys,/ArrowLeft.*openImage\(state.index-1\)/);
   assert.match(keys,/ArrowRight.*openImage\(state.index\+1\)/);
   const html=fs.readFileSync(__dirname+'/index.html','utf8');
   assert.match(html,/SHIFT[\s\S]*hold to zoom/);
+  assert.match(html,/<kbd>P<\/kbd> predict corners/);
+  assert.match(html,/<kbd>W<\/kbd> whole image/);
+  assert.doesNotMatch(html,/<kbd>Ctrl<\/kbd><kbd>A<\/kbd> predict corners/);
+  assert.doesNotMatch(html,/<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>A<\/kbd> whole image/);
   assert.match(html,/Choose back/);
   assert.doesNotMatch(html,/Runs on this computer/);
   assert.match(html,/data-testid="processing-location-crop">Local/);

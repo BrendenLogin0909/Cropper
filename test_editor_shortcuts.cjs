@@ -27,6 +27,8 @@ function shortcutHarness(api) {
   };
   const messages = [];
   let active = {tagName: 'BODY', isContentEditable: false};
+  let folderModalHidden = true;
+  let openDialog = null;
   const listeners = [];
   const context = {
     state,
@@ -34,10 +36,10 @@ function shortcutHarness(api) {
     document: {
       get activeElement() { return active; },
       addEventListener(type, fn) { if (type === 'keydown') listeners.push(fn); },
-      querySelector() { return null; },
+      querySelector(sel) { return sel === 'dialog[open]' ? openDialog : null; },
     },
     $(id) {
-      if (id === 'folder-modal') return {classList: {contains: (cls) => cls === 'hidden'}};
+      if (id === 'folder-modal') return {classList: {contains: (cls) => cls === 'hidden' ? folderModalHidden : false}};
       return {
         classList: {contains: () => false, add() {}, remove() {}, toggle() {}},
         style: {}, disabled: false, querySelector: () => ({textContent: ''}),
@@ -80,6 +82,7 @@ function shortcutHarness(api) {
       key: 'a',
       ctrlKey: false,
       metaKey: false,
+      altKey: false,
       shiftKey: false,
       repeat: false,
       defaultPrevented: false,
@@ -98,7 +101,13 @@ function shortcutHarness(api) {
     await flush();
     return event;
   }
-  return {state, messages, press, dispatch, flush, setActive(el) { active = el; }, context};
+  return {
+    state, messages, press, dispatch, flush,
+    setActive(el) { active = el; },
+    setFolderModalHidden(hidden) { folderModalHidden = hidden; },
+    setOpenDialog(el) { openDialog = el; },
+    context,
+  };
 }
 
 const twoCandidates = {
@@ -256,9 +265,149 @@ test('a late predict after Whole image does not overwrite the corners', async ()
   assert.equal(viaButton.state.points[1].x, 599);
 });
 
-test('shortcut strip and tooltips mention Ctrl+A and Ctrl+Shift+A', () => {
-  assert.match(html, /<kbd>Ctrl<\/kbd><kbd>A<\/kbd> predict corners/);
-  assert.match(html, /<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>A<\/kbd> whole image/);
-  assert.match(html, /id="predict-corners" title="Predict the photo corners locally \(Ctrl\+A\)"/);
-  assert.match(html, /id="select-whole" title="Select the full image boundary \(Ctrl\+Shift\+A\)"/);
+test('shortcut strip and tooltips mention P and W, not Ctrl+A', () => {
+  assert.match(html, /<kbd>P<\/kbd> predict corners/);
+  assert.match(html, /<kbd>W<\/kbd> whole image/);
+  assert.doesNotMatch(html, /<kbd>Ctrl<\/kbd><kbd>A<\/kbd> predict corners/);
+  assert.doesNotMatch(html, /<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>A<\/kbd> whole image/);
+  assert.match(html, /id="predict-corners" title="Predict the photo corners locally \(P\)"/);
+  assert.match(html, /id="select-whole" title="Select the full image boundary \(W\)"/);
+});
+
+test('P calls predict', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  const event = await h.press({key: 'p'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+  const upper = await h.press({key: 'P'});
+  assert.equal(upper.defaultPrevented, true);
+  assert.equal(h.context.predictCalls, 2);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 320);
+});
+
+test('P cycles cached candidates and wraps to the first', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  await h.press({key: 'p'});
+  await h.press({key: 'p'});
+  assert.equal(h.state.points[0].x, 320);
+  await h.press({key: 'p'});
+  assert.equal(h.context.predictCalls, 3);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
+});
+
+test('W selects the whole image', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const event = await h.press({key: 'w'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.state.points.length, 4);
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[0].y, 0);
+  assert.equal(h.state.points[1].x, 599);
+  assert.equal(h.state.points[2].y, 399);
+  assert.equal(h.state.points[3].x, 0);
+});
+
+test('W after an in-flight predict keeps the whole-image corners', async () => {
+  let release;
+  const h = shortcutHarness(() => new Promise((resolve) => { release = resolve; }));
+  h.dispatch({key: 'p'});
+  const event = h.dispatch({key: 'w'});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.selectCalls, 1);
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[1].x, 599);
+  release(twoCandidates);
+  await h.flush();
+  assert.equal(h.state.points[0].x, 0);
+  assert.equal(h.state.points[1].x, 599);
+});
+
+test('Shift+P and Ctrl+P do not predict', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const shiftP = await h.press({key: 'P', shiftKey: true});
+  const ctrlP = await h.press({key: 'p', ctrlKey: true});
+  const altP = await h.press({key: 'p', altKey: true});
+  const metaP = await h.press({key: 'p', metaKey: true});
+  assert.equal(shiftP.defaultPrevented, false);
+  assert.equal(ctrlP.defaultPrevented, false);
+  assert.equal(altP.defaultPrevented, false);
+  assert.equal(metaP.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('P and W with focus in a text input are ignored', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.setActive({tagName: 'INPUT', isContentEditable: false});
+  const predictEvent = await h.press({key: 'p'});
+  const selectEvent = await h.press({key: 'w'});
+  assert.equal(predictEvent.defaultPrevented, false);
+  assert.equal(selectEvent.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('P and W are ignored while a dialog is open', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.setOpenDialog({tagName: 'DIALOG'});
+  const withDialogP = await h.press({key: 'p'});
+  const withDialogW = await h.press({key: 'w'});
+  assert.equal(withDialogP.defaultPrevented, false);
+  assert.equal(withDialogW.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  h.setOpenDialog(null);
+  h.setFolderModalHidden(false);
+  const withModalP = await h.press({key: 'p'});
+  const withModalW = await h.press({key: 'w'});
+  assert.equal(withModalP.defaultPrevented, false);
+  assert.equal(withModalW.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+});
+
+test('P and W are no-ops while busy', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.busy = true;
+  const predictEvent = await h.press({key: 'p'});
+  const selectEvent = await h.press({key: 'w'});
+  assert.equal(predictEvent.defaultPrevented, false);
+  assert.equal(selectEvent.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('P and W are ignored outside the crop view', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.view = 'chatgpt';
+  const predictEvent = await h.press({key: 'p'});
+  const selectEvent = await h.press({key: 'w'});
+  assert.equal(predictEvent.defaultPrevented, false);
+  assert.equal(selectEvent.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.selectCalls, 0);
+  assert.equal(h.state.points.length, 0);
+});
+
+test('a held P (event.repeat) does not spam predict', async () => {
+  let calls = 0;
+  const h = shortcutHarness(async () => { calls++; return twoCandidates; });
+  await h.press({key: 'p', repeat: true});
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(calls, 0);
+  await h.press({key: 'p'});
+  await h.press({key: 'p', repeat: true});
+  assert.equal(h.context.predictCalls, 1);
+  assert.equal(calls, 1);
+  assert.equal(h.state.points[0].x, 10);
 });

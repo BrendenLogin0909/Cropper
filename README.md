@@ -47,11 +47,11 @@ advance its source; it leaves the source queued for another attempt.
 ## Crop
 
 Open a batch root or 1. Original. Select a photo and place four points in any order.
-Ctrl+A predicts corners locally; repeat to cycle outlines. For multi-photo pages,
+P predicts corners locally; repeat to cycle outlines (Ctrl+A is an alternate). For multi-photo pages,
 place one point inside the intended print first. Ctrl+Q clears all points; Ctrl+Z
 undoes one point; Backspace resets. Hold Ctrl to zoom. Left/right arrows navigate;
 Enter saves. Prediction is approximate: inspect every outline before saving.
-Whole image (Ctrl+Shift+A) selects the full frame. Re-crop from the original, not a later stage.
+Whole image (W) selects the full frame (Ctrl+Shift+A is an alternate). Re-crop from the original, not a later stage.
 
 Choose output proportions using the physical print size when known. Perspective
 corners alone cannot establish the correct aspect ratio. The live preview helps
