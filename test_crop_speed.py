@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import time
 import unittest
@@ -190,6 +191,155 @@ class CropSpeedTests(unittest.TestCase):
             expected = crop_detection.predict_corners(full)
             self.assertEqual(predicted[0]['candidates'], expected['candidates'])
 
+    def test_in_flight_fill_does_not_put_after_evict(self):
+        path = self.jpeg_source('stale-fill.jpg', (2400, 1800))
+        started = threading.Event()
+        release = threading.Event()
+        real_preview = crop_detection.detection_preview
+        before = crop_cache.file_identity(path)
+
+        def blocked_preview(image):
+            started.set()
+            self.assertTrue(release.wait(6), 'fill was not released')
+            return real_preview(image)
+
+        with patch.object(crop_detection, 'detection_preview', blocked_preview):
+            opener_errors = []
+
+            def fetch():
+                try:
+                    self.get(f'/api/image?path={path}')
+                except Exception as exc:
+                    opener_errors.append(exc)
+
+            opener = threading.Thread(target=fetch)
+            opener.start()
+            self.assertTrue(started.wait(5), 'image fill never started')
+            Image.new('RGB', (640, 480), 'navy').save(path)
+            after = crop_cache.file_identity(path)
+            if after[1] == before[1]:
+                os.utime(path, ns=(before[1] + 1_000_000, before[1] + 1_000_000))
+                after = crop_cache.file_identity(path)
+            self.assertNotEqual(before[1], after[1], 'overwrite did not change mtime')
+            self.assertNotEqual(before[2], after[2], 'overwrite did not change size')
+            crop_cache.evict_path(path)
+            self.assertIsNone(crop_cache.IMAGE_CACHE.get(path))
+            release.set()
+            opener.join(8)
+            self.assertFalse(opener_errors)
+            self.wait_until(
+                lambda: crop_cache._inflight_fills.get(crop_cache._resolved_str(path)) is None,
+                timeout=4,
+                message='in-flight fill did not finish after release',
+            )
+            cached = crop_cache.IMAGE_CACHE.get(path)
+            if cached is not None:
+                self.assertNotEqual(
+                    cached['original_size'],
+                    (2400, 1800),
+                    'old pixels stored under the new mtime/size identity',
+                )
+            self.assertIsNone(cached, 'stale in-flight fill repopulated IMAGE_CACHE')
+            self.assertFalse(crop_cache.IMAGE_CACHE.contains_resolved(str(path.resolve())))
+            for key, item in list(crop_cache.IMAGE_CACHE._data.items()):
+                self.assertNotEqual(key, after, 'old pixels stored under the new identity')
+                self.assertNotEqual(item['original_size'], (2400, 1800))
+        result = self.post('/api/crop-corners', {'path': str(path)})
+        cached = crop_cache.IMAGE_CACHE.get(path)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached['original_size'], (640, 480))
+        self.assertTrue(result['candidates'] or result['candidates'] == [])
+
+    def test_fill_leader_error_propagates_to_waiters(self):
+        path = self.png_source('fill-err.png')
+        entered = threading.Event()
+        release_error = threading.Event()
+        waiter_waiting = threading.Event()
+        previews = []
+        real_wait = crop_cache.wait_for_pending_fill
+
+        def boom(image):
+            previews.append(1)
+            entered.set()
+            self.assertTrue(release_error.wait(4), 'error was not released')
+            raise RuntimeError('fill exploded')
+
+        def wrapped_wait(wait_path, timeout=None):
+            resolved = crop_cache._resolved_str(wait_path)
+            with crop_cache._fill_lock:
+                inflight = crop_cache._inflight_fills.get(resolved)
+            if inflight is not None:
+                waiter_waiting.set()
+            return real_wait(wait_path, timeout)
+
+        leader_errors = []
+        waiter_errors = []
+        with patch.object(crop_detection, 'detection_preview', boom):
+            with patch.object(crop_cache, 'wait_for_pending_fill', wrapped_wait):
+                image, _ = server.load_image(path)
+
+                def leader():
+                    try:
+                        crop_cache.fill_from_full_image_exclusive(path, image)
+                    except Exception as exc:
+                        leader_errors.append(exc)
+
+                def waiter():
+                    try:
+                        crop_cache.decode_detection_image(path)
+                    except Exception as exc:
+                        waiter_errors.append(exc)
+
+                lead = threading.Thread(target=leader)
+                wait = threading.Thread(target=waiter)
+                lead.start()
+                self.assertTrue(entered.wait(4), 'leader fill never started')
+                wait.start()
+                self.assertTrue(waiter_waiting.wait(4), 'waiter never joined the in-flight fill')
+                release_error.set()
+                lead.join(6)
+                wait.join(6)
+        self.assertTrue(leader_errors)
+        self.assertTrue(waiter_errors, 'waiter did not receive the leader error')
+        self.assertEqual(str(waiter_errors[0]), 'fill exploded')
+        self.assertEqual(len(previews), 1)
+
+    def test_fill_waiter_times_out_and_decodes_itself(self):
+        path = self.png_source('fill-timeout.png', size=(400, 300))
+        started = threading.Event()
+        release = threading.Event()
+        real_preview = crop_detection.detection_preview
+        previews = []
+
+        def blocked_preview(image):
+            previews.append(1)
+            if len(previews) == 1:
+                started.set()
+                self.assertTrue(release.wait(6), 'leader fill was not released')
+            return real_preview(image)
+
+        with patch.object(crop_detection, 'detection_preview', blocked_preview):
+            with patch.object(crop_cache, 'FILL_WAIT_SECONDS', 0.05):
+                image, _ = server.load_image(path)
+                lead_errors = []
+
+                def leader():
+                    try:
+                        crop_cache.fill_from_full_image_exclusive(path, image)
+                    except Exception as exc:
+                        lead_errors.append(exc)
+
+                lead = threading.Thread(target=leader)
+                lead.start()
+                self.assertTrue(started.wait(4), 'leader fill never started')
+                detect, size = crop_cache.decode_detection_image(path)
+                self.assertEqual(size, (400, 300))
+                self.assertLessEqual(max(detect.size), crop_detection.DETECTION_SIZE)
+                self.assertGreaterEqual(len(previews), 2)
+                release.set()
+                lead.join(6)
+                self.assertFalse(lead_errors)
+
     def test_prefetch_then_open_predict_matches_cold_full_decode(self):
         path = self.jpeg_source('pref-full.jpg', (3000, 2200))
         decode_calls = []
@@ -346,9 +496,9 @@ class CropSpeedTests(unittest.TestCase):
         first = self.png_source('one.png')
         second = self.png_source('two.png')
         image = Image.new('RGB', (80, 60), 'red')
-        tiny.put(first, image.copy(), image.copy(), image.size)
+        tiny.put(first, image.copy(), image.copy(), image.size, identity=crop_cache.file_identity(first))
         self.assertEqual(len(tiny), 1)
-        tiny.put(second, image.copy(), image.copy(), image.size)
+        tiny.put(second, image.copy(), image.copy(), image.size, identity=crop_cache.file_identity(second))
         self.assertEqual(len(tiny), 1)
         self.assertIsNone(tiny.get(first))
         self.assertIsNotNone(tiny.get(second))

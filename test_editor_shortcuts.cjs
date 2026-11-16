@@ -1138,6 +1138,28 @@ test('document handler SELECT guard skips save and navigation for Enter and Esca
   assert.equal(h.context.document.activeElement, h.cropAspect);
 });
 
+test('document handler early SELECT guard blocks arrow keys that cropEnterActivatesFocusedControl does not cover', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.state.images = twoImages();
+  h.state.index = 1;
+  h.setActive(h.cropAspect);
+  assert.equal(h.context.cropEnterActivatesFocusedControl(h.cropAspect), true);
+  const left = h.dispatchDocument({key: 'ArrowLeft', target: h.cropAspect});
+  assert.equal(left.defaultPrevented, false);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.context.saveCalls, 0);
+  assert.equal(h.context.predictCalls, 0);
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  const right = h.dispatchDocument({key: 'ArrowRight', target: h.cropAspect});
+  assert.equal(right.defaultPrevented, false);
+  assert.equal(h.context.openCalls, 0);
+  assert.equal(h.state.index, 1);
+  const predict = h.dispatchDocument({key: 'p', target: h.cropAspect});
+  assert.equal(predict.defaultPrevented, false);
+  assert.equal(h.context.predictCalls, 0);
+});
+
 test('Enter and Escape on Output proportions go through the document handler, release focus, and do not save', () => {
   const h = shortcutHarness(async () => twoCandidates);
   h.bindSettings();
