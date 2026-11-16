@@ -148,7 +148,8 @@ python tools/perf/bench_crop_corners.py --runs 7
 
 It prints p50/p95 for decode, 960 px resize, detect, open (JPEG response path,
 before preview-cache fill), live-preview warp of the cached 1400 px image with
-and without bowed-edge straighten, cold vs cached server predict, and warp on/off
+and without bowed-edge straighten (on applies the full-res curve, scaled),
+cold vs cached server predict, and warp on/off
 at 1200×900, 3000×2200 and 4500×3400, then warp-off/on plus strip and remap times
 for synthetic bowed rectangles that qualify (target ≤ +50 ms p95 extra on a
 straight save; ≤ +0.5 s p95 extra on a 4500 px bowed save).

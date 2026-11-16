@@ -228,7 +228,8 @@ def load_image(path: Path) -> tuple[Image.Image, dict]:
     return image, original_info
 
 
-def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspect_ratio: float | None = None, straighten_bowed_edges: bool = True) -> Image.Image:
+def _homography_crop(image: Image.Image, points: list[list[float]], aspect_ratio: float | None = None) -> tuple[Image.Image, np.ndarray, np.ndarray]:
+    """Four-corner warp. Returns (crop, ordered corners, source RGB)."""
     corners = order_corners(points)
     width, height = image.size
     if np.any(corners[:, 0] < 0) or np.any(corners[:, 0] >= width) or np.any(corners[:, 1] < 0) or np.any(corners[:, 1] >= height):
@@ -252,10 +253,31 @@ def warp(image: Image.Image, points: list[list[float]], rotation: int = 0, aspec
     matrix = cv2.getPerspectiveTransform(corners, target)
     source_rgb = np.asarray(image)
     result = cv2.warpPerspective(source_rgb, matrix, (out_width, out_height), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    output = Image.fromarray(result)
+    return Image.fromarray(result), corners, source_rgb
+
+
+def warp(
+    image: Image.Image,
+    points: list[list[float]],
+    rotation: int = 0,
+    aspect_ratio: float | None = None,
+    straighten_bowed_edges: bool = True,
+    *,
+    curve_source: Image.Image | None = None,
+    curve_points: list[list[float]] | None = None,
+) -> Image.Image:
+    output, corners, source_rgb = _homography_crop(image, points, aspect_ratio)
     if straighten_bowed_edges:
-        background = bowed_edges.scanner_background_lab(image, corners, rgb=source_rgb)
-        output = bowed_edges.straighten_bowed_print(output, background_lab=background)
+        if curve_source is not None and curve_points is not None:
+            src_warp, src_corners, src_rgb = _homography_crop(curve_source, curve_points, aspect_ratio)
+            background = bowed_edges.scanner_background_lab(curve_source, src_corners, rgb=src_rgb)
+            curves = bowed_edges.detect_edge_curves(src_warp, background)
+            if src_warp.size != output.size:
+                curves = bowed_edges.scale_curves(curves, src_warp.size, output.size)
+            output = bowed_edges.apply_curves(output, curves)
+        else:
+            background = bowed_edges.scanner_background_lab(image, corners, rgb=source_rgb)
+            output = bowed_edges.straighten_bowed_print(output, background_lab=background)
     if rotation == 90:
         output = output.transpose(Image.Transpose.ROTATE_270)
     elif rotation == -90:
@@ -1751,14 +1773,28 @@ class Handler(BaseHTTPRequestHandler):
                 path = self.request_image(data.get("path", ""))
                 crop_cache.wait_for_pending_fill(path)
                 cached = crop_cache.IMAGE_CACHE.get(path)
+                full = None
                 if cached is None or cached['preview'] is None:
                     full, _ = load_image(path)
                     crop_cache.fill_from_full_image_exclusive(path, full)
                     cached = crop_cache.IMAGE_CACHE.get(path)
                 image = cached['preview']
                 original_width, original_height = cached['original_size']
-                scaled = [[float(x) * image.width / original_width, float(y) * image.height / original_height] for x, y in data.get("points", [])]
-                preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"), bowed_edges.enabled(data.get("settings"), data))
+                points = data.get("points", [])
+                scaled = [[float(x) * image.width / original_width, float(y) * image.height / original_height] for x, y in points]
+                straighten = bowed_edges.enabled(data.get("settings"), data)
+                if straighten and full is None:
+                    try:
+                        full, _ = load_image(path)
+                    except OSError:
+                        full = None
+                if straighten and full is not None:
+                    preview = warp(
+                        image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"), True,
+                        curve_source=full, curve_points=points,
+                    )
+                else:
+                    preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"), straighten)
                 payload = io.BytesIO()
                 preview.save(payload, format="JPEG", quality=89, optimize=True)
                 self.reply(200, payload.getvalue(), "image/jpeg")

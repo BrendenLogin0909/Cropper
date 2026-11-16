@@ -54,19 +54,27 @@ full-resolution decode. After the homography, warp may follow bowed print edges.
 **Straighten bowed edges is on by default.** It runs after the four-corner warp
 on both preview and save. An edge remaps only with all three of: a scanner-bed
 Lab band outside the fitted curve along ≥ ~30% of the side (`BACKGROUND_DE` 14,
-`BACKGROUND_BAND_FRAC` 0.30; background = median Lab of a ≤ `BACKGROUND_MAX`
-(400 px) copy of the source outside a dilated quad), full-resolution bow depth
-≥ `BOW_DEPTH_PX` (4 px), and consistent
+`BACKGROUND_BAND_FRAC` 0.30; background = median Lab of a sparse ring of
+full-resolution samples just outside the crop quad, falling back to a ≤
+`BACKGROUND_MAX` (400 px) outside-median), full-resolution **quadratic sag**
+≥ `BOW_DEPTH_FRAC` (0.2% of the side) measured relative to the chord between the locked
+endpoints (a linear wedge or uniform strip is ~0 sag), and consistent
 inward sag (`SIGN_FRAC` 0.80). Picture-content gradients never count.
 Unqualified edges stay exactly straight; if none qualify, output is
 byte-identical to OFF. Poor quadratic fit is left straight — **there is no
-trim**, even when the background match is strong. Fitted depth is clipped to
+trim**, even when the background match is strong. Fitted sag is clipped to
 `DEPTH_CAP_FRAC` (3% of the side). If any pixel would move more than
 `DISPLACEMENT_CAP_FRAC` (2% of the side), that edge is skipped (straight warp).
-Predicted extra area loss above `AREA_LOSS_FRAC` (0.5%) also skips the edge.
-The ≤800 px estimate is refined at full resolution in a `REFINE_BAND_PX` (6 px,
+Predicted extra area loss is a **per-print** budget: after edges qualify,
+largest-loss edges are dropped until the total is ≤ `AREA_LOSS_FRAC` (0.5%);
+if that removes them all, output is byte-identical to OFF. The ≤800 px estimate
+is refined at full resolution in a `REFINE_BAND_PX` (6 px,
 widened by the downsample scale) band; remap is restricted to the affected
-edge band. Turn it off in Save settings (the checkbox is stored in
+edge band. Preview and save apply **one** curve: `/api/crop-preview` loads the
+full-resolution source, runs that detect+refine on the full-res homography, and
+scales the already-qualified params onto the 1400 px warp instead of refitting.
+If the source file cannot be read after the 1400 cache is filled, preview falls
+back to detecting on the 1400 warp alone. Turn it off in Save settings (the checkbox is stored in
 localStorage like auto-next). **Off matches the previous homography-only
 output** (byte-identical to the crop-speed warp). The flag is not part of the
 corner-prediction cache key. Run
@@ -94,6 +102,20 @@ blocks, horizon near the border, bright sky at top) have content to the print
 edges and no background band outside; ON must be byte-identical to OFF, with
 area loss ≤ 0.1%. A qualifying bowed print on scanner background with a thin
 varying streak must leave a residual streak ≤ 2 px at save scale, and extra
-area loss ≤ 0.5%. Preview-vs-save bounds stay MAE < 0.5, corner max ≤ 6.0 px,
-curve p95 ≤ 5.0 px (measured 4500×3400 MAE 0.208 / corner 4.24 / curve p95 3.00).
+area loss ≤ 0.5% **per print**. Preview-vs-save bounds stay MAE < 0.5, corner max ≤ 3.0 px,
+curve p95 ≤ 2.5 px. Preview applies the save curve scaled to 1400 px (one
+qualify/skip at full res; no preview gate or refine). Measured:
+
+- 1200×900 bow 4.5: MAE 0.000 / corner 0.000 / curve p95 0.000
+- 2000×1500 bow 8: MAE 0.095 / corner 0.000 / curve p95 0.000
+- 4500×3400 bow 18: MAE 0.153 / corner 4.243 / curve p95 3.000
+- 4500×3400 bow 11: MAE 0.153 / corner 4.243 / curve p95 3.000 (same decision: top=curve)
+
+The 4500 corner/curve gap is LANCZOS upsample of 1400 → ~3940 (~3 px per axis,
+3√2 at a corner). Bounds are not loosened. A straight print with a 3–6 px
+uniform strip or a 0–8 px linear wedge on one edge is byte-identical to OFF.
+A 3000×2200 print with a 25 px left / 10 px right tapering streak: the 0.5%
+per-print budget drops the left edge (predicted ~0.59% > 0.5%; residual 25 px);
+right remaps (peak 9.7 px, residual 2.0 px, predicted 0.23%). Displacement 2%
+and depth 3% would have allowed the left edge; those caps are not loosened.
 Real-scan validation is local and off-repo.

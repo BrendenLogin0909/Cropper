@@ -1,10 +1,15 @@
 """Follow bowed print edges after the four-corner homography.
 
 Default ON. An edge is remapped only with positive evidence: a scanner-background
-band outside the curve, a full-resolution bow deeper than BOW_DEPTH_PX, and a
-consistent inward sag. Picture-content gradients never count. A poor quadratic
-fit is left straight (no trim, even when the background match is strong).
-Remap is restricted to the affected edge band(s).
+band outside the curve, a chord-relative quadratic sag deeper than BOW_DEPTH_FRAC
+of the side, and a consistent inward sag. Depth is a fraction of the side after
+a linear detrend (a linear wedge or uniform strip is ~0). Picture-content
+gradients never count. Qualify/skip runs once, at the full-res warp; preview
+scales those params and does not re-gate or refine. A poor quadratic fit is
+left straight (no trim, even when the background match is strong). Remap is
+restricted to the affected edge band(s). Predicted extra area loss is a
+per-print budget: largest-loss edges are dropped until the total is ≤
+AREA_LOSS_FRAC.
 """
 from __future__ import annotations
 
@@ -24,8 +29,10 @@ BACKGROUND_DE = 14.0
 # Minimum fraction of the edge that must show a background-coloured band outside
 # the fitted curve.
 BACKGROUND_BAND_FRAC = 0.30
-# Full-resolution pixels. Below this the edge is treated as straight.
-BOW_DEPTH_PX = 4.0
+# Minimum quadratic sag as a fraction of the side, after linear detrend.
+# Below this the edge is treated as straight. 0.2% is ~2 px on a 1000 px side
+# and ~8 px on a 4000 px side, so a 10–12 px bow at 4500 qualifies at every size.
+BOW_DEPTH_FRAC = 0.002
 # Interior sag samples that must share one sign (inward).
 SIGN_FRAC = 0.80
 # Clip fitted bow depth to this fraction of the edge length.
@@ -33,8 +40,8 @@ DEPTH_CAP_FRAC = 0.03
 # Skip the edge (straight warp) if any pixel would move more than this fraction
 # of the edge length.
 DISPLACEMENT_CAP_FRAC = 0.02
-# Skip the edge if the predicted extra area loss exceeds this fraction of the
-# warped rectangle.
+# Skip edges (largest predicted loss first) until the print's total predicted
+# extra area loss is within this fraction of the warped rectangle.
 AREA_LOSS_FRAC = 0.005
 # Dilate the source quad by this fraction of min(width, height) before taking
 # the outside-median Lab.
@@ -73,17 +80,71 @@ def _delta_e(lab: np.ndarray, background: np.ndarray) -> np.ndarray:
 
 
 def scanner_background_lab(image: Image.Image, corners: np.ndarray, rgb: np.ndarray | None = None) -> np.ndarray | None:
-    """Median Lab of source pixels outside a dilated quad.
+    """Median Lab of scanner-bed pixels around the crop quad.
 
-    Estimated on a ≤ BACKGROUND_MAX copy of the source. Returns None when too few
+    Prefers a sparse ring of full-resolution samples (no full-image Lab convert).
+    Falls back to a ≤ BACKGROUND_MAX outside-median. Returns None when too few
     outside pixels remain (full-bleed crop) — callers then skip remapping.
     """
     if rgb is None:
         rgb = np.asarray(image) if image.mode == 'RGB' else np.asarray(image.convert('RGB'))
     else:
         rgb = np.asarray(rgb)
+    ring = _ring_background_lab(rgb, corners)
+    if ring is not None:
+        return ring
+    return _downsampled_outside_median(rgb, corners)
+
+
+def _ring_background_lab(rgb: np.ndarray, corners: np.ndarray) -> np.ndarray | None:
+    """Median Lab of a sparse ring just outside the quad. None if too few hits."""
     height, width = rgb.shape[:2]
-    pts = np.asarray(corners, dtype=np.float64)
+    pts = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] != 4:
+        return None
+    centroid = pts.mean(axis=0)
+    radius = max(2, int(round(QUAD_DILATE_FRAC * min(width, height))))
+    offsets = []
+    for offset in (2, 4, radius, radius * 2):
+        value = int(offset)
+        if value >= 1 and value not in offsets:
+            offsets.append(value)
+    contour = np.round(pts).astype(np.int32).reshape(-1, 1, 2)
+    samples = []
+    ts = np.linspace(0.08, 0.92, 32)
+    for i in range(4):
+        start = pts[i]
+        end = pts[(i + 1) % 4]
+        tangent = end - start
+        length = float(np.hypot(tangent[0], tangent[1]))
+        if length < 1.0:
+            continue
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64) / length
+        midpoint = (start + end) * 0.5
+        if float(np.dot(normal, midpoint - centroid)) < 0.0:
+            normal = -normal
+        for t in ts:
+            base = start + t * tangent
+            for offset in offsets:
+                x, y = base + normal * offset
+                xi = int(round(x))
+                yi = int(round(y))
+                if xi < 0 or yi < 0 or xi >= width or yi >= height:
+                    continue
+                if cv2.pointPolygonTest(contour, (float(xi), float(yi)), False) >= 0.0:
+                    continue
+                samples.append(rgb[yi, xi])
+    if len(samples) < 64:
+        return None
+    stacked = np.asarray(samples, dtype=np.uint8).reshape(-1, 1, 3)
+    return np.median(_to_lab(stacked).reshape(-1, 3), axis=0)
+
+
+def _downsampled_outside_median(rgb: np.ndarray, corners: np.ndarray) -> np.ndarray | None:
+    """Median Lab of all pixels outside a dilated quad on a ≤ BACKGROUND_MAX copy."""
+    rgb = np.asarray(rgb)
+    height, width = rgb.shape[:2]
+    pts = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
     longest = max(width, height)
     if longest > BACKGROUND_MAX:
         scale = BACKGROUND_MAX / longest
@@ -102,8 +163,7 @@ def scanner_background_lab(image: Image.Image, corners: np.ndarray, rgb: np.ndar
     outside = dilated == 0
     if int(outside.sum()) < 64:
         return None
-    lab = _to_lab(rgb)
-    return np.median(lab[outside], axis=0)
+    return np.median(_to_lab(rgb)[outside], axis=0)
 
 
 def _working_rgb(rgb: np.ndarray) -> tuple[np.ndarray, float]:
@@ -215,15 +275,27 @@ def _background_band_fraction(lab: np.ndarray, side: str, curve: np.ndarray, bac
     return float(matches.mean())
 
 
+def _quadratic_sag(curve: np.ndarray) -> np.ndarray:
+    """Quadratic sag relative to the chord between locked endpoints.
+
+    Subtracts the linear tilt/offset so a uniform strip or a linear wedge is ~0
+    and a bowed edge keeps only its interior depth. Endpoints stay at sag 0.
+    """
+    count = int(curve.shape[0])
+    if count < 2:
+        return np.zeros(count, dtype=np.float64)
+    xs = np.arange(count, dtype=np.float64)
+    chord = curve[0] + (curve[-1] - curve[0]) * xs / max(count - 1, 1)
+    return curve - chord
+
+
 def _consistent_inward_sag(curve: np.ndarray) -> bool:
     count = curve.shape[0]
     if count < MIN_SAMPLES:
         return False
-    xs = np.arange(count, dtype=np.float64)
+    sag = _quadratic_sag(curve)
     lo = int(round(0.04 * count))
     hi = int(round(0.96 * count))
-    chord = curve[0] + (curve[-1] - curve[0]) * xs / max(count - 1, 1)
-    sag = curve - chord
     interior = sag[lo:hi]
     if interior.size == 0:
         return False
@@ -237,34 +309,50 @@ def _consistent_inward_sag(curve: np.ndarray) -> bool:
 
 
 def _geometry_ok(curve: np.ndarray, side: str, width: int, height: int) -> bool:
-    """Depth, sag, 2% displacement skip, and 0.5% area skip. No background walk."""
+    """Chord-relative sag depth and 2% displacement skip. Area is per-print later."""
     edge_length = float(width if side in {'top', 'bottom'} else height)
     other = float(height if side in {'top', 'bottom'} else width)
     if edge_length < 2 or other < 2:
         return False
-    peak = float(curve.max())
-    if peak < BOW_DEPTH_PX:
+    sag = np.clip(_quadratic_sag(curve), 0.0, None)
+    peak = float(sag.max()) if sag.size else 0.0
+    if peak < BOW_DEPTH_FRAC * edge_length:
         return False
     if not _consistent_inward_sag(curve):
         return False
     if peak > DISPLACEMENT_CAP_FRAC * edge_length:
         return False
-    capped = np.minimum(curve, DEPTH_CAP_FRAC * edge_length)
-    area = float(capped.mean() * edge_length) / (float(width) * float(height))
-    return area <= AREA_LOSS_FRAC
+    return True
 
 
 def _qualify_edge(curve: np.ndarray, side: str, width: int, height: int, lab: np.ndarray, background: np.ndarray) -> tuple[np.ndarray, str, float]:
-    """Return (curve or zeros, mode, predicted area-loss fraction)."""
+    """Return (chord-relative sag or zeros, mode, predicted area-loss fraction)."""
     zeros = np.zeros_like(curve)
     if not _geometry_ok(curve, side, width, height):
         return zeros, 'none', 0.0
     if _background_band_fraction(lab, side, curve, background) < BACKGROUND_BAND_FRAC:
         return zeros, 'none', 0.0
     edge_length = float(width if side in {'top', 'bottom'} else height)
-    capped = np.minimum(curve, DEPTH_CAP_FRAC * edge_length)
+    sag = np.clip(_quadratic_sag(curve), 0.0, None)
+    capped = np.minimum(sag, DEPTH_CAP_FRAC * edge_length)
     area = float(capped.mean() * edge_length) / (float(width) * float(height))
     return capped, 'curve', area
+
+
+def _trim_print_area(applied: dict, modes: dict, areas: dict) -> float:
+    """Drop largest-loss edges until the print total is ≤ AREA_LOSS_FRAC."""
+    ranked = sorted(
+        (side for side in ('top', 'bottom', 'left', 'right') if modes[side] == 'curve'),
+        key=lambda side: -areas[side],
+    )
+    total = float(sum(areas[side] for side in ranked))
+    while total > AREA_LOSS_FRAC and ranked:
+        side = ranked.pop(0)
+        total -= areas[side]
+        modes[side] = 'none'
+        applied[side] = np.zeros_like(applied[side])
+        areas[side] = 0.0
+    return max(0.0, total)
 
 
 def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = None) -> dict:
@@ -327,14 +415,14 @@ def detect_edge_curves(image: Image.Image, background_lab: np.ndarray | None = N
         fitted, mode = _fit_quadratic(hits)
         refined[side] = fitted if mode == 'curve' else np.zeros_like(hits)
     modes = {}
-    area_loss = 0.0
     applied = {}
+    areas = {}
     for side in ('top', 'bottom', 'left', 'right'):
         curve, mode, area = _qualify_edge(refined[side], side, full_w, full_h, lab, background_lab)
         applied[side] = curve
         modes[side] = mode
-        if mode == 'curve':
-            area_loss += area
+        areas[side] = area
+    area_loss = _trim_print_area(applied, modes, areas)
     return {
         'top': applied['top'],
         'bottom': applied['bottom'],
@@ -417,6 +505,48 @@ def _stretch_band(pixels: np.ndarray, curve: np.ndarray, side: str) -> np.ndarra
     return out
 
 
+def scale_curves(curves: dict, src_size: tuple[int, int], dest_size: tuple[int, int]) -> dict:
+    """Resample already-qualified curves from a full-res warp onto a smaller warp.
+
+    Depths scale with the destination size. Modes are copied, not re-qualified,
+    so a bow that passed BOW_DEPTH_FRAC at save resolution is still applied on
+    the 1400 px preview. Preview does not re-gate or refine.
+    """
+    src_w, src_h = src_size
+    dest_w, dest_h = dest_size
+    sx = dest_w / max(src_w, 1)
+    sy = dest_h / max(src_h, 1)
+
+    def resample(curve: np.ndarray, dest_len: int, depth_scale: float) -> np.ndarray:
+        dest_len = max(int(dest_len), 0)
+        if dest_len == 0:
+            return np.zeros(0, dtype=np.float64)
+        if curve.size == 0:
+            return np.zeros(dest_len, dtype=np.float64)
+        xs = np.linspace(0, curve.size - 1, dest_len)
+        return np.interp(xs, np.arange(curve.size, dtype=np.float64), curve) * depth_scale
+
+    return {
+        'top': resample(curves['top'], dest_w, sy),
+        'bottom': resample(curves['bottom'], dest_w, sy),
+        'left': resample(curves['left'], dest_h, sx),
+        'right': resample(curves['right'], dest_h, sx),
+        'modes': dict(curves['modes']),
+        'elapsed_s': curves.get('elapsed_s', 0.0),
+        'scale': curves.get('scale', 1.0),
+        'area_loss': curves.get('area_loss', 0.0),
+    }
+
+
+def apply_curves(image: Image.Image, curves: dict) -> Image.Image:
+    """Remap qualified edge bands. Same image object if every mode is none."""
+    if all(mode == 'none' for mode in curves['modes'].values()):
+        return image
+    pixels = np.asarray(image) if image.mode == 'RGB' else np.asarray(image.convert('RGB'))
+    remapped = _remap_qualified(pixels, curves)
+    return Image.fromarray(remapped)
+
+
 def _remap_qualified(pixels: np.ndarray, curves: dict) -> np.ndarray:
     out = pixels
     for side in ('top', 'bottom', 'left', 'right'):
@@ -426,14 +556,16 @@ def _remap_qualified(pixels: np.ndarray, curves: dict) -> np.ndarray:
     return out
 
 
-def straighten_bowed_print(image: Image.Image, background_lab: np.ndarray | None = None) -> Image.Image:
+def straighten_bowed_print(
+    image: Image.Image,
+    background_lab: np.ndarray | None = None,
+    curves: dict | None = None,
+) -> Image.Image:
     """Remap a homography crop so qualified bowed print edges become the border.
 
     If no edge qualifies, the same image object is returned (byte-identical to OFF).
+    Pass `curves` to apply already-computed (or scaled) params instead of refitting.
     """
-    curves = detect_edge_curves(image, background_lab)
-    if all(mode == 'none' for mode in curves['modes'].values()):
-        return image
-    pixels = np.asarray(image) if image.mode == 'RGB' else np.asarray(image.convert('RGB'))
-    remapped = _remap_qualified(pixels, curves)
-    return Image.fromarray(remapped)
+    if curves is None:
+        curves = detect_edge_curves(image, background_lab)
+    return apply_curves(image, curves)

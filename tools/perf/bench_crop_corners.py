@@ -25,7 +25,7 @@ from test_bowed_edges import synthetic_curved_rectangle  # noqa: E402
 from test_crop_detection import synthetic_print  # noqa: E402
 
 SIZES = ((1200, 900), (3000, 2200), (4500, 3400))
-# Single-edge bows that qualify: ≥ BOW_DEPTH_PX, ≤ 2% displacement, ≤ 0.5% area.
+# Single-edge bows that qualify: ≥ BOW_DEPTH_FRAC, ≤ 2% displacement, ≤ 0.5% area.
 BOW_FIXTURES = {
     (1200, 900): (80, 4.5),
     (3000, 2200): (180, 12),
@@ -94,7 +94,13 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
         scaled = [[x * preview_src.width / original_size[0], y * preview_src.height / original_size[1]] for x, y in points]
 
         def encode_preview(straighten):
-            warped = server.warp(preview_src, scaled, 0, None, straighten)
+            if straighten:
+                warped = server.warp(
+                    preview_src, scaled, 0, None, True,
+                    curve_source=image, curve_points=points,
+                )
+            else:
+                warped = server.warp(preview_src, scaled, 0, None, False)
             buf = BytesIO()
             warped.save(buf, format='JPEG', quality=89, optimize=True)
 
