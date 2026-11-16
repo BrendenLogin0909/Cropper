@@ -387,17 +387,12 @@ function releaseCropShortcutFocus(el) {
 }
 function cropEnterActivatesFocusedControl(el) {
   if (!el) return false;
+  if (el.isContentEditable) return true;
   const tag = el.tagName;
-  if (tag === 'BUTTON' || tag === 'SUMMARY') return true;
+  if (tag === 'BUTTON' || tag === 'SUMMARY' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
   if (tag === 'A' && (el.href || el.getAttribute?.('href'))) return true;
-  if (tag === 'INPUT') {
-    const type = String(el.type || '').toLowerCase();
-    return type === 'button' || type === 'submit' || type === 'checkbox' || type === 'radio';
-  }
   const role = el.getAttribute?.('role');
-  if (role === 'button' || role === 'link') return true;
-  const tabindex = el.getAttribute?.('tabindex');
-  return tabindex != null && Number(tabindex) >= 0;
+  return role === 'button' || role === 'link' || role === 'menuitem' || role === 'checkbox' || role === 'tab';
 }
 function saveSettings(event) {
   settings.autoNext = $('auto-next').checked;
@@ -423,6 +418,7 @@ function loadSettings() {
   aspect.addEventListener('pointerdown', markPointer);
   aspect.addEventListener('mousedown', markPointer);
   aspect.addEventListener('keydown', event => {
+    aspect._cropPointer = false;
     if (event.key === 'Enter' || event.key === 'Escape') {
       event.preventDefault();
       event.stopPropagation();
@@ -2181,15 +2177,16 @@ function wire() {
       return;
     }
     if(state.busy)return;
-    if(!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.repeat){
+    if(!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey){
       const key=event.key.toLowerCase();
-      if(key==='p'){event.preventDefault();predictCropCorners();return;}
-      if(key==='w'){event.preventDefault();selectWholeImage();return;}
       if(key==='backspace'){
         event.preventDefault();
-        if(cropImageReady())clearCropPoints();
+        if(!event.repeat && cropImageReady())clearCropPoints();
         return;
       }
+      if(event.repeat)return;
+      if(key==='p'){event.preventDefault();predictCropCorners();return;}
+      if(key==='w'){event.preventDefault();selectWholeImage();return;}
       if(cropImageReady()){
         if(key==='c'){event.preventDefault();clearCropPoints();return;}
         if(key==='z'){event.preventDefault();undoCropPoint();return;}

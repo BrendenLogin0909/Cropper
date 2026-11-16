@@ -26,8 +26,9 @@ function makeControl(tag, extra = {}) {
     type: extra.type || '',
     value: extra.value || '',
     checked: extra.checked || false,
-    isContentEditable: false,
+    isContentEditable: extra.isContentEditable || false,
     disabled: false,
+    href: extra.href,
     textContent: '',
     style: {},
     children: [{}, {}, {}, {}],
@@ -38,6 +39,12 @@ function makeControl(tag, extra = {}) {
       add: (name) => { if (name === 'hidden') el._hidden = true; },
       remove: (name) => { if (name === 'hidden') el._hidden = false; },
       toggle() {},
+    },
+    getAttribute(name) {
+      if (name === 'role') return extra.role ?? null;
+      if (name === 'href') return extra.href ?? null;
+      if (name === 'tabindex') return extra.tabindex != null ? String(extra.tabindex) : null;
+      return extra[name] != null ? extra[name] : null;
     },
     querySelector: () => ({textContent: ''}),
     addEventListener(type, fn) { (el._listeners[type] ||= []).push(fn); },
@@ -196,8 +203,16 @@ function shortcutHarness(api) {
       keyCode: 0,
       defaultPrevented: false,
       preventDefault() { event.defaultPrevented = true; },
+      stopPropagation() { event._stopped = true; },
       ...partial,
     };
+    const focused = active;
+    if (focused && focused._listeners && focused._listeners.keydown) {
+      for (const fn of focused._listeners.keydown) {
+        fn(event);
+        if (event._stopped) return event;
+      }
+    }
     listeners[0](event);
     return event;
   }
@@ -1091,17 +1106,37 @@ test('a pointer-driven Output proportions change releases focus so P and W work'
   assert.equal(h.context.selectCalls, 1);
 });
 
-test('Enter and Escape release focus from Output proportions', () => {
+test('Enter and Escape on Output proportions go through the document handler, release focus, and do not save', () => {
   const h = shortcutHarness(async () => twoCandidates);
   h.bindSettings();
   h.setActive(h.cropAspect);
-  const enter = h.cropAspect.dispatch('keydown', {key: 'Enter'});
+  const enter = h.dispatch({key: 'Enter'});
   assert.equal(enter.defaultPrevented, true);
   assert.equal(h.context.document.activeElement, h.body);
+  assert.equal(h.context.saveCalls, 0);
   h.setActive(h.cropAspect);
-  const escape = h.cropAspect.dispatch('keydown', {key: 'Escape'});
+  const escape = h.dispatch({key: 'Escape'});
   assert.equal(escape.defaultPrevented, true);
   assert.equal(h.context.document.activeElement, h.body);
+  assert.equal(h.context.saveCalls, 0);
+});
+
+test('pointerdown then two ArrowDowns keep Output proportions focus and step twice', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.bindSettings();
+  h.setActive(h.cropAspect);
+  h.cropAspect.value = '2:3';
+  h.cropAspect.dispatch('pointerdown');
+  h.cropAspect.dispatch('keydown', {key: 'ArrowDown'});
+  h.cropAspect.value = '3:4';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  assert.equal(h.context.settings.aspect, '3:4');
+  h.cropAspect.dispatch('keydown', {key: 'ArrowDown'});
+  h.cropAspect.value = '4:5';
+  h.cropAspect.dispatch('input');
+  assert.equal(h.context.document.activeElement, h.cropAspect);
+  assert.equal(h.context.settings.aspect, '4:5');
 });
 
 test('Auto-next still blurs after a change', () => {
@@ -1132,10 +1167,8 @@ test('Backspace with a modifier, with repeat, or while loading does not clear po
   h.state.points = [{x: 1, y: 1}];
   const alt = await h.press({key: 'Backspace', altKey: true});
   const shift = await h.press({key: 'Backspace', shiftKey: true});
-  const repeat = await h.press({key: 'Backspace', repeat: true});
   assert.equal(alt.defaultPrevented, false);
   assert.equal(shift.defaultPrevented, false);
-  assert.equal(repeat.defaultPrevented, false);
   assert.equal(h.state.points.length, 1);
   assert.equal(h.context.clearCalls, 0);
   let releaseInfo;
@@ -1153,6 +1186,29 @@ test('Backspace with a modifier, with repeat, or while loading does not clear po
   assert.equal(duringLoad.defaultPrevented, true);
   releaseInfo({width: 800, height: 500});
   await opening;
+});
+
+test('repeat Backspace preventDefaults and does not clear points', async () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  h.state.points = [{x: 1, y: 1}];
+  const event = await h.press({key: 'Backspace', repeat: true});
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(h.context.clearCalls, 0);
+  assert.equal(h.state.points.length, 1);
+});
+
+test('Enter with the crop canvas or a tabindex wrapper focused still saves', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const canvas = makeControl('DIV', {tabindex: '0'});
+  h.setActive(canvas);
+  const canvasEvent = h.dispatch({key: 'Enter'});
+  assert.equal(canvasEvent.defaultPrevented, true);
+  assert.equal(h.context.saveCalls, 1);
+  const wrapper = makeControl('DIV', {tabindex: '0'});
+  h.setActive(wrapper);
+  const wrapperEvent = h.dispatch({key: 'Enter'});
+  assert.equal(wrapperEvent.defaultPrevented, true);
+  assert.equal(h.context.saveCalls, 2);
 });
 
 test('Backspace in crop view still preventDefaults', async () => {
