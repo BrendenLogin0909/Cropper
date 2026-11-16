@@ -1,5 +1,7 @@
 # Cropper
 
+> **Contributors and agents: read [`docs/`](docs/README.md) first.** It is the source of truth for requirements, architecture, decisions, plan and testing, and every PR must keep it up to date. See also [AGENTS.md](AGENTS.md).
+
 Cropper is a local browser-based image cropper for quickly straightening photos, documents, and other four-corner subjects. The image processing runs on your computer with OpenCV and Pillow. No account, subscription, upload, or internet connection is required.
 
 Cropper also has **Front + Back** for pairing both sides of a print and **Auto improve** for colour cast and tonal correction.
