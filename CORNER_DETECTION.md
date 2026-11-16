@@ -26,3 +26,12 @@ are additional. No original photos were modified.
 
 The new endpoint requires an idle backend restart. Browser refresh alone cannot
 install a new Python handler. The UI explains this if the old backend returns 404.
+
+Detection still runs at 960 px. Quad scoring is vectorised and de-duplicated
+before the expensive side walk so the same corners come back faster. Opening an
+image fills a decoded 960/1400 preview cache; JPEG cache misses may draft-decode
+to ~960 px. Prediction results are LRU-cached on the server and in a small client
+Map. Opening also prefetches the current and next image on one background worker.
+Cancelling predict (C, Z, Backspace, Whole image) aborts the in-flight request.
+Save/export still uses the full-resolution decode. Run
+`python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.

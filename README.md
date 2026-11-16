@@ -129,3 +129,15 @@ A rate-limit 429 is retried once with backoff; out-of-credit 429s are not retrie
 Other errors need the Retry failed photos button. Raw provider errors are not shown.
 Restart the idle Cropper server and refresh the browser after updating Python
 files. No paid image requests are made by the automated tests.
+
+## Corner-prediction timing harness
+
+Synthetic only (no real photos, no paths outside a temp dir). Refuses to run if
+`OPENAI_API_KEY` is set:
+
+```
+python tools/perf/bench_crop_corners.py --runs 7
+```
+
+It prints p50/p95 for decode, 960 px resize, detect, and cold vs cached server
+time at 1200×900, 3000×2200 and 4500×3400.
