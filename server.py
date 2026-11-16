@@ -36,7 +36,7 @@ from colorize import candidates
 from photo_pairs import read_links, approve_link, suggestions, accept_linked
 from restore import OPERATIONS, preview_dust_marks, restore, useful_change
 import stage_files
-from crop_detection import predict_corners
+import crop_cache
 
 
 HERE = Path(__file__).resolve().parent
@@ -1522,6 +1522,8 @@ class Handler(BaseHTTPRequestHandler):
                 path = self.request_image(query.get("path", [""])[0])
                 limit = 440 if parsed.path == "/api/thumb" else 1800 if parsed.path == "/api/enhance-original" else 7000
                 image, _ = load_image(path)
+                if parsed.path == "/api/image":
+                    crop_cache.fill_from_full_image(path, image)
                 image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
                 data = io.BytesIO()
                 image.save(data, format="JPEG", quality=88, optimize=True)
@@ -1632,12 +1634,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/api/crop-corners':
                 path = self.request_image(data.get('path', ''))
-                image, _ = load_image(path)
                 target = data.get('target')
                 if target is not None and (not isinstance(target, list) or len(target) != 2 or
                                            not all(isinstance(v, (int, float)) and np.isfinite(v) for v in target)):
                     raise ValueError('Invalid photo selection point.')
-                self.json(200, predict_corners(image, target))
+                self.json(200, crop_cache.predict_cached(path, target, foreground=True))
+                return
+            if self.path == '/api/crop-prefetch':
+                raw_paths = data.get('paths') if isinstance(data.get('paths'), list) else []
+                queued = []
+                for value in raw_paths[:8]:
+                    queued.append(self.request_image(value))
+                crop_cache.queue_prefetch(queued)
+                self.json(200, {'queued': len(queued)})
                 return
             if self.path == "/api/overwrite-preview":
                 operation = str(data.get("operation") or "crop")
@@ -1716,9 +1725,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/crop-preview":
                 path = self.request_image(data.get("path", ""))
-                image, _ = load_image(path)
-                original_width, original_height = image.size
-                image.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+                cached = crop_cache.IMAGE_CACHE.get(path)
+                if cached is None or cached['preview'] is None:
+                    full, _ = load_image(path)
+                    crop_cache.fill_from_full_image(path, full)
+                    cached = crop_cache.IMAGE_CACHE.get(path)
+                image = cached['preview']
+                original_width, original_height = cached['original_size']
                 scaled = [[float(x) * image.width / original_width, float(y) * image.height / original_height] for x, y in data.get("points", [])]
                 preview = warp(image, scaled, int(data.get("rotation", 0)), data.get("aspect_ratio"))
                 payload = io.BytesIO()
