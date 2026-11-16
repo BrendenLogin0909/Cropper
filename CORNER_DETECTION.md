@@ -16,7 +16,7 @@ neural model. No API request or image upload; the endpoint only reads the source
 
 ## Validation, 13 October 2026
 
-Development used the first 24 originals from Janet Photo Album. A subsequent
+Development used the first 24 originals from a private family scan set. A subsequent
 12-image sample (09.59.36 through 10.06.02) was checked without further tuning.
 Visual review of the first outline found 9/12 usable: 75%. This is an informal
 small-sample estimate, not an independently labelled corner-accuracy benchmark

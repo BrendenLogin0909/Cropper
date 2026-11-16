@@ -3139,7 +3139,7 @@ class OutputHandlingTests(unittest.TestCase):
         return popen
 
     def test_non_ascii_dialog_path_round_trips_as_utf8_json(self):
-        path = r'C:\Users\José\Fotos — 写真'
+        path = r'C:\Users\TestUser\Local scans — 写真'
         raw = json.dumps({'path': path}, ensure_ascii=False).encode('utf-8')
         self.assertEqual(server.parse_folder_dialog_stdout(raw), path)
 
@@ -3160,7 +3160,7 @@ class OutputHandlingTests(unittest.TestCase):
         self.assertEqual(emitted.decode('utf-8'), json.dumps({'path': path}, ensure_ascii=False))
         self.assertEqual(server.parse_folder_dialog_stdout(emitted), path)
 
-        chosen = Path(self.folder.name) / 'José' / 'Fotos — 写真'
+        chosen = Path(self.folder.name) / 'TestUser' / 'Local scans — 写真'
         chosen.mkdir(parents=True, exist_ok=True)
         source = (
             'import json, sys\n'
