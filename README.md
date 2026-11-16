@@ -48,9 +48,10 @@ advance its source; it leaves the source queued for another attempt.
 
 Open a batch root or 1. Original. Select a photo and place four points in any order.
 P predicts corners locally; repeat to cycle outlines (Ctrl+A is an alternate). For multi-photo pages,
-place one point inside the intended print first. Ctrl+Q clears all points; Ctrl+Z
-undoes one point; Backspace resets. Hold Shift to zoom. Left/right arrows navigate;
-Enter saves. Prediction is approximate: inspect every outline before saving.
+place one point inside the intended print first. C or Ctrl+Q clears all points; Z or Ctrl+Z
+undoes one point; Backspace also clears. R rotates the crop clockwise. A and D (or the
+arrow keys) move to the previous and next image and drop unplaced points. Hold Shift
+to zoom. Enter saves. Prediction is approximate: inspect every outline before saving.
 Whole image (W) selects the full frame (Ctrl+Shift+A is an alternate). Re-crop from the original, not a later stage.
 
 Choose output proportions using the physical print size when known. Perspective
@@ -99,7 +100,7 @@ Dust/noise/sharpening operations retain their algorithms and use auto-improvemen
 filing: input from 1.5, archive to 2. Cropped, output to 1.6 with _e. An unnecessary
 repair leaves the source unchanged. No operation creates a nested Before folder.
 
-## Navy album migration — 15 October 2026
+## Scan-set migration
 
 174 nested legacy files moved into sibling folders; 84 unchanged skipped-auto
 snapshots added. All 258 destinations were SHA-256 verified. Four empty legacy

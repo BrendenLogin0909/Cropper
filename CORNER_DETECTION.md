@@ -7,15 +7,17 @@ neural model. No API request or image upload; the endpoint only reads the source
 - W / Whole image: select the full image boundary. Ctrl+Shift+A is an alternate.
 - On a page containing multiple photos, clear points and place one point inside
   the intended photo before predicting. Candidates must contain that point.
-- Ctrl+Q clears points and cancels application of any outstanding prediction.
-- Shift zoom and arrow-key navigation remain unchanged.
+- C or Ctrl+Q clears points and cancels application of any outstanding prediction.
+- Z or Ctrl+Z undoes the last point and cancels an outstanding prediction.
+- R rotates the crop clockwise. A and D (or the arrow keys) change image.
+- Shift zoom remains unchanged. Enter saves.
 - Inspect and adjust every suggestion before saving. Rounded corners, weak
   boundaries, internal rectangular objects and partial prints remain difficult.
 
-## Validation, 13 October 2026
+## Validation
 
-Development used the first 24 originals from Janet Photo Album. A subsequent
-12-image sample (09.59.36 through 10.06.02) was checked without further tuning.
+Development used the first 24 originals from a private family scan set. A subsequent
+12-image sample from a set of local test scans was checked without further tuning.
 Visual review of the first outline found 9/12 usable: 75%. This is an informal
 small-sample estimate, not an independently labelled corner-accuracy benchmark
 or a guarantee. Two no-detections and one incorrect outline were counted as

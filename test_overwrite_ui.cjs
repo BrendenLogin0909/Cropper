@@ -104,7 +104,7 @@ function startServer(python, dataDir, extras = {}) {
 
 function loadCropClient({ base, token, els, skipChecked, overwriteReturn = 'overwrite', tab }) {
   const start = app.indexOf('function tabId()');
-  const end = app.indexOf('\nfunction saveSettings()');
+  const end = app.indexOf('\nfunction saveSettings');
   const exported = {};
   const dialogOpens = { overwrite: 0, replace: 0 };
   const storage = tab ? { 'cropper-tab-id': tab } : {};
