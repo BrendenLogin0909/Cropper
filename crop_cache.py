@@ -15,6 +15,7 @@ RESULT_CAP = 64
 
 
 def file_identity(path: Path) -> tuple[str, int, int]:
+    """(resolved path, mtime_ns, size). No ctime: Windows st_ctime is creation time."""
     resolved = path.resolve()
     stat = resolved.stat()
     return (str(resolved), int(stat.st_mtime_ns), int(stat.st_size))
@@ -43,8 +44,16 @@ class ImagePreviewCache:
             self._data.move_to_end(key)
             return item
 
-    def put(self, path: Path, detect: Image.Image, preview: Image.Image | None, original_size: tuple[int, int]) -> None:
-        key = file_identity(path)
+    def put(
+        self,
+        path: Path,
+        detect: Image.Image,
+        preview: Image.Image | None,
+        original_size: tuple[int, int],
+        *,
+        identity: tuple[str, int, int],
+    ) -> None:
+        key = identity
         nbytes = _image_bytes(detect) + _image_bytes(preview)
         with self._lock:
             previous = self._data.pop(key, None)
@@ -146,38 +155,101 @@ _foreground = 0
 _foreground_lock = threading.Lock()
 _abort = threading.Event()
 _fill_lock = threading.Lock()
-_inflight_fills: dict[str, threading.Event] = {}
+_inflight_fills: dict[str, '_FillFlight'] = {}
+_evict_generation: dict[str, int] = {}
+_global_evict_generation = 0
+FILL_WAIT_SECONDS = 30.0
+
+
+class _FillFlight:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: BaseException | None = None
 
 
 def _resolved_str(path: Path) -> str:
     return str(Path(path).resolve())
 
 
-def _release_inflight(resolved: str, event: threading.Event) -> None:
-    event.set()
+def _generation(resolved: str) -> tuple[int, int]:
+    return (_global_evict_generation, _evict_generation.get(resolved, 0))
+
+
+def _capture_fill_guard(path: Path) -> tuple[tuple[str, int, int] | None, tuple[int, int]]:
+    resolved = _resolved_str(path)
+    try:
+        identity = file_identity(path)
+    except OSError:
+        identity = None
     with _fill_lock:
-        if _inflight_fills.get(resolved) is event:
+        generation = _generation(resolved)
+    return identity, generation
+
+
+def _put_if_current(
+    path: Path,
+    detect: Image.Image,
+    preview: Image.Image | None,
+    original_size: tuple[int, int],
+    identity: tuple[str, int, int] | None,
+    generation: tuple[int, int],
+) -> bool:
+    """Put IMAGE_CACHE only if identity and eviction generation are unchanged.
+
+    The cache key is the identity captured when the fill started, never a
+    fresh file_identity() at put time. Recomputing the key here would store
+    old pixels under a new mtime/size after a mid-fill overwrite.
+    """
+    resolved = _resolved_str(path)
+    try:
+        current = file_identity(path)
+    except OSError:
+        return False
+    with _fill_lock:
+        now = _generation(resolved)
+    if identity is None or current != identity or now != generation:
+        return False
+    IMAGE_CACHE.put(path, detect, preview, original_size, identity=identity)
+    return True
+
+
+def _bump_evict(resolved: str) -> _FillFlight | None:
+    with _fill_lock:
+        _evict_generation[resolved] = _evict_generation.get(resolved, 0) + 1
+        return _inflight_fills.pop(resolved, None)
+
+
+def _release_inflight(resolved: str, flight: _FillFlight) -> None:
+    flight.done.set()
+    with _fill_lock:
+        if _inflight_fills.get(resolved) is flight:
             del _inflight_fills[resolved]
 
 
 def _clear_inflight() -> None:
     with _fill_lock:
-        events = list(_inflight_fills.values())
+        flights = list(_inflight_fills.values())
         _inflight_fills.clear()
-    for event in events:
-        event.set()
+    for flight in flights:
+        flight.done.set()
 
 
-def wait_for_pending_fill(path: Path, timeout: float | None = None) -> None:
-    """Block while another thread is filling IMAGE_CACHE for this path."""
+def wait_for_pending_fill(path: Path, timeout: float | None = None) -> bool:
+    """Wait for an in-progress fill. Returns False on timeout; re-raises the leader's error."""
     with _fill_lock:
-        event = _inflight_fills.get(_resolved_str(path))
-    if event is not None:
-        event.wait(timeout)
+        flight = _inflight_fills.get(_resolved_str(path))
+    if flight is None:
+        return True
+    limit = FILL_WAIT_SECONDS if timeout is None else timeout
+    if not flight.done.wait(limit):
+        return False
+    if flight.error is not None:
+        raise flight.error
+    return True
 
 
 def reset() -> None:
-    global _foreground, _prefetch_generation
+    global _foreground, _prefetch_generation, _global_evict_generation
     IMAGE_CACHE.clear()
     RESULT_CACHE.clear()
     with _prefetch_cv:
@@ -187,6 +259,9 @@ def reset() -> None:
     with _foreground_lock:
         _foreground = 0
     _abort.set()
+    with _fill_lock:
+        _global_evict_generation += 1
+        _evict_generation.clear()
     _clear_inflight()
 
 
@@ -196,6 +271,9 @@ def evict_path(path: Path) -> None:
     IMAGE_CACHE.evict_resolved(resolved)
     RESULT_CACHE.evict_resolved(resolved)
     _abort.set()
+    flight = _bump_evict(resolved)
+    if flight is not None:
+        flight.done.set()
 
 
 def begin_foreground() -> None:
@@ -222,40 +300,69 @@ def prefetch_aborted() -> bool:
 
 
 def fill_from_full_image(path: Path, image: Image.Image) -> None:
+    identity, generation = _capture_fill_guard(path)
     detect = crop_detection.detection_preview(image)
     preview = image.copy()
     preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
-    IMAGE_CACHE.put(path, detect, preview, image.size)
+    _put_if_current(path, detect, preview, image.size, identity, generation)
 
 
 def fill_from_full_image_exclusive(path: Path, image: Image.Image) -> None:
     """Fill IMAGE_CACHE, waiting for an in-progress fill of the same path instead of decoding twice."""
-    wait_for_pending_fill(path)
+    waited = wait_for_pending_fill(path)
     if IMAGE_CACHE.get(path) is not None:
         return
     resolved = _resolved_str(path)
     with _fill_lock:
         existing = _inflight_fills.get(resolved)
         if existing is not None:
-            event = existing
+            flight = existing
             leader = False
         else:
-            event = threading.Event()
-            _inflight_fills[resolved] = event
+            flight = _FillFlight()
+            _inflight_fills[resolved] = flight
             leader = True
     if not leader:
-        event.wait()
+        if not waited:
+            fill_from_full_image(path, image)
+            return
+        if not flight.done.wait(FILL_WAIT_SECONDS):
+            fill_from_full_image(path, image)
+            return
+        if flight.error is not None:
+            raise flight.error
         return
     try:
         if IMAGE_CACHE.get(path) is None:
             fill_from_full_image(path, image)
+    except Exception as exc:
+        flight.error = exc
+        raise
     finally:
-        _release_inflight(resolved, event)
+        _release_inflight(resolved, flight)
+
+
+def _decode_put_detection(path: Path) -> tuple[Image.Image, tuple[int, int]]:
+    identity, generation = _capture_fill_guard(path)
+    with Image.open(path) as source:
+        original_size = source.size
+        orientation = source.getexif().get(274)
+        if orientation in {5, 6, 7, 8}:
+            original_size = (original_size[1], original_size[0])
+        image = ImageOps.exif_transpose(source).convert('RGB')
+    detect = crop_detection.detection_preview(image)
+    preview = image.copy()
+    preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
+    _put_if_current(path, detect, preview, original_size, identity, generation)
+    cached = IMAGE_CACHE.get(path)
+    if cached is not None:
+        return cached['detect'], cached['original_size']
+    return detect, original_size
 
 
 def decode_detection_image(path: Path) -> tuple[Image.Image, tuple[int, int]]:
     """Full-decode (or reuse) the 960 px detect image. Draft JPEG decode is gone."""
-    wait_for_pending_fill(path)
+    waited = wait_for_pending_fill(path)
     cached = IMAGE_CACHE.get(path)
     if cached is not None:
         return cached['detect'], cached['original_size']
@@ -263,14 +370,15 @@ def decode_detection_image(path: Path) -> tuple[Image.Image, tuple[int, int]]:
     with _fill_lock:
         existing = _inflight_fills.get(resolved)
         if existing is not None:
-            event = existing
+            flight = existing
             leader = False
         else:
-            event = threading.Event()
-            _inflight_fills[resolved] = event
+            flight = _FillFlight()
+            _inflight_fills[resolved] = flight
             leader = True
     if not leader:
-        event.wait()
+        if not waited:
+            return _decode_put_detection(path)
         cached = IMAGE_CACHE.get(path)
         if cached is not None:
             return cached['detect'], cached['original_size']
@@ -279,19 +387,12 @@ def decode_detection_image(path: Path) -> tuple[Image.Image, tuple[int, int]]:
         cached = IMAGE_CACHE.get(path)
         if cached is not None:
             return cached['detect'], cached['original_size']
-        with Image.open(path) as source:
-            original_size = source.size
-            orientation = source.getexif().get(274)
-            if orientation in {5, 6, 7, 8}:
-                original_size = (original_size[1], original_size[0])
-            image = ImageOps.exif_transpose(source).convert('RGB')
-        detect = crop_detection.detection_preview(image)
-        preview = image.copy()
-        preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
-        IMAGE_CACHE.put(path, detect, preview, original_size)
-        return detect, original_size
+        return _decode_put_detection(path)
+    except Exception as exc:
+        flight.error = exc
+        raise
     finally:
-        _release_inflight(resolved, event)
+        _release_inflight(resolved, flight)
 
 
 def preview_image(path: Path, full_image: Image.Image | None = None) -> tuple[Image.Image, tuple[int, int]]:
