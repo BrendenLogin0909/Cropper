@@ -1411,6 +1411,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def json(self, status: int, payload: dict) -> None:
         self.reply(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
@@ -1533,7 +1534,15 @@ class Handler(BaseHTTPRequestHandler):
                 limit = 440 if parsed.path == "/api/thumb" else 1800 if parsed.path == "/api/enhance-original" else 7000
                 image, _ = load_image(path)
                 if parsed.path == "/api/image":
-                    crop_cache.fill_from_full_image(path, image)
+                    display = image
+                    if max(image.size) > limit:
+                        display = image.copy()
+                        display.thumbnail((limit, limit), Image.Resampling.LANCZOS)
+                    data = io.BytesIO()
+                    display.save(data, format="JPEG", quality=88, optimize=True)
+                    self.reply(200, data.getvalue(), "image/jpeg")
+                    crop_cache.fill_from_full_image_exclusive(path, image)
+                    return
                 image.thumbnail((limit, limit), Image.Resampling.LANCZOS)
                 data = io.BytesIO()
                 image.save(data, format="JPEG", quality=88, optimize=True)
@@ -1737,10 +1746,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/crop-preview":
                 path = self.request_image(data.get("path", ""))
+                crop_cache.wait_for_pending_fill(path)
                 cached = crop_cache.IMAGE_CACHE.get(path)
                 if cached is None or cached['preview'] is None:
                     full, _ = load_image(path)
-                    crop_cache.fill_from_full_image(path, full)
+                    crop_cache.fill_from_full_image_exclusive(path, full)
                     cached = crop_cache.IMAGE_CACHE.get(path)
                 image = cached['preview']
                 original_width, original_height = cached['original_size']

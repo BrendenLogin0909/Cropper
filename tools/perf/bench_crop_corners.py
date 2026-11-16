@@ -7,11 +7,14 @@ import os
 import sys
 import tempfile
 import time
+from io import BytesIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from PIL import Image  # noqa: E402
 
 import crop_cache  # noqa: E402
 import crop_detection  # noqa: E402
@@ -42,7 +45,8 @@ def report(label: str, samples: list[float]) -> str:
 def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     path = folder / f'synthetic_{width}x{height}.jpg'
     synthetic_print(width, height).save(path, format='JPEG', quality=90)
-    decode, resize, detect, cold, cached = [], [], [], [], []
+    decode, resize, detect, cold, cached, opens, previews = [], [], [], [], [], [], []
+    points = [[width * 0.18, height * 0.16], [width * 0.82, height * 0.16], [width * 0.82, height * 0.84], [width * 0.18, height * 0.84]]
     for _ in range(runs):
         crop_cache.reset()
 
@@ -62,6 +66,30 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
         detect.append(time_ms(do_detect))
 
         crop_cache.reset()
+
+        def do_open():
+            opened, _ = server.load_image(path)
+            do_open.image = opened
+            display = opened
+            if max(opened.size) > 7000:
+                display = opened.copy()
+                display.thumbnail((7000, 7000), Image.Resampling.LANCZOS)
+            buf = BytesIO()
+            display.save(buf, format='JPEG', quality=88, optimize=True)
+        opens.append(time_ms(do_open))
+        crop_cache.fill_from_full_image_exclusive(path, do_open.image)
+        filled = crop_cache.IMAGE_CACHE.get(path)
+        preview_src = filled['preview']
+        original_size = filled['original_size']
+        scaled = [[x * preview_src.width / original_size[0], y * preview_src.height / original_size[1]] for x, y in points]
+
+        def do_preview():
+            warped = server.warp(preview_src, scaled, 0, None)
+            buf = BytesIO()
+            warped.save(buf, format='JPEG', quality=89, optimize=True)
+        previews.append(time_ms(do_preview))
+
+        crop_cache.reset()
         cold.append(time_ms(lambda: crop_cache.predict_cached(path, None, foreground=True)))
         cached.append(time_ms(lambda: crop_cache.predict_cached(path, None, foreground=True)))
 
@@ -69,6 +97,8 @@ def bench_size(width: int, height: int, runs: int, folder: Path) -> None:
     print(report('decode', decode))
     print(report('resize-960', resize))
     print(report('detect', detect))
+    print(report('open', opens))
+    print(report('preview-1400', previews))
     print(report('server cold', cold))
     print(report('server cached', cached))
     print()

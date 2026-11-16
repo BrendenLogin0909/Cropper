@@ -68,6 +68,14 @@ class CropSpeedTests(unittest.TestCase):
         with urlopen(request) as response:
             return response.read()
 
+    def wait_until(self, predicate, timeout=8, message='condition not met'):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        self.fail(message)
+
     def png_source(self, name='photo.png', size=(800, 600)):
         path = self.root / name
         image = Image.new('RGB', size, '#cbb99a')
@@ -87,7 +95,7 @@ class CropSpeedTests(unittest.TestCase):
         full, _ = server.load_image(path)
         expected = crop_detection.predict_corners(full)['candidates']
         self.get(f'/api/image?path={path}')
-        self.assertGreater(len(crop_cache.IMAGE_CACHE), 0)
+        self.wait_until(lambda: crop_cache.IMAGE_CACHE.get(path) is not None, message='IMAGE_CACHE not filled after /api/image')
         result = self.post('/api/crop-corners', {'path': str(path)})
         self.assertEqual(result['candidates'], expected)
         self.assertEqual(len(crop_cache.RESULT_CACHE), 1)
@@ -101,38 +109,148 @@ class CropSpeedTests(unittest.TestCase):
         self.assertEqual(len(crop_cache.RESULT_CACHE), 1)
         self.assertNotEqual(first['candidates'], second['candidates'])
 
-    def test_draft_decode_used_only_for_large_jpeg(self):
-        small = self.jpeg_source('small.jpg', (1200, 900))
-        large = self.jpeg_source('large.jpg', (3000, 2200))
-        png = self.png_source('plain.png')
-        crop_cache.reset()
-        _, _, used_small = crop_cache.decode_detection_image(small, allow_draft=True)
-        crop_cache.reset()
-        detect, original, used_large = crop_cache.decode_detection_image(large, allow_draft=True)
-        crop_cache.reset()
-        _, _, used_png = crop_cache.decode_detection_image(png, allow_draft=True)
-        self.assertFalse(used_small)
-        self.assertFalse(used_png)
-        self.assertTrue(used_large)
-        self.assertEqual(original, (3000, 2200))
-        self.assertLessEqual(max(detect.size), crop_detection.DETECTION_SIZE)
+    def test_image_response_does_not_fill_cache_synchronously(self):
+        path = self.jpeg_source('open-async.jpg', (3000, 2200))
+        started = threading.Event()
+        release = threading.Event()
+        real = crop_cache.fill_from_full_image
 
-    def test_draft_corners_stay_within_bound_of_full_decode(self):
-        path = self.jpeg_source('draft.jpg', (3000, 2200))
+        def blocking_fill(p, img):
+            started.set()
+            self.assertTrue(release.wait(6), 'fill was not released')
+            return real(p, img)
+
+        with patch.object(crop_cache, 'fill_from_full_image', blocking_fill):
+            body = []
+            errors = []
+
+            def fetch():
+                try:
+                    body.append(self.get(f'/api/image?path={path}'))
+                except Exception as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=fetch)
+            worker.start()
+            self.assertTrue(started.wait(5), 'fill never started')
+            worker.join(2)
+            self.assertFalse(errors)
+            self.assertTrue(body, 'GET did not return before fill finished')
+            self.assertGreater(len(body[0]), 100)
+            release.set()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+
+    def test_predict_reuses_in_progress_image_fill(self):
+        path = self.jpeg_source('fill-reuse.jpg', (2400, 1800))
+        previews = []
+        started = threading.Event()
+        release = threading.Event()
+        real_preview = crop_detection.detection_preview
+
+        def counting_preview(image):
+            previews.append(1)
+            started.set()
+            self.assertTrue(release.wait(6), 'preview fill was not released')
+            return real_preview(image)
+
+        with patch.object(crop_detection, 'detection_preview', counting_preview):
+            body = []
+            errors = []
+
+            def fetch():
+                try:
+                    body.append(self.get(f'/api/image?path={path}'))
+                except Exception as exc:
+                    errors.append(exc)
+
+            opener = threading.Thread(target=fetch)
+            opener.start()
+            self.assertTrue(started.wait(5), 'image fill never started')
+            predicted = []
+
+            def predict():
+                try:
+                    predicted.append(self.post('/api/crop-corners', {'path': str(path)}))
+                except Exception as exc:
+                    errors.append(exc)
+
+            predictor = threading.Thread(target=predict)
+            predictor.start()
+            time.sleep(0.2)
+            self.assertEqual(len(previews), 1)
+            release.set()
+            opener.join(8)
+            predictor.join(8)
+            self.assertFalse(errors)
+            self.assertTrue(body)
+            self.assertTrue(predicted)
+            self.assertEqual(len(previews), 1)
+            full, _ = server.load_image(path)
+            expected = crop_detection.predict_corners(full)
+            self.assertEqual(predicted[0]['candidates'], expected['candidates'])
+
+    def test_prefetch_then_open_predict_matches_cold_full_decode(self):
+        path = self.jpeg_source('pref-full.jpg', (3000, 2200))
+        decode_calls = []
+        real_decode = crop_cache.decode_detection_image
+
+        def wrapped_decode(*args, **kwargs):
+            decode_calls.append({'args': args, 'kwargs': kwargs})
+            return real_decode(*args, **kwargs)
+
         full, _ = server.load_image(path)
-        full_result = crop_detection.predict_corners(full)
-        crop_cache.reset()
-        detect, original, used = crop_cache.decode_detection_image(path, allow_draft=True)
-        self.assertTrue(used)
-        draft_result = crop_detection.predict_corners(detect, original_size=original)
-        self.assertTrue(full_result['candidates'])
-        self.assertTrue(draft_result['candidates'])
-        diffs = []
-        for full_pt, draft_pt in zip(full_result['candidates'][0]['points'], draft_result['candidates'][0]['points']):
-            diffs.append(((full_pt[0] - draft_pt[0]) ** 2 + (full_pt[1] - draft_pt[1]) ** 2) ** 0.5)
-        diffs.sort()
-        self.assertLessEqual(diffs[len(diffs) // 2], 5.0)
-        self.assertLessEqual(diffs[-1], 20.0)
+        expected = crop_detection.predict_corners(full)
+        with patch.object(crop_cache, 'decode_detection_image', wrapped_decode):
+            crop_cache.queue_prefetch([path])
+            self.wait_until(
+                lambda: crop_cache.RESULT_CACHE.get(path, None) is not None,
+                timeout=15,
+                message='prefetch did not land in RESULT_CACHE',
+            )
+        drafted = any(
+            call['kwargs'].get('allow_draft') is True
+            or (len(call['args']) >= 2 and call['args'][1] is True)
+            for call in decode_calls
+        )
+        self.assertFalse(drafted, 'prefetch worker used JPEG draft decode')
+        self.get(f'/api/image?path={path}')
+        result = self.post('/api/crop-corners', {'path': str(path)})
+        self.assertEqual(result['candidates'], expected['candidates'])
+        cached = crop_cache.RESULT_CACHE.get(path, None)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached['candidates'], expected['candidates'])
+
+    def test_foreground_predict_does_not_drop_neighbour_prefetch(self):
+        current = self.png_source('now.png', size=(800, 600))
+        neighbour = self.png_source('next.png', size=(640, 480))
+        started = threading.Event()
+        real = crop_detection.predict_corners
+
+        def wrapped(image, target=None, original_size=None, abort=None):
+            size = original_size or image.size
+            if abort is not None and size == (800, 600):
+                started.set()
+                deadline = time.time() + 6
+                while time.time() < deadline:
+                    if abort():
+                        return {'candidates': [], 'elapsed_ms': 0, 'aborted': True}
+                    time.sleep(0.01)
+                return {'candidates': [], 'elapsed_ms': 0, 'aborted': True}
+            if abort is None:
+                time.sleep(0.35)
+            return real(image, target, original_size=original_size, abort=abort)
+
+        with patch.object(crop_detection, 'predict_corners', wrapped):
+            crop_cache.queue_prefetch([current, neighbour])
+            self.assertTrue(started.wait(5), 'current prefetch never started')
+            self.post('/api/crop-corners', {'path': str(current)})
+            self.wait_until(
+                lambda: crop_cache.RESULT_CACHE.get(neighbour, None) is not None,
+                timeout=10,
+                message='neighbour prefetch was dropped after foreground predict',
+            )
+        self.assertIsNotNone(crop_cache.RESULT_CACHE.get(neighbour, None))
 
     def test_save_still_loads_full_resolution(self):
         path = self.jpeg_source('save.jpg', (3000, 2200))

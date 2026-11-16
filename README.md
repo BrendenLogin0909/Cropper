@@ -139,5 +139,6 @@ Synthetic only (no real photos, no paths outside a temp dir). Refuses to run if
 python tools/perf/bench_crop_corners.py --runs 7
 ```
 
-It prints p50/p95 for decode, 960 px resize, detect, and cold vs cached server
-time at 1200×900, 3000×2200 and 4500×3400.
+It prints p50/p95 for decode, 960 px resize, detect, open (JPEG response path,
+before preview-cache fill), live-preview warp of the cached 1400 px image, and
+cold vs cached server time at 1200×900, 3000×2200 and 4500×3400.

@@ -29,12 +29,19 @@ install a new Python handler. The UI explains this if the old backend returns 40
 
 Detection still runs at 960 px. Quad scoring is vectorised and de-duplicated
 before the expensive side walk so the same corners come back faster. Opening an
-image fills a decoded 960/1400 preview cache; JPEG cache misses may draft-decode
-to ~960 px. Prediction results are LRU-cached on the server and in a small client
-Map. Opening also prefetches the current and next image on one background worker.
-Cancelling predict (C, Z, Backspace, Whole image) aborts the in-flight request.
-Switching photo or folder also aborts; begin-batch/folder change resets the
-server caches and prefetch queue. Saving a crop, restore, or enhance evicts that
-resolved path from both LRUs, and the client Map drops that path so the next P
-refetches. Save/export still uses the full-resolution decode. Run
-`python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.
+image replies with the display JPEG first, then fills a decoded 960/1400 preview
+cache off the request path; an in-progress fill is waited on and reused so predict
+does not decode twice. Prefetch and every RESULT_CACHE entry use a full decode
+(JPEG draft decode was removed). Prediction results are LRU-cached on the server
+and in a small client Map. Opening also prefetches the current and next image on
+one background worker; a foreground predict re-queues a skipped neighbour rather
+than dropping it. Cancelling predict (C, Z, Backspace, Whole image) aborts the
+in-flight request. Switching photo or folder also aborts; begin-batch/folder
+change resets the server caches and prefetch queue. Saving a crop, restore, or
+enhance evicts that resolved path from both LRUs, and the client Map drops that
+path so the next P refetches. Save/export still uses the full-resolution decode.
+Run `python tools/perf/bench_crop_corners.py --runs 7` for synthetic timings.
+
+## PLAN
+
+Live preview p95 on real-world photos ~434 ms after a cold press vs a 400 ms goal; follow-up (re-measure with step 3 curve warp).

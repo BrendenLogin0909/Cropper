@@ -140,22 +140,54 @@ RESULT_CACHE = ResultCache()
 
 _prefetch_cv = threading.Condition()
 _prefetch_queue: list[Path] = []
+_prefetch_generation = 0
 _prefetch_started = False
 _foreground = 0
 _foreground_lock = threading.Lock()
 _abort = threading.Event()
+_fill_lock = threading.Lock()
+_inflight_fills: dict[str, threading.Event] = {}
+
+
+def _resolved_str(path: Path) -> str:
+    return str(Path(path).resolve())
+
+
+def _release_inflight(resolved: str, event: threading.Event) -> None:
+    event.set()
+    with _fill_lock:
+        if _inflight_fills.get(resolved) is event:
+            del _inflight_fills[resolved]
+
+
+def _clear_inflight() -> None:
+    with _fill_lock:
+        events = list(_inflight_fills.values())
+        _inflight_fills.clear()
+    for event in events:
+        event.set()
+
+
+def wait_for_pending_fill(path: Path, timeout: float | None = None) -> None:
+    """Block while another thread is filling IMAGE_CACHE for this path."""
+    with _fill_lock:
+        event = _inflight_fills.get(_resolved_str(path))
+    if event is not None:
+        event.wait(timeout)
 
 
 def reset() -> None:
+    global _foreground, _prefetch_generation
     IMAGE_CACHE.clear()
     RESULT_CACHE.clear()
     with _prefetch_cv:
         _prefetch_queue.clear()
+        _prefetch_generation += 1
         _prefetch_cv.notify_all()
     with _foreground_lock:
-        global _foreground
         _foreground = 0
     _abort.set()
+    _clear_inflight()
 
 
 def evict_path(path: Path) -> None:
@@ -170,13 +202,15 @@ def begin_foreground() -> None:
     global _foreground
     with _foreground_lock:
         _foreground += 1
-    _abort.set()
+        _abort.set()
 
 
 def end_foreground() -> None:
     global _foreground
     with _foreground_lock:
         _foreground = max(0, _foreground - 1)
+    with _prefetch_cv:
+        _prefetch_cv.notify_all()
 
 
 def _foreground_busy() -> bool:
@@ -194,37 +228,80 @@ def fill_from_full_image(path: Path, image: Image.Image) -> None:
     IMAGE_CACHE.put(path, detect, preview, image.size)
 
 
-def decode_detection_image(path: Path, allow_draft: bool = True) -> tuple[Image.Image, tuple[int, int], bool]:
+def fill_from_full_image_exclusive(path: Path, image: Image.Image) -> None:
+    """Fill IMAGE_CACHE, waiting for an in-progress fill of the same path instead of decoding twice."""
+    wait_for_pending_fill(path)
+    if IMAGE_CACHE.get(path) is not None:
+        return
+    resolved = _resolved_str(path)
+    with _fill_lock:
+        existing = _inflight_fills.get(resolved)
+        if existing is not None:
+            event = existing
+            leader = False
+        else:
+            event = threading.Event()
+            _inflight_fills[resolved] = event
+            leader = True
+    if not leader:
+        event.wait()
+        return
+    try:
+        if IMAGE_CACHE.get(path) is None:
+            fill_from_full_image(path, image)
+    finally:
+        _release_inflight(resolved, event)
+
+
+def decode_detection_image(path: Path) -> tuple[Image.Image, tuple[int, int]]:
+    """Full-decode (or reuse) the 960 px detect image. Draft JPEG decode is gone."""
+    wait_for_pending_fill(path)
     cached = IMAGE_CACHE.get(path)
     if cached is not None:
-        return cached['detect'], cached['original_size'], False
-    with Image.open(path) as source:
-        original_size = source.size
-        orientation = source.getexif().get(274)
-        if orientation in {5, 6, 7, 8}:
-            original_size = (original_size[1], original_size[0])
-        used_draft = False
-        if allow_draft and source.format == 'JPEG' and max(source.size) > 2000:
-            source.draft('RGB', (crop_detection.DETECTION_SIZE, crop_detection.DETECTION_SIZE))
-            used_draft = True
-        image = ImageOps.exif_transpose(source).convert('RGB')
-    detect = crop_detection.detection_preview(image)
-    if used_draft:
-        IMAGE_CACHE.put(path, detect, None, original_size)
-    else:
+        return cached['detect'], cached['original_size']
+    resolved = _resolved_str(path)
+    with _fill_lock:
+        existing = _inflight_fills.get(resolved)
+        if existing is not None:
+            event = existing
+            leader = False
+        else:
+            event = threading.Event()
+            _inflight_fills[resolved] = event
+            leader = True
+    if not leader:
+        event.wait()
+        cached = IMAGE_CACHE.get(path)
+        if cached is not None:
+            return cached['detect'], cached['original_size']
+        return decode_detection_image(path)
+    try:
+        cached = IMAGE_CACHE.get(path)
+        if cached is not None:
+            return cached['detect'], cached['original_size']
+        with Image.open(path) as source:
+            original_size = source.size
+            orientation = source.getexif().get(274)
+            if orientation in {5, 6, 7, 8}:
+                original_size = (original_size[1], original_size[0])
+            image = ImageOps.exif_transpose(source).convert('RGB')
+        detect = crop_detection.detection_preview(image)
         preview = image.copy()
         preview.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.Resampling.LANCZOS)
         IMAGE_CACHE.put(path, detect, preview, original_size)
-    return detect, original_size, used_draft
+        return detect, original_size
+    finally:
+        _release_inflight(resolved, event)
 
 
 def preview_image(path: Path, full_image: Image.Image | None = None) -> tuple[Image.Image, tuple[int, int]]:
+    wait_for_pending_fill(path)
     cached = IMAGE_CACHE.get(path)
     if cached is not None and cached['preview'] is not None:
         return cached['preview'], cached['original_size']
     if full_image is None:
         raise FileNotFoundError(path)
-    fill_from_full_image(path, full_image)
+    fill_from_full_image_exclusive(path, full_image)
     cached = IMAGE_CACHE.get(path)
     return cached['preview'], cached['original_size']
 
@@ -240,7 +317,7 @@ def predict_cached(path: Path, target=None, foreground: bool = True) -> dict:
             identity = file_identity(path)
         except OSError:
             identity = None
-        detect, original_size, _ = decode_detection_image(path, allow_draft=True)
+        detect, original_size = decode_detection_image(path)
         abort = prefetch_aborted if not foreground else None
         result = crop_detection.predict_corners(detect, target, original_size=original_size, abort=abort)
         if result.get('aborted') or (not foreground and prefetch_aborted()):
@@ -260,12 +337,14 @@ def predict_cached(path: Path, target=None, foreground: bool = True) -> dict:
 
 
 def queue_prefetch(paths: list[Path]) -> None:
+    global _prefetch_generation
     _ensure_worker()
     _abort.set()
     with _prefetch_cv:
         _prefetch_queue.clear()
         _prefetch_queue.extend(paths)
-        _prefetch_cv.notify()
+        _prefetch_generation += 1
+        _prefetch_cv.notify_all()
 
 
 def _ensure_worker() -> None:
@@ -278,19 +357,41 @@ def _ensure_worker() -> None:
     thread.start()
 
 
+def _requeue_if_current(path: Path, generation: int) -> None:
+    with _prefetch_cv:
+        if _prefetch_generation != generation:
+            return
+        if path not in _prefetch_queue:
+            _prefetch_queue.insert(0, path)
+        _prefetch_cv.notify_all()
+
+
 def _prefetch_worker() -> None:
     while True:
         with _prefetch_cv:
             while not _prefetch_queue:
                 _prefetch_cv.wait()
+            generation = _prefetch_generation
             path = _prefetch_queue.pop(0)
-        with _foreground_lock:
-            if _foreground:
+            while _foreground_busy() and _prefetch_generation == generation:
+                _prefetch_cv.wait()
+            if _prefetch_generation != generation:
                 continue
-            _abort.clear()
+            busy = False
+            with _foreground_lock:
+                if _foreground:
+                    busy = True
+                else:
+                    _abort.clear()
+            if busy:
+                if path not in _prefetch_queue:
+                    _prefetch_queue.insert(0, path)
+                continue
         try:
             if RESULT_CACHE.get(path, None) is not None:
                 continue
-            predict_cached(path, None, foreground=False)
+            result = predict_cached(path, None, foreground=False)
+            if result.get('aborted'):
+                _requeue_if_current(path, generation)
         except Exception:
             continue
