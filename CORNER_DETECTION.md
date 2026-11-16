@@ -3,11 +3,12 @@
 Uses local OpenCV edge, contour and colour-boundary detection, not a trained
 neural model. No API request or image upload; the endpoint only reads the source.
 
-- Ctrl+A / Predict corners: suggest an outline. Repeat to cycle cached alternatives.
+- P / Predict corners: suggest an outline. Repeat to cycle cached alternatives. Ctrl+A is an alternate.
+- W / Whole image: select the full image boundary. Ctrl+Shift+A is an alternate.
 - On a page containing multiple photos, clear points and place one point inside
   the intended photo before predicting. Candidates must contain that point.
 - Ctrl+Q clears points and cancels application of any outstanding prediction.
-- Ctrl zoom and arrow-key navigation remain unchanged.
+- Shift zoom and arrow-key navigation remain unchanged.
 - Inspect and adjust every suggestion before saving. Rounded corners, weak
   boundaries, internal rectangular objects and partial prints remain difficult.
 

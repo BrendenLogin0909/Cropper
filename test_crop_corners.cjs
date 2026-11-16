@@ -32,11 +32,20 @@ test('late response cannot change a different image or undo clear',async()=>{
   release({candidates:[{points:[[1,1],[2,1],[2,2],[1,2]]}]});await request;
   assert.equal(h.state.points.length,0);
 });
+test('late predict for image A is dropped after image B is current',async()=>{
+  let release;
+  const h=harness(()=>new Promise(r=>release=r));
+  const request=h.predict();
+  h.state.images[0]={path:'other.jpg',modified:2};
+  h.state.width=800;h.state.height=600;
+  release({candidates:[{points:[[1,1],[2,1],[2,2],[1,2]]}]});await request;
+  assert.equal(h.state.points.length,0);
+});
 test('old backend gives an explicit restart message without modifying points',async()=>{
   const h=harness(async()=>{throw new Error('Not found.');});
   await h.predict();assert.match(h.messages[0],/backend restart/);assert.equal(h.state.points.length,0);
 });
-test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
+test('shortcuts preserve text entry and Shift zoom, and bind Ctrl+A to predict',()=>{
   const keys=code.slice(code.indexOf("document.addEventListener('keydown'"));
   assert.ok(keys.indexOf("'INPUT','TEXTAREA','SELECT'")<keys.indexOf("event.key==='Shift'"));
   assert.match(keys,/event.key==='Shift'/);
@@ -46,12 +55,20 @@ test('shortcuts preserve text entry, Shift zoom and do not intercept Ctrl',()=>{
   assert.match(keys,/clearCropPoints\(\)/);
   assert.match(keys,/state.points.pop\(\)/);
   assert.doesNotMatch(keys,/event.key==='Control'/);
-  assert.doesNotMatch(keys,/event.key.toLowerCase\(\)==='a'&&event.ctrlKey/);
-  assert.doesNotMatch(keys,/predictCropCorners\(\);\}/);
+  assert.match(keys,/key==='a'/);
+  assert.match(keys,/!event.repeat\)predictCropCorners\(\)/);
+  assert.match(keys,/event.shiftKey\)selectWholeImage\(\)/);
+  assert.match(keys,/key==='p'/);
+  assert.match(keys,/key==='w'/);
+  assert.match(keys,/event.isComposing \|\| event.keyCode === 229/);
   assert.match(keys,/ArrowLeft.*openImage\(state.index-1\)/);
   assert.match(keys,/ArrowRight.*openImage\(state.index\+1\)/);
   const html=fs.readFileSync(__dirname+'/index.html','utf8');
   assert.match(html,/SHIFT[\s\S]*hold to zoom/);
+  assert.match(html,/<kbd>P<\/kbd> predict corners/);
+  assert.match(html,/<kbd>W<\/kbd> whole image/);
+  assert.doesNotMatch(html,/<kbd>Ctrl<\/kbd><kbd>A<\/kbd> predict corners/);
+  assert.doesNotMatch(html,/<kbd>Ctrl<\/kbd><kbd>Shift<\/kbd><kbd>A<\/kbd> whole image/);
   assert.match(html,/Choose back/);
   assert.doesNotMatch(html,/Runs on this computer/);
   assert.match(html,/data-testid="processing-location-crop">Local/);
