@@ -81,6 +81,7 @@ function shortcutHarness(api) {
   };
   cropAspect.blur = () => { if (active === cropAspect) active = body; };
   autoNext.blur = () => { if (active === autoNext) active = body; };
+  cropAspectCustom.blur = () => { cropAspectCustom.blurred = true; if (active === cropAspectCustom) active = body; };
   const context = {
     state,
     settings: {autoNext: true, aspect: 'auto', customAspect: '2:3'},
@@ -206,7 +207,7 @@ function shortcutHarness(api) {
   }
   return {
     state, messages, press, dispatch, flush,
-    els, cropAspect, autoNext, body,
+    els, cropAspect, autoNext, cropAspectCustom, body,
     setActive(el) { active = el; },
     setFolderModalHidden(hidden) { folderModalHidden = hidden; },
     setOpenDialog(el) { openDialog = el; },
@@ -974,4 +975,69 @@ test('letter shortcuts are ignored outside the crop view', async () => {
   assert.equal(h.context.saveCalls, 0);
   assert.equal(h.state.points.length, 1);
   assert.equal(h.state.index, 0);
+});
+
+test('image load failure with a matching ticket resets width and shows empty state', async () => {
+  let updateCalls = 0;
+  const h = shortcutHarness((url) => {
+    if (String(url).startsWith('/api/info')) return {width: 800, height: 500};
+    return twoCandidates;
+  });
+  h.context.updateControls = function () { updateCalls += 1; };
+  h.context.assignImage = async () => { throw new Error('decode failed'); };
+  h.state.images = twoImages();
+  h.state.width = 600;
+  h.state.height = 400;
+  h.els['empty-state'].classList.add('hidden');
+  h.els['image-layer'].classList.remove('hidden');
+  await h.context.openImage(1);
+  assert.equal(h.state.width, 0);
+  assert.equal(h.state.height, 0);
+  assert.equal(h.els['image-layer'].classList.contains('hidden'), true);
+  assert.equal(h.els['empty-state'].classList.contains('hidden'), false);
+  assert.ok(updateCalls >= 2);
+  assert.match(h.messages[0] || '', /decode failed/);
+});
+
+test('W, Whole image, Ctrl+Shift+A, P and Ctrl+A are blocked between info and assignImage', async () => {
+  let releaseAssign;
+  const posted = [];
+  const h = shortcutHarness((url, body) => {
+    posted.push([url, body]);
+    if (String(url).startsWith('/api/info')) return {width: 800, height: 500};
+    return twoCandidates;
+  });
+  h.context.assignImage = () => new Promise((resolve) => { releaseAssign = resolve; });
+  h.state.images = twoImages();
+  const opening = h.context.openImage(1);
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(h.els['image-layer'].classList.contains('hidden'), true);
+  assert.equal(h.state.width, 0);
+  await h.press({key: 'w'});
+  await h.press({key: 'A', ctrlKey: true, shiftKey: true});
+  h.context.selectWholeImage();
+  await h.press({key: 'p'});
+  await h.press({key: 'a', ctrlKey: true});
+  await h.flush();
+  assert.equal(h.context.selectCalls, 3);
+  assert.equal(h.state.points.length, 0);
+  assert.equal(posted.some((entry) => String(entry[0]).includes('crop-corners')), false);
+  releaseAssign();
+  await opening;
+  assert.equal(h.state.width, 800);
+  assert.equal(h.els['image-layer'].classList.contains('hidden'), false);
+});
+
+test('typing in crop-aspect-custom keeps focus', () => {
+  const h = shortcutHarness(async () => twoCandidates);
+  const field = h.els['crop-aspect-custom'];
+  h.bindSettings();
+  h.setActive(field);
+  field.value = '4:5';
+  field.dispatch('input');
+  assert.equal(field.blurred, undefined);
+  assert.equal(h.context.document.activeElement, field);
+  assert.equal(h.context.settings.customAspect, '4:5');
 });

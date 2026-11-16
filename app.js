@@ -990,14 +990,20 @@ async function openImage(index) {
   try {
     const info = await api(`/api/info?path=${encodeURIComponent(item.path)}`);
     if (ticket !== state.requestId) return;
-    state.width = info.width; state.height = info.height;
     const photo = $('photo');
     await assignImage(photo, imagePath('/api/image', item.path, { v: item.modified }));
     if (ticket !== state.requestId) return;
+    state.width = info.width; state.height = info.height;
     $('empty-state').classList.add('hidden'); $('image-layer').classList.remove('hidden');
     $('image-subtitle').textContent = `${info.width.toLocaleString()} × ${info.height.toLocaleString()} px  ·  ${formatBytes(item.bytes)}`;
     fitImage(); renderOverlay(); updateControls();
   } catch (error) {
+    if (ticket === state.requestId) {
+      state.width = 0; state.height = 0;
+      $('image-layer').classList.add('hidden');
+      $('empty-state').classList.remove('hidden');
+      updateControls();
+    }
     if (!handleOutsideAllowedFolder(error)) toast(error.message, true);
   }
 }
@@ -1121,7 +1127,7 @@ function rotateCrop(delta) {
   updateControls();
 }
 function selectWholeImage() {
-  if (!state.width || !state.height || state.busy) return;
+  if (!cropImageReady() || !state.height || state.busy) return;
   cropPredictionRequest++;
   state.points = [{ x: 0, y: 0 }, { x: state.width - 1, y: 0 }, { x: state.width - 1, y: state.height - 1 }, { x: 0, y: state.height - 1 }];
   renderOverlay(); updateControls();
